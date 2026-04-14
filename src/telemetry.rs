@@ -108,13 +108,14 @@ pub async fn telemetry_task(
     uart_peri: peripherals::USART3,
     tx_pin:    peripherals::PB10,
     rx_pin:    peripherals::PB11,
+    tx_dma:    peripherals::DMA1_CH3,
     irqs:      Irqs,
 ) {
     let mut cfg = UartConfig::default();
     cfg.baudrate = 57_600;
 
     let mut uart = Uart::new(uart_peri, rx_pin, tx_pin, irqs,
-                             embassy_stm32::dma::NoDma, embassy_stm32::dma::NoDma, cfg).unwrap();
+                             tx_dma, embassy_stm32::dma::NoDma, cfg).unwrap();
 
     info!("Telemetry task started (MAVLink v2 @ 57600)");
 

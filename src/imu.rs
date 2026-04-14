@@ -28,8 +28,8 @@ const ACCEL_SCALE: f32 = 9.81 / 2048.0;  // ±16 g range → m/s²
 const GYRO_SCALE:  f32 = 0.001065;        // ±2000 dps range → rad/s  (π/180/16.4)
 
 /// SPI peripheral + CS pin types for STM32F405 SPI1.
-type ImuSpi  = Spi<'static, peripherals::SPI1>;
-type ImuCs   = Output<'static>;
+type ImuSpi = Spi<'static, peripherals::SPI1, peripherals::DMA2_CH3, peripherals::DMA2_CH0>;
+type ImuCs = Output<'static, peripherals::PA4>;
 
 pub struct Icm42688p {
     spi: ImuSpi,
@@ -37,7 +37,7 @@ pub struct Icm42688p {
 }
 
 impl Icm42688p {
-    pub async fn new(mut spi: ImuSpi, cs_pin: ImuCs) -> Self {
+    pub async fn new(spi: ImuSpi, cs_pin: ImuCs) -> Self {
         let mut dev = Self { spi, cs: cs_pin };
         dev.init().await;
         dev
@@ -109,11 +109,12 @@ impl Icm42688p {
 #[embassy_executor::task]
 pub async fn imu_task(
     spi_peri: peripherals::SPI1,
-    cs:   peripherals::PA4,
-    sck:  peripherals::PA5,
-    miso: peripherals::PA6,
-    mosi: peripherals::PA7,
-    irqs: crate::Irqs,
+    cs:       peripherals::PA4,
+    sck:      peripherals::PA5,
+    miso:     peripherals::PA6,
+    mosi:     peripherals::PA7,
+    tx_dma:   peripherals::DMA2_CH3,
+    rx_dma:   peripherals::DMA2_CH0,
 ) {
     use embassy_stm32::spi::BitOrder;
 
@@ -121,7 +122,7 @@ pub async fn imu_task(
     spi_cfg.frequency       = embassy_stm32::time::Hertz(24_000_000);
     spi_cfg.bit_order       = BitOrder::MsbFirst;
 
-    let spi  = Spi::new(spi_peri, sck, mosi, miso, embassy_stm32::dma::NoDma, embassy_stm32::dma::NoDma, spi_cfg);
+    let spi  = Spi::new(spi_peri, sck, mosi, miso, tx_dma, rx_dma, spi_cfg);
     let cs   = Output::new(cs, Level::High, Speed::VeryHigh);
     let mut imu = Icm42688p::new(spi, cs).await;
 

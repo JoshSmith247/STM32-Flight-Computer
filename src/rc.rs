@@ -96,17 +96,19 @@ pub async fn rc_task(
     uart_peri: peripherals::USART2,
     tx_pin:    peripherals::PA2,
     rx_pin:    peripherals::PA3,
+    rx_dma:    peripherals::DMA1_CH5,
     irqs:      Irqs,
 ) {
     let mut cfg = UartConfig::default();
     cfg.baudrate         = 100_000;
     cfg.parity           = embassy_stm32::usart::Parity::ParityEven;
     cfg.stop_bits        = embassy_stm32::usart::StopBits::STOP2;
-    cfg.invert_rx        = true;   // SBUS is inverted
+    // NOTE: SBUS requires inverted RX logic. embassy-stm32 does not expose invert_rx
+    // for STM32F4 — use a hardware signal inverter (e.g. 74HC04) on the RX line.
     cfg.data_bits        = embassy_stm32::usart::DataBits::DataBits8; // 8E2 → 9-bit USART
 
     let mut uart = Uart::new(uart_peri, rx_pin, tx_pin, irqs,
-                             embassy_stm32::dma::NoDma, embassy_stm32::dma::NoDma, cfg).unwrap();
+                             embassy_stm32::dma::NoDma, rx_dma, cfg).unwrap();
 
     info!("RC task started (SBUS @ 100 kbaud)");
 

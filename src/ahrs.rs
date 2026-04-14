@@ -6,7 +6,7 @@
 //! Reference: Madgwick, S. (2010). "An efficient orientation filter for
 //! inertial and inertial/magnetic sensor arrays."
 
-use libm::{fabsf, invsqrtf, sqrtf};
+use libm::{fabsf, sqrtf};
 
 use crate::types::{Euler, Quaternion, Vec3};
 
@@ -28,7 +28,7 @@ impl MadgwickFilter {
         let (mut q0, mut q1, mut q2, mut q3) = (self.q.w, self.q.x, self.q.y, self.q.z);
 
         // Normalise accelerometer
-        let a_norm = invsqrtf(accel.x*accel.x + accel.y*accel.y + accel.z*accel.z);
+        let a_norm = 1.0 / sqrtf(accel.x*accel.x + accel.y*accel.y + accel.z*accel.z);
         if !a_norm.is_finite() || fabsf(a_norm) < 1e-10 { return self.q; }
         let (ax, ay, az) = (accel.x * a_norm, accel.y * a_norm, accel.z * a_norm);
 
@@ -47,7 +47,7 @@ impl MadgwickFilter {
         let s3 =  2.0*q1*f1 + 2.0*q2*f2;
 
         // Normalise gradient
-        let s_norm = invsqrtf(s0*s0 + s1*s1 + s2*s2 + s3*s3);
+        let s_norm = 1.0 / sqrtf(s0*s0 + s1*s1 + s2*s2 + s3*s3);
         let (s0, s1, s2, s3) = (s0*s_norm, s1*s_norm, s2*s_norm, s3*s_norm);
 
         // Rate of change of quaternion from gyro
@@ -63,7 +63,7 @@ impl MadgwickFilter {
         q3 += (qd3 - self.beta*s3) * self.dt;
 
         // Normalise quaternion
-        let norm = invsqrtf(q0*q0 + q1*q1 + q2*q2 + q3*q3);
+        let norm = 1.0 / sqrtf(q0*q0 + q1*q1 + q2*q2 + q3*q3);
         self.q = Quaternion { w: q0*norm, x: q1*norm, y: q2*norm, z: q3*norm };
         self.q
     }
