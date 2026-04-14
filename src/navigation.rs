@@ -158,7 +158,7 @@ fn navigate_mission(mission: &mut Mission, pos: LatLonAlt, alt_m: f32) -> NavCom
         };
     }
 
-    let target = mission.current_target().unwrap();
+    let target = *mission.current_target().unwrap();
     let dist = haversine_m(pos, target.position);
 
     if dist < WAYPOINT_RADIUS_M {

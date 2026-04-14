@@ -7,13 +7,13 @@ description = "Autonomous drone flight computer for STM32F405"
 
 [dependencies]
 # Embassy async embedded framework
-embassy-executor  = { version = "0.6", features = ["arch-cortex-m", "executor-thread", "defmt"] }
-embassy-stm32     = { version = "0.1", features = ["stm32f405rg", "time-driver-tim2", "exti", "defmt"] }
+embassy-executor  = { version = "0.6", features = ["arch-cortex-m", "executor-thread", "integrated-timers", "defmt"] }
+embassy-stm32     = { version = "0.1", features = ["stm32f405rg", "time-driver-tim2", "time", "exti", "defmt"] }
 embassy-time      = { version = "0.3", features = ["defmt", "defmt-timestamp-uptime"] }
 embassy-sync      = { version = "0.6", features = ["defmt"] }
 
 # Cortex-M support
-cortex-m          = { version = "0.7", features = ["inline-asm"] }
+cortex-m          = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt       = "0.7"
 
 # Logging over RTT (debug probe)
@@ -26,7 +26,7 @@ libm              = "0.2"
 micromath         = "0.5"
 
 # MAVLink telemetry protocol
-mavlink           = { version = "0.13", default-features = false, features = ["common"] }
+mavlink = { version = "0.13.1", default-features = false, features = ["embedded"] }
 
 [profile.release]
 opt-level     = "z"   # Optimize for size
