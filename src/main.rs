@@ -56,26 +56,32 @@ static STATE: SharedState = SharedState::new();
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     // --- Clocks & peripheral init ---
+    // HSI (64 MHz internal) → PLL1 → 400 MHz SYSCLK (VOS1, no external crystal needed)
+    // VCO: 64/4 * 50 = 800 MHz  →  /2 = 400 MHz SYSCLK, /4 = 200 MHz PLL1Q
+    // HCLK = 200 MHz, APBx = 100 MHz — all within VOS1 limits
     let mut config = Config::default();
     {
         use embassy_stm32::rcc::*;
-        config.rcc.hse = Some(Hse { freq: embassy_stm32::time::Hertz(8_000_000), mode: HseMode::Oscillator });
-        config.rcc.pll_src = PllSource::HSE;
-        config.rcc.pll = Some(Pll {
+        config.rcc.hsi = Some(HSIPrescaler::DIV1);
+        config.rcc.pll1 = Some(Pll {
+            source: PllSource::HSI,
             prediv: PllPreDiv::DIV4,
-            mul: PllMul::MUL168,
-            divp: Some(PllPDiv::DIV2),  // SYSCLK = 168 MHz
-            divq: Some(PllQDiv::DIV7),  // USB = 48 MHz
+            mul: PllMul::MUL50,
+            divp: Some(PllDiv::DIV2),  // SYSCLK = 400 MHz
+            divq: Some(PllDiv::DIV4),  // PLL1Q  = 200 MHz
             divr: None,
         });
-        config.rcc.sys = Sysclk::PLL1_P;
-        config.rcc.ahb_pre  = AHBPrescaler::DIV1;
-        config.rcc.apb1_pre = APBPrescaler::DIV4;
-        config.rcc.apb2_pre = APBPrescaler::DIV2;
+        config.rcc.sys        = Sysclk::PLL1_P;
+        config.rcc.voltage_scale = VoltageScale::Scale1;  // VOS1: up to 400 MHz
+        config.rcc.ahb_pre    = AHBPrescaler::DIV2;   // HCLK  = 200 MHz
+        config.rcc.apb1_pre   = APBPrescaler::DIV2;   // APB1  = 100 MHz
+        config.rcc.apb2_pre   = APBPrescaler::DIV2;   // APB2  = 100 MHz
+        config.rcc.apb3_pre   = APBPrescaler::DIV2;   // APB3  = 100 MHz
+        config.rcc.apb4_pre   = APBPrescaler::DIV2;   // APB4  = 100 MHz
     }
     let p = embassy_stm32::init(config);
 
-    defmt::info!("Flight computer booting — STM32F405 @ 168 MHz");
+    defmt::info!("Flight computer booting — STM32H723 @ 400 MHz");
 
     // --- Spawn tasks ---
     spawner.must_spawn(imu::imu_task(p.SPI1, p.PA4, p.PA5, p.PA6, p.PA7, p.DMA2_CH3, p.DMA2_CH0));
