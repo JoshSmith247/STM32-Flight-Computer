@@ -1,14 +1,16 @@
-/* STM32F405RG memory layout
- * Flash: 1 MB  @ 0x08000000
- * SRAM1: 112 KB @ 0x20000000
- * SRAM2: 16 KB  @ 0x2001C000
- * CCM:   64 KB  @ 0x10000000 (data only, no DMA)
+/* STM32H723ZGT6 memory layout
+ * Flash:    1 MB   @ 0x08000000
+ * ITCM:     64 KB  @ 0x00000000 (instruction tightly coupled, no DMA)
+ * DTCM:     128 KB @ 0x20000000 (data tightly coupled, no DMA)
+ * AXI SRAM: 320 KB @ 0x24000000 (DMA accessible — use as main RAM)
+ * SRAM1:    16 KB  @ 0x30000000
+ * SRAM2:    16 KB  @ 0x30004000
+ * SRAM4:    16 KB  @ 0x38000000
  */
 MEMORY
 {
-    FLASH  : ORIGIN = 0x08000000, LENGTH = 1024K
-    RAM    : ORIGIN = 0x20000000, LENGTH = 128K
-    CCMRAM : ORIGIN = 0x10000000, LENGTH = 64K
+    FLASH : ORIGIN = 0x08000000, LENGTH = 1024K
+    RAM   : ORIGIN = 0x24000000, LENGTH = 320K   /* AXI SRAM — DMA accessible */
 }
 
 /* Stack placed at end of RAM */

@@ -3,12 +3,12 @@ name = "stm32-flight-computer"
 version = "0.1.0"
 edition = "2021"
 authors = []
-description = "Autonomous drone flight computer for STM32F405"
+description = "Autonomous drone flight computer for STM32H723"
 
 [dependencies]
 # Embassy async embedded framework
 embassy-executor  = { version = "0.6", features = ["arch-cortex-m", "executor-thread", "integrated-timers", "defmt"] }
-embassy-stm32     = { version = "0.1", features = ["stm32f405rg", "time-driver-tim2", "time", "exti", "defmt"] }
+embassy-stm32     = { version = "0.1", features = ["stm32h723zg", "time-driver-tim2", "time", "exti", "defmt"] }
 embassy-time      = { version = "0.3", features = ["defmt", "defmt-timestamp-uptime"] }
 embassy-sync      = { version = "0.6", features = ["defmt"] }
 

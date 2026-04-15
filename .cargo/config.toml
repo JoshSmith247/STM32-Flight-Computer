@@ -2,7 +2,7 @@
 target = "thumbv7em-none-eabihf"   # Cortex-M4F with hardware FPU (STM32F405)
 
 [target.thumbv7em-none-eabihf]
-runner = "probe-rs run --chip STM32F405RGTx"
+runner = "./flash.sh"
 rustflags = [
     "-C", "link-arg=-Tlink.x",
     "-C", "link-arg=-Tdefmt.x",

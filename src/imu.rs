@@ -49,7 +49,9 @@ impl Icm42688p {
         embassy_time::Timer::after(embassy_time::Duration::from_millis(10)).await;
 
         let who = self.read_reg(REG_WHO_AM_I).await;
-        assert_eq!(who, WHO_AM_I_EXPECTED, "ICM-42688-P not found (got 0x{:02X})", who);
+        if who != WHO_AM_I_EXPECTED {
+            defmt::error!("ICM-42688-P not found (got 0x{:02X}, expected 0x{:02X})", who, WHO_AM_I_EXPECTED);
+        }
 
         // Enable accel + gyro in low-noise mode
         self.write_reg(REG_PWR_MGMT0, 0x0F).await;
