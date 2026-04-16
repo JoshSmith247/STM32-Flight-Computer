@@ -1,12 +1,11 @@
-[build]
-target = "thumbv7em-none-eabihf"   # Cortex-M4F with hardware FPU (STM32F405)
-
 [target.thumbv7em-none-eabihf]
-runner = "./flash.sh"
+runner = "sh flash.sh"
+
 rustflags = [
-    "-C", "link-arg=-Tlink.x",
-    "-C", "link-arg=-Tdefmt.x",
+  "-C", "link-arg=-Tlink.x",
+  "-C", "link-arg=-Tdefmt.x",
+  "-C", "link-arg=-zstack-size=0x2000",
 ]
 
-[env]
-DEFMT_LOG = "debug"
+[build]
+target = "thumbv7em-none-eabihf"
