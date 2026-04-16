@@ -1,41 +1,22 @@
 [package]
-name = "stm32-flight-computer"
+name = "flight-computer"
 version = "0.1.0"
 edition = "2021"
-authors = []
-description = "Autonomous drone flight computer for STM32H723"
 
 [dependencies]
-# Embassy async embedded framework
-embassy-executor  = { version = "0.6", features = ["arch-cortex-m", "executor-thread", "integrated-timers", "defmt"] }
-embassy-stm32     = { version = "0.1", features = ["stm32h723zg", "time-driver-tim2", "time", "exti", "defmt"] }
-embassy-time      = { version = "0.3", features = ["defmt", "defmt-timestamp-uptime"] }
-embassy-sync      = { version = "0.6", features = ["defmt"] }
+embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", features = ["stm32h723zg", "rt", "exti", "defmt", "time-driver-any", "unstable-pac"] }
+embassy-executor = { git = "https://github.com/embassy-rs/embassy", features = ["platform-cortex-m", "executor-thread", "executor-interrupt"] }
+embassy-time = { git = "https://github.com/embassy-rs/embassy", features = ["defmt", "defmt-timestamp-uptime"] }
 
-# Cortex-M support
-cortex-m          = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
-cortex-m-rt       = "0.7"
+critical-section = "1.1"
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
 
-# Logging over RTT (debug probe)
-defmt             = "0.3"
-defmt-rtt         = "0.4"
-panic-probe       = { version = "0.3", features = ["print-defmt"] }
-
-# Fixed-point / float math (no_std)
-libm              = "0.2"
-micromath         = "0.5"
-
-# MAVLink telemetry protocol
-mavlink = { version = "0.13.1", default-features = false, features = ["embedded"] }
+defmt = "0.3"
+defmt-rtt = "0.4"
+panic-probe = { version = "0.3", features = ["print-defmt"] }
 
 [profile.release]
-opt-level     = "z"   # Optimize for size
-lto           = true
-codegen-units = 1
-debug         = true  # Keep debug symbols for probe
-
-[profile.dev]
-opt-level     = 1     # Some optimisation avoids stack overflows during dev
-
-# cargo build/run target
-[build-dependencies]
+debug = true
+lto = true
+opt-level = 's'
