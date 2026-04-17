@@ -1,3 +1,10 @@
+//! LED Configuration
+//! 
+//! Designates state using built-in PC7-pin LED
+//! To eventually be replaced by beeping mechanism
+//! 
+
+
 use embassy_stm32::gpio::Output;
 use embassy_time::{Duration, Timer};
 
