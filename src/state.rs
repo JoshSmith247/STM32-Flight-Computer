@@ -1,5 +1,7 @@
 use core::sync::atomic::{AtomicU8, Ordering};
 
+use crate::motors;
+
 #[derive(Clone, Copy, PartialEq, Eq, defmt::Format)]
 #[repr(u8)]
 pub enum FlightState {
@@ -32,4 +34,19 @@ pub fn get() -> FlightState {
 
 pub fn set(state: FlightState) {
     FLIGHT_STATE.store(state as u8, Ordering::Relaxed);
+
+    if state == FlightState::Arming {
+        // Perform arming actions
+        arm();
+        set(FlightState::Armed);
+    }
+
+    defmt::info!("Flight state -> {}", state);
+}
+
+fn arm() {
+    // Initialize connection to remote control
+    // Initialize nav
+    // Start motors (aprox. 10 sec test before flight)
+    //motors::motors_task()
 }
