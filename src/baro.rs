@@ -6,10 +6,9 @@
 //!
 //! Output: pressure (Pa) + temperature (°C) → altitude estimate via ISA formula.
 
-use embassy_stm32::gpio::{Level, Output, Speed};
-use embassy_time::{Duration, Ticker, Timer};
+use embassy_stm32::{peripherals, Peri};
+use embassy_time::{Duration, Ticker};
 use defmt::info;
-use libm::logf;
 
 use crate::{types::BaroData, STATE};
 
@@ -36,9 +35,7 @@ fn pressure_to_altitude_m(pressure_pa: f32, sea_level_pa: f32) -> f32 {
 
 #[embassy_executor::task]
 pub async fn baro_task(
-    // CS pin for MS5611 on shared SPI1 bus
-    // In a real implementation, share the SPI bus via a mutex in STATE.
-    cs_pin: embassy_stm32::peripherals::PA8,
+    _cs_pin: Peri<'static, peripherals::PA8>,
 ) {
     // TODO: initialise SPI access via shared bus mutex
     // TODO: read 6 PROM calibration coefficients (C1–C6) after reset
