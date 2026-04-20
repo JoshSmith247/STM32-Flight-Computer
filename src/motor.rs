@@ -11,11 +11,11 @@
 //!   M3 → PB0  (TIM3 CH3)
 //!   M4 → PB1  (TIM3 CH4)
 
-use embassy_stm32::peripherals;
+use embassy_stm32::{peripherals, Peri};
 use embassy_time::{Duration, Ticker};
 use defmt::info;
 
-use crate::{types::MotorOutputs, STATE};
+use crate::STATE;
 
 // DSHOT600 @ 84 MHz APB1 timer clock
 // Period = 84 MHz / 600 kHz / 1 = 140 timer ticks per bit
@@ -55,11 +55,11 @@ fn throttle_to_dshot(t: f32) -> u16 {
 
 #[embassy_executor::task]
 pub async fn motor_task(
-    tim:  peripherals::TIM3,
-    m1:   peripherals::PB4,
-    m2:   peripherals::PB5,
-    m3:   peripherals::PB0,
-    m4:   peripherals::PB1,
+    _tim: Peri<'static, peripherals::TIM3>,
+    _m1:  Peri<'static, peripherals::PB4>,
+    _m2:  Peri<'static, peripherals::PB5>,
+    _m3:  Peri<'static, peripherals::PB0>,
+    _m4:  Peri<'static, peripherals::PB1>,
 ) {
     // TODO: Initialise TIM3 in PWM mode with DMA bursts for DSHOT.
     //       Embassy-stm32 does not yet have a first-class DSHOT driver;
@@ -67,7 +67,7 @@ pub async fn motor_task(
 
     info!("Motor task started (DSHOT600 stub)");
 
-    let armed = false;
+    let _armed = false;
     let mut ticker = Ticker::every(Duration::from_hz(500));
 
     loop {
