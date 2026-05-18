@@ -25,7 +25,7 @@ pub static STATE: types::SharedState = types::SharedState::new();
 bind_interrupts!(pub struct Irqs {
     USART2    => embassy_stm32::usart::InterruptHandler<embassy_stm32::peripherals::USART2>;
     USART3    => embassy_stm32::usart::InterruptHandler<embassy_stm32::peripherals::USART3>;
-    SPI1         => embassy_stm32::spi::InterruptHandler<embassy_stm32::peripherals::SPI1>;
+    //SPI1         => embassy_stm32::spi::InterruptHandler<embassy_stm32::peripherals::SPI1>;
     DMA2_STREAM0 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA2_CH0>;
     DMA2_STREAM3 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA2_CH3>;
 });
@@ -72,7 +72,23 @@ async fn control_task() {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    let p = embassy_stm32::init(Default::default());
+    let mut config = embassy_stm32::Config::default();
+    
+    use embassy_stm32::rcc::*;
+
+    config.rcc.hsi = Some(HSIPrescaler::Div1); 
+    config.rcc.csi = true;
+    
+    config.rcc.pll1 = Some(Pll {
+        source: PllSource::Hsi,
+        prediv: PllPreDiv::Div4,
+        mul: PllMul::Mul50,
+        divp: Some(PllDiv::Div2),
+        divq: Some(PllDiv::Div8),
+        divr: None,
+    });
+    
+    let p = embassy_stm32::init(config);
 
     let led = Output::new(p.PG7, Level::Low, Speed::Low);
 

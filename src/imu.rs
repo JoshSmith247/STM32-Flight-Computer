@@ -65,7 +65,10 @@ pub async fn imu_task(
     let mut spi_config = spi::Config::default();
     spi_config.frequency = Hertz(12_500_000);
 
-    /*let mut spi = Spi::new(spi_peri, sck, mosi, miso, tx_dma, rx_dma, irqs, spi_config);
+    spi_config.mode = spi::MODE_0;
+
+    let mut spi = Spi::new(spi_peri, sck, mosi, miso, tx_dma, rx_dma, irqs, spi_config);
+
     let mut cs  = Output::new(cs_pin, Level::High, Speed::High);
 
     // 1 ms minimum from VDD stable to first SPI transaction (datasheet §6.1).
@@ -82,7 +85,16 @@ pub async fn imu_task(
         cs.set_low();
         spi.transfer_in_place(&mut b).await.ok();
         cs.set_high();
-        b[1]
+
+        // Remember: This takes a cargo run --features parameter!!
+        #[cfg(feature = "simulation")]
+        {
+            WHO_AM_I_EXPECTED
+        }
+        #[cfg(not(feature = "simulation"))]
+        {
+            b[1]
+        }
     };
     if who != WHO_AM_I_EXPECTED {
         error!("ICM-42688-P not found: WHO_AM_I = 0x{:02X} (expected 0x{:02X})", who, WHO_AM_I_EXPECTED);
@@ -143,5 +155,5 @@ pub async fn imu_task(
             gyro:  Vec3 { x: gx, y: gy, z: gz },
             temp_c,
         };
-    }*/
+    }
 }
