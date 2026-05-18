@@ -34,13 +34,13 @@ pub async fn led_task(mut led: Output<'static>) {
                     led.set_high();
                     Timer::after(Duration::from_millis(100)).await;
                     led.set_low();
-                    Timer::after(Duration::from_millis(100)).await;
+                    Timer::after(Duration::from_millis(50)).await;
                 }
-                Timer::after(Duration::from_millis(1600)).await;
+                Timer::after(Duration::from_millis(200)).await;
             }
             FlightState::Flying => {
                 // Solid on
-                led.set_high();
+                led.set_low();
                 Timer::after(Duration::from_millis(100)).await;
             }
             FlightState::Landing => {
