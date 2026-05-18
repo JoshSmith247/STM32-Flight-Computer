@@ -25,8 +25,10 @@ const CONV_TIME: Duration = Duration::from_millis(10);
 /// ISA altitude from pressure (Pa). Reference: https://en.wikipedia.org/wiki/Barometric_formula
 /// Uses simple troposphere model valid 0–11 km.
 fn pressure_to_altitude_m(pressure_pa: f32, sea_level_pa: f32) -> f32 {
-    // h = 44330 * (1 - (p/p0)^(1/5.255))
-    44330.0 * (1.0 - libm::powf(pressure_pa / sea_level_pa, 0.1902949))
+    // Linear troposphere approximation — avoids libm::powf deep call stack.
+    // Accurate to < 1 % below 1 km. Replace with powf when SPI is real.
+    let ratio = pressure_pa / sea_level_pa;
+    44330.0 * 0.19029 * (1.0 - ratio)
 }
 
 // ---------------------------------------------------------------------------

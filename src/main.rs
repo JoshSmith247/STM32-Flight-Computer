@@ -15,19 +15,19 @@ mod telemetry;
 mod types;
 
 use embassy_executor::Spawner;
-use embassy_stm32::{
-    bind_interrupts,
-    gpio::{Level, Output, Speed},
-};
+use embassy_stm32::{bind_interrupts, gpio::{Level, Output, Speed}};
 use embassy_time::{Duration, Ticker, Timer};
 use state::FlightState;
-use {defmt_rtt as _, panic_probe as _};
+use {defmt_rtt as _};
 
 pub static STATE: types::SharedState = types::SharedState::new();
 
 bind_interrupts!(pub struct Irqs {
-    USART2 => embassy_stm32::usart::InterruptHandler<embassy_stm32::peripherals::USART2>;
-    USART3 => embassy_stm32::usart::InterruptHandler<embassy_stm32::peripherals::USART3>;
+    USART2    => embassy_stm32::usart::InterruptHandler<embassy_stm32::peripherals::USART2>;
+    USART3    => embassy_stm32::usart::InterruptHandler<embassy_stm32::peripherals::USART3>;
+    SPI1         => embassy_stm32::spi::InterruptHandler<embassy_stm32::peripherals::SPI1>;
+    DMA2_STREAM0 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA2_CH0>;
+    DMA2_STREAM3 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA2_CH3>;
 });
 
 /// 500 Hz control loop: AHRS fusion → PID cascade → motor mix → STATE.motor_outputs.
@@ -77,7 +77,7 @@ async fn main(spawner: Spawner) {
     let led = Output::new(p.PG7, Level::Low, Speed::Low);
 
     spawner.spawn(led::led_task(led).unwrap());
-    spawner.spawn(imu::imu_task().unwrap());
+    spawner.spawn(imu::imu_task(p.SPI1, p.PA5, p.PA7, p.PA6, p.PA4, p.DMA2_CH3, p.DMA2_CH0, Irqs).unwrap());
     spawner.spawn(motor::motor_task(p.TIM3, p.PB4, p.PB5, p.PB0, p.PB1).unwrap());
     spawner.spawn(rc::rc_task(p.USART2, p.PA2, p.PA3, p.DMA1_CH5, Irqs).unwrap());
     spawner.spawn(telemetry::telemetry_task(p.USART3, p.PB10, p.PB11, p.DMA1_CH3, Irqs).unwrap());
@@ -87,17 +87,31 @@ async fn main(spawner: Spawner) {
 
     state::set(FlightState::Idle);
 
-    Timer::after(Duration::from_millis(10_000)).await; // pre-arm countdown
+    Timer::after(Duration::from_millis(10_000)).await;
 
-    state::set(FlightState::Arming);
-    *STATE.armed.lock().await = true;
-    state::set(FlightState::Armed);
+    if state::get() != FlightState::Fault {
+        state::set(FlightState::Arming);
+        *STATE.armed.lock().await = true;
+        state::set(FlightState::Armed);
 
-    Timer::after(Duration::from_millis(10_000)).await; // post-arm hold
+        Timer::after(Duration::from_millis(10_000)).await;
 
-    state::set(FlightState::Flying);
+        state::set(FlightState::Flying);
+    }
 
     loop {
         Timer::after(Duration::from_millis(1_000)).await;
     }
+}
+
+#[inline(never)]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    // FORCE PORT G PIN 7 LOW TO TURN OFF THE LED
+    unsafe {
+        // This directly writes to the hardware register to turn off PG7
+        let gpiog = 0x40021800 as *mut u32;
+        *gpiog.offset(5) = 1 << 7;
+    }
+    loop {}
 }
