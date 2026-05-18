@@ -4,8 +4,11 @@
 //!   SPI1_SCK  → PA5   SPI1_MOSI → PA7
 //!   SPI1_MISO → PA6   IMU_CS    → PA4 (GPIO, active-low)
 //!
-//! DMA: DMA2_CH0 (TX), DMA2_CH1 (RX) — both free on this board.
+//! DMA: DMA2_CH3 (TX), DMA2_CH0 (RX).
 //! ODR set to 1 kHz; task reads at 500 Hz so every read is fresh data.
+//!
+//! SPI1 bus is shared with the barometer; this task takes the SPI1_BUS mutex
+//! for each individual transaction and releases it immediately after.
 
 use core::f32::consts::PI;
 
@@ -13,8 +16,6 @@ use defmt::{error, info};
 use embassy_stm32::{
     gpio::{Level, Output, Speed},
     peripherals,
-    spi::{self, Spi},
-    time::Hertz,
     Peri,
 };
 use embassy_time::{Duration, Ticker, Timer};
@@ -48,53 +49,53 @@ const GYRO_SCALE:  f32 = (2000.0 / 32768.0) * (PI / 180.0);
 const ACCEL_SCALE: f32 = (16.0 / 32768.0) * 9.80665;
 
 // ---------------------------------------------------------------------------
+// SPI transaction helpers
+// ---------------------------------------------------------------------------
+
+/// Write a register: assert CS, clock out [addr, val], deassert CS.
+async fn write_reg(cs: &mut Output<'_>, addr: u8, val: u8) {
+    let mut buf = [addr & 0x7F, val];
+    let mut bus = crate::SPI1_BUS.lock().await;
+    let spi = bus.as_mut().unwrap();
+    cs.set_low();
+    spi.transfer_in_place(&mut buf).await.ok();
+    cs.set_high();
+}
+
+/// Read one register: addr | 0x80 to signal a read, returns the data byte.
+async fn read_reg(cs: &mut Output<'_>, addr: u8) -> u8 {
+    let mut buf = [addr | 0x80, 0x00];
+    let mut bus = crate::SPI1_BUS.lock().await;
+    let spi = bus.as_mut().unwrap();
+    cs.set_low();
+    spi.transfer_in_place(&mut buf).await.ok();
+    cs.set_high();
+    buf[1]
+}
+
+// ---------------------------------------------------------------------------
 // Embassy task
 // ---------------------------------------------------------------------------
 
 #[embassy_executor::task]
-pub async fn imu_task(
-    spi_peri: Peri<'static, peripherals::SPI1>,
-    sck:      Peri<'static, peripherals::PA5>,
-    mosi:     Peri<'static, peripherals::PA7>,
-    miso:     Peri<'static, peripherals::PA6>,
-    cs_pin:   Peri<'static, peripherals::PA4>,
-    tx_dma:   Peri<'static, peripherals::DMA2_CH3>,
-    rx_dma:   Peri<'static, peripherals::DMA2_CH0>,
-    irqs:     crate::Irqs,
-) {
-    let mut spi_config = spi::Config::default();
-    spi_config.frequency = Hertz(12_500_000);
-
-    spi_config.mode = spi::MODE_0;
-
-    let mut spi = Spi::new(spi_peri, sck, mosi, miso, tx_dma, rx_dma, irqs, spi_config);
-
-    let mut cs  = Output::new(cs_pin, Level::High, Speed::High);
+pub async fn imu_task(cs_pin: Peri<'static, peripherals::PA4>) {
+    let mut cs = Output::new(cs_pin, Level::High, Speed::High);
 
     // 1 ms minimum from VDD stable to first SPI transaction (datasheet §6.1).
     Timer::after(Duration::from_millis(10)).await;
 
     // Soft reset — clears all registers to default state.
-    { let mut b = [DEVICE_CONFIG & 0x7F, 0x01]; cs.set_low(); spi.transfer_in_place(&mut b).await.ok(); cs.set_high(); }
+    write_reg(&mut cs, DEVICE_CONFIG, 0x01).await;
     // Device needs up to 1 ms to complete reset before accepting new commands.
     Timer::after(Duration::from_millis(2)).await;
 
     // Confirm we're talking to the right chip.
     let who = {
-        let mut b = [WHO_AM_I | 0x80, 0x00];
-        cs.set_low();
-        spi.transfer_in_place(&mut b).await.ok();
-        cs.set_high();
-
-        // Remember: This takes a cargo run --features parameter!!
+        let raw = read_reg(&mut cs, WHO_AM_I).await;
         #[cfg(feature = "simulation")]
-        {
-            WHO_AM_I_EXPECTED
-        }
+        { WHO_AM_I_EXPECTED }
         #[cfg(not(feature = "simulation"))]
-        {
-            b[1]
-        }
+        { raw }
     };
     if who != WHO_AM_I_EXPECTED {
         error!("ICM-42688-P not found: WHO_AM_I = 0x{:02X} (expected 0x{:02X})", who, WHO_AM_I_EXPECTED);
@@ -104,14 +105,14 @@ pub async fn imu_task(
     info!("IMU: ICM-42688-P found (WHO_AM_I = 0x{:02X})", who);
 
     // PWR_MGMT0: gyro low-noise (bits 3:2 = 11), accel low-noise (bits 1:0 = 11).
-    { let mut b = [PWR_MGMT0 & 0x7F, 0x0F]; cs.set_low(); spi.transfer_in_place(&mut b).await.ok(); cs.set_high(); }
+    write_reg(&mut cs, PWR_MGMT0, 0x0F).await;
     Timer::after(Duration::from_millis(1)).await;
 
     // GYRO_CONFIG0: FS = ±2000 dps (bits 7:5 = 000), ODR = 1 kHz (bits 3:0 = 0110).
-    { let mut b = [GYRO_CONFIG0 & 0x7F, 0x06]; cs.set_low(); spi.transfer_in_place(&mut b).await.ok(); cs.set_high(); }
+    write_reg(&mut cs, GYRO_CONFIG0, 0x06).await;
 
     // ACCEL_CONFIG0: FS = ±16g (bits 7:5 = 000), ODR = 1 kHz (bits 3:0 = 0110).
-    { let mut b = [ACCEL_CONFIG0 & 0x7F, 0x06]; cs.set_low(); spi.transfer_in_place(&mut b).await.ok(); cs.set_high(); }
+    write_reg(&mut cs, ACCEL_CONFIG0, 0x06).await;
 
     // Gyro startup in low-noise mode takes up to 45 ms (datasheet Table 1).
     Timer::after(Duration::from_millis(50)).await;
@@ -128,13 +129,17 @@ pub async fn imu_task(
         // DMA handles the transfer autonomously — CPU is free during the ~10 µs.
         let mut buf = [0u8; 15];
         buf[0] = TEMP_DATA1 | 0x80;
-        cs.set_low();
-        if spi.transfer_in_place(&mut buf).await.is_err() {
+        {
+            let mut bus = crate::SPI1_BUS.lock().await;
+            let spi = bus.as_mut().unwrap();
+            cs.set_low();
+            if spi.transfer_in_place(&mut buf).await.is_err() {
+                cs.set_high();
+                error!("IMU: SPI transfer error");
+                continue;
+            }
             cs.set_high();
-            error!("IMU: SPI transfer error");
-            continue;
         }
-        cs.set_high();
 
         // Temperature (°C) — datasheet §4.17: Temp_degC = raw / 132.48 + 25
         let temp_raw = i16::from_be_bytes([buf[1], buf[2]]);

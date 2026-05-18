@@ -50,7 +50,9 @@ impl Pid {
 // Full three-axis PID cascade
 // ---------------------------------------------------------------------------
 
-/// Default tuning — PLACEHOLDER values, must be tuned on actual hardware.
+/// Conservative first-flight starting values for a mid-size quad (~5", ~500 g).
+/// Tuning order: raise rate_Kp until oscillation, back off 30%, then add rate_Kd
+/// to damp, then rate_Ki for steady-state, then repeat for attitude loop.
 const DT: f32 = 1.0 / 500.0;
 
 pub struct FlightPids {
@@ -68,13 +70,17 @@ pub struct FlightPids {
 impl Default for FlightPids {
     fn default() -> Self {
         Self {
-            att_roll:   Pid::new(4.5, 0.0, 0.0,  100.0, 400.0),
-            att_pitch:  Pid::new(4.5, 0.0, 0.0,  100.0, 400.0),
-            att_yaw:    Pid::new(4.0, 0.0, 0.0,  100.0, 400.0),
+            // Outer loop: angle error (rad) → rate setpoint (rad/s).
+            // Ki/Kd left at zero — P-only is sufficient for the attitude shell.
+            att_roll:   Pid::new(4.0, 0.0, 0.0, 100.0, 400.0),
+            att_pitch:  Pid::new(4.0, 0.0, 0.0, 100.0, 400.0),
+            att_yaw:    Pid::new(3.0, 0.0, 0.0, 100.0, 400.0),
 
-            rate_roll:  Pid::new(60.0, 40.0, 2.5, 200.0, 500.0),
-            rate_pitch: Pid::new(60.0, 40.0, 2.5, 200.0, 500.0),
-            rate_yaw:   Pid::new(80.0, 30.0, 0.0, 200.0, 500.0),
+            // Inner loop: rate error (rad/s) → torque demand (→ normalised ±1.0).
+            // Kd on yaw omitted — gyro noise on z-axis amplifies into yaw chatter.
+            rate_roll:  Pid::new(50.0, 30.0, 2.0, 200.0, 500.0),
+            rate_pitch: Pid::new(50.0, 30.0, 2.0, 200.0, 500.0),
+            rate_yaw:   Pid::new(70.0, 20.0, 0.0, 200.0, 500.0),
         }
     }
 }

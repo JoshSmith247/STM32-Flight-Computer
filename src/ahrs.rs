@@ -37,10 +37,7 @@ impl MadgwickFilter {
         let f2 = 2.0*(q0*q1 + q2*q3) - ay;
         let f3 = 2.0*(0.5 - q1*q1 - q2*q2) - az;
 
-        let j11 = 2.0*q3; let j12 = 2.0*q0; let j13 = -4.0*q1; // partial derivatives of f1 wrt q
-        // ... (full Jacobian rows omitted for brevity — see reference for complete derivation)
-
-        // Gradient (simplified — full implementation populates all terms)
+        // Gradient = J_g^T * f_g (see Madgwick 2010, eq. 35)
         let s0 = -2.0*q2*f1 + 2.0*q1*f2;
         let s1 =  2.0*q3*f1 + 2.0*q0*f2 - 4.0*q1*f3;
         let s2 = -2.0*q0*f1 + 2.0*q3*f2 - 4.0*q2*f3;
