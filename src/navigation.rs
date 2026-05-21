@@ -14,6 +14,7 @@ use embassy_time::{Duration, Ticker};
 use libm::{atan2f, cosf, sinf, sqrtf};
 
 use crate::{
+    pid::AltPid,
     types::{AttitudeSetpoint, FlightMode, LatLonAlt, NavCommand},
     STATE,
 };
@@ -100,7 +101,9 @@ pub fn bearing_rad(from: LatLonAlt, to: LatLonAlt) -> f32 {
 #[embassy_executor::task]
 pub async fn navigation_task() {
     let mut mission = Mission::new();
-    // TODO: load mission from flash/EEPROM or uplink via MAVLink MISSION_ITEM
+    let mut alt_pid = AltPid::new();
+    let mut hold_alt: f32 = 0.0;
+    let mut prev_mode = FlightMode::Stabilise;
 
     info!("Navigation task started");
     let mut ticker = Ticker::every(Duration::from_hz(100));
@@ -131,12 +134,16 @@ pub async fn navigation_task() {
                 land_setpoint(baro.altitude_m)
             }
             FlightMode::PositionHold => {
-                // TODO: use a horizontal position PID here
+                if prev_mode != FlightMode::PositionHold {
+                    hold_alt = baro.altitude_m;
+                    alt_pid.reset();
+                    info!("PositionHold: locking altitude at {} m", hold_alt);
+                }
                 NavCommand {
                     autonomous: true,
                     attitude_setpoint: AttitudeSetpoint {
                         roll: 0.0, pitch: 0.0, yaw_rate: 0.0,
-                        throttle: 0.55, // approximate hover throttle
+                        throttle: alt_pid.update(hold_alt, baro.altitude_m),
                     },
                     target: gps,
                 }
@@ -145,6 +152,7 @@ pub async fn navigation_task() {
         };
 
         *STATE.nav_command.lock().await = cmd;
+        prev_mode = mode;
     }
 }
 

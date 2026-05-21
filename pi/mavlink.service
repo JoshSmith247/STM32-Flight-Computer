@@ -1,0 +1,15 @@
+[Unit]
+Description=MAVLink bridge (STM32 serial <-> GCS UDP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/drone
+EnvironmentFile=/home/pi/drone/.env
+ExecStart=/usr/bin/python3 /home/pi/drone/mavlink_bridge.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

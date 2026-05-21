@@ -115,6 +115,28 @@ impl FlightPids {
 }
 
 // ---------------------------------------------------------------------------
+// Altitude-hold PID — 100 Hz from navigation_task
+// ---------------------------------------------------------------------------
+
+pub struct AltPid(Pid);
+
+impl AltPid {
+    pub fn new() -> Self {
+        // 1 m error → 0.05 throttle nudge; slow integrator for steady hover.
+        Self(Pid::new(0.05, 0.005, 0.10, 0.3, 0.4))
+    }
+
+    /// Returns throttle [0.1, 0.9] to hold `target_m` above takeoff.
+    pub fn update(&mut self, target_m: f32, current_m: f32) -> f32 {
+        const DT: f32 = 1.0 / 100.0;
+        const HOVER: f32 = 0.55;
+        (HOVER + self.0.update(target_m, current_m, DT)).clamp(0.1, 0.9)
+    }
+
+    pub fn reset(&mut self) { self.0.reset(); }
+}
+
+// ---------------------------------------------------------------------------
 // Motor mixer — quad X configuration
 // ---------------------------------------------------------------------------
 //
