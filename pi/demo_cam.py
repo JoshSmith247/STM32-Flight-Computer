@@ -22,10 +22,13 @@ FFMPEG_CMD = [
     '-re',                  # play at real-time rate
     '-stream_loop', '-1',   # loop indefinitely
     '-i', VIDEO_FILE,
-    '-an',                  # drop audio
-    '-vcodec', 'copy',      # pass H.264 through without re-encoding
-    '-f', 'rtp',
-    f'rtp://{LAPTOP_IP}:{VIDEO_PORT}',
+    '-an',                   # drop audio
+    '-vcodec', 'libx264',    # re-encode to H.264 (handles any source codec)
+    '-preset', 'ultrafast',
+    '-tune', 'zerolatency',
+    '-g', '15',              # keyframe every 30 frames, decoder syncs within 1 s
+    '-f', 'mpegts',
+    f'udp://{LAPTOP_IP}:{VIDEO_PORT}',
 ]
 
 

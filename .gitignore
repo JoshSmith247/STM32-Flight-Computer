@@ -1,3 +1,6 @@
 /target
 */.venv
 */.env
+ground/training/*
+pi/demo/*
+ground/models/*
