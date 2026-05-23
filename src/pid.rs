@@ -54,6 +54,7 @@ impl Pid {
 /// Tuning order: raise rate_Kp until oscillation, back off 30%, then add rate_Kd
 /// to damp, then rate_Ki for steady-state, then repeat for attitude loop.
 const DT: f32 = 1.0 / 500.0;
+const RATE_OUTPUT_LIMIT: f32 = 500.0; // rate PID ceiling; also used to normalise to ±1.0
 
 pub struct FlightPids {
     // Outer attitude loop (angle → rate setpoint)
@@ -78,9 +79,9 @@ impl Default for FlightPids {
 
             // Inner loop: rate error (rad/s) → torque demand (→ normalised ±1.0).
             // Kd on yaw omitted — gyro noise on z-axis amplifies into yaw chatter.
-            rate_roll:  Pid::new(50.0, 30.0, 2.0, 200.0, 500.0),
-            rate_pitch: Pid::new(50.0, 30.0, 2.0, 200.0, 500.0),
-            rate_yaw:   Pid::new(70.0, 20.0, 0.0, 200.0, 500.0),
+            rate_roll:  Pid::new(50.0, 30.0, 2.0, 200.0, RATE_OUTPUT_LIMIT),
+            rate_pitch: Pid::new(50.0, 30.0, 2.0, 200.0, RATE_OUTPUT_LIMIT),
+            rate_yaw:   Pid::new(70.0, 20.0, 0.0, 200.0, RATE_OUTPUT_LIMIT),
         }
     }
 }
@@ -105,7 +106,7 @@ impl FlightPids {
         let pitch_out = self.rate_pitch.update(pitch_rate_sp, body_rate.y, DT);
         let yaw_out   = self.rate_yaw.update(  yaw_rate_sp,   body_rate.z, DT);
 
-        (roll_out / 500.0, pitch_out / 500.0, yaw_out / 500.0)
+        (roll_out / RATE_OUTPUT_LIMIT, pitch_out / RATE_OUTPUT_LIMIT, yaw_out / RATE_OUTPUT_LIMIT)
     }
 
     pub fn reset_all(&mut self) {
@@ -137,6 +138,30 @@ impl AltPid {
 }
 
 // ---------------------------------------------------------------------------
+// Position-hold PID — one per horizontal axis (N and E), 100 Hz
+// ---------------------------------------------------------------------------
+
+pub struct PosPid(Pid);
+
+impl PosPid {
+    pub fn new() -> Self {
+        // 1 m position error → 0.05 rad lean (~3°).  Gentle I term corrects
+        // slow wind drift; D damps oscillation around the hold point.
+        // Output is clamped to ±25° (0.436 rad = MAX_TILT_RAD in navigation).
+        Self(Pid::new(0.05, 0.002, 0.08, 0.3, 0.436))
+    }
+
+    /// `err_m`: (target − current) in metres along one NED body-frame axis.
+    /// Returns a lean angle in radians; sign convention: positive = lean positive.
+    pub fn update(&mut self, err_m: f32) -> f32 {
+        const DT: f32 = 1.0 / 100.0;
+        self.0.update(err_m, 0.0, DT)
+    }
+
+    pub fn reset(&mut self) { self.0.reset(); }
+}
+
+// ---------------------------------------------------------------------------
 // Motor mixer — quad X configuration
 // ---------------------------------------------------------------------------
 //
@@ -152,9 +177,21 @@ impl AltPid {
 //     4    +1    -1     -1   (back-left,   CW)
 
 pub fn mix_quad_x(throttle: f32, roll: f32, pitch: f32, yaw: f32) -> MotorOutputs {
-    let m1 = (throttle - roll + pitch - yaw).clamp(0.0, 1.0);
-    let m2 = (throttle + roll + pitch + yaw).clamp(0.0, 1.0);
-    let m3 = (throttle - roll - pitch + yaw).clamp(0.0, 1.0);
-    let m4 = (throttle + roll - pitch - yaw).clamp(0.0, 1.0);
-    MotorOutputs { m1, m2, m3, m4 }
+    let r1 = throttle - roll + pitch - yaw;
+    let r2 = throttle + roll + pitch + yaw;
+    let r3 = throttle - roll - pitch + yaw;
+    let r4 = throttle + roll - pitch - yaw;
+
+    // Shift all motors by the same offset before clamping so torque ratios are
+    // preserved when any output would otherwise exceed [0, 1].
+    let max_out = r1.max(r2).max(r3).max(r4);
+    let min_out = r1.min(r2).min(r3).min(r4);
+    let offset = if max_out > 1.0 { max_out - 1.0 } else if min_out < 0.0 { min_out } else { 0.0 };
+
+    MotorOutputs {
+        m1: (r1 - offset).clamp(0.0, 1.0),
+        m2: (r2 - offset).clamp(0.0, 1.0),
+        m3: (r3 - offset).clamp(0.0, 1.0),
+        m4: (r4 - offset).clamp(0.0, 1.0),
+    }
 }

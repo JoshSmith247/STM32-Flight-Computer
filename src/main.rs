@@ -3,10 +3,11 @@
 
 mod ahrs;
 mod baro;
+mod battery;
+mod gps;
 mod imu;
 mod led;
 mod motor;
-mod motors;
 mod navigation;
 mod pid;
 mod rc;
@@ -30,12 +31,17 @@ pub type SpiBus = Spi<'static, Async, spi::mode::Master>;
 pub static SPI1_BUS: Mutex<CriticalSectionRawMutex, Option<SpiBus>> = Mutex::new(None);
 
 bind_interrupts!(pub struct Irqs {
-    USART2    => embassy_stm32::usart::InterruptHandler<embassy_stm32::peripherals::USART2>;
-    USART3    => embassy_stm32::usart::InterruptHandler<embassy_stm32::peripherals::USART3>;
-    //SPI1         => embassy_stm32::spi::InterruptHandler<embassy_stm32::peripherals::SPI1>;
+    USART1       => embassy_stm32::usart::InterruptHandler<embassy_stm32::peripherals::USART1>;
+    USART2       => embassy_stm32::usart::InterruptHandler<embassy_stm32::peripherals::USART2>;
+    USART3       => embassy_stm32::usart::InterruptHandler<embassy_stm32::peripherals::USART3>;
+    //SPI1       => embassy_stm32::spi::InterruptHandler<embassy_stm32::peripherals::SPI1>;
+    DMA1_STREAM1 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH1>;
+    DMA1_STREAM3 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH3>;
     DMA1_STREAM5 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH5>;
     DMA2_STREAM0 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA2_CH0>;
     DMA2_STREAM3 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA2_CH3>;
+    DMA2_STREAM5 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA2_CH5>;
+    DMA2_STREAM6 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA2_CH6>;
 });
 
 /// 500 Hz control loop: AHRS fusion → PID cascade → motor mix → STATE.motor_outputs.
@@ -162,14 +168,16 @@ async fn main(spawner: Spawner) {
         ));
     }
 
-    let led = Output::new(p.PG7, Level::Low, Speed::Low);
+    let led = Output::new(p.PG7, Level::High, Speed::Low); // active-low: start HIGH = off
 
     spawner.spawn(led::led_task(led).unwrap());
     spawner.spawn(imu::imu_task(p.PA4).unwrap());
     spawner.spawn(motor::motor_task(p.TIM3, p.PB4, p.PB5, p.PB0, p.PB1).unwrap());
     spawner.spawn(rc::rc_task(p.USART2, p.PA2, p.PA3, p.DMA1_CH5, Irqs).unwrap());
-    spawner.spawn(telemetry::telemetry_task(p.USART3, p.PB10, p.PB11, p.DMA1_CH3, Irqs).unwrap());
+    spawner.spawn(telemetry::telemetry_task(p.USART3, p.PB11, p.PB10, p.DMA1_CH3, p.DMA1_CH1, Irqs).unwrap());
     spawner.spawn(baro::baro_task(p.PA8).unwrap());
+    spawner.spawn(gps::gps_task(p.USART1, p.PA10, p.PA9, p.DMA2_CH6, p.DMA2_CH5, Irqs).unwrap());
+    spawner.spawn(battery::battery_task(p.ADC3, p.PC0).unwrap());
     spawner.spawn(navigation::navigation_task().unwrap());
     spawner.spawn(control_task().unwrap());
     spawner.spawn(arming_task().unwrap());

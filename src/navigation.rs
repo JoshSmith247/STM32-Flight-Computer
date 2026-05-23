@@ -14,7 +14,8 @@ use embassy_time::{Duration, Ticker};
 use libm::{atan2f, cosf, sinf, sqrtf};
 
 use crate::{
-    pid::AltPid,
+    pid::{AltPid, PosPid},
+    state,
     types::{AttitudeSetpoint, FlightMode, LatLonAlt, NavCommand},
     STATE,
 };
@@ -100,10 +101,14 @@ pub fn bearing_rad(from: LatLonAlt, to: LatLonAlt) -> f32 {
 
 #[embassy_executor::task]
 pub async fn navigation_task() {
-    let mut mission = Mission::new();
-    let mut alt_pid = AltPid::new();
-    let mut hold_alt: f32 = 0.0;
-    let mut prev_mode = FlightMode::Stabilise;
+    let mut mission   = Mission::new();
+    let mut alt_pid   = AltPid::new();
+    let mut pos_pid_n = PosPid::new();     // NED North axis
+    let mut pos_pid_e = PosPid::new();     // NED East axis
+    let mut hold_alt: f32     = 0.0;
+    let mut hold_pos          = LatLonAlt::default();
+    let mut prev_mode         = FlightMode::Stabilise;
+    let mut home_set          = false;
 
     info!("Navigation task started");
     let mut ticker = Ticker::every(Duration::from_hz(100));
@@ -111,48 +116,124 @@ pub async fn navigation_task() {
     loop {
         ticker.next().await;
 
-        let mode      = STATE.rc_input.lock().await.mode;
-        let gps       = *STATE.gps_fix.lock().await;
-        let baro      = *STATE.baro_data.lock().await;
-        let attitude  = *STATE.attitude.lock().await;
-        let is_armed  = *STATE.armed.lock().await;
+        let mode     = STATE.rc_input.lock().await.mode;
+        let gps      = *STATE.gps_fix.lock().await;
+        let baro     = *STATE.baro_data.lock().await;
+        let attitude = *STATE.attitude.lock().await;
+        let battery  = *STATE.battery.lock().await;
+        let is_armed = *STATE.armed.lock().await;
 
         if !is_armed {
-            let mut cmd = STATE.nav_command.lock().await;
-            cmd.autonomous = false;
+            STATE.nav_command.lock().await.autonomous = false;
             continue;
         }
 
-        let cmd = match mode {
+        // Capture home position on first confirmed 3-D fix
+        if !home_set && gps.fix_ok {
+            mission.set_home(gps.pos());
+            home_set = true;
+            info!("Home set: lat={=f64} lon={=f64}", gps.lat_deg, gps.lon_deg);
+        }
+
+        // Fault state (Pi lost, or battery task set it) → force Land immediately.
+        // Auto-disarm once we touch down so the drone can't re-arm from Fault.
+        if state::get() == state::FlightState::Fault {
+            if baro.altitude_m < 0.3 && is_armed {
+                *STATE.armed.lock().await = false;
+                info!("Fault landing complete — disarmed");
+            }
+        }
+
+        // Battery critical abort — override RC mode with RTH or Land.
+        // Keeps the current mode if we are already landing.
+        let effective_mode = if state::get() == state::FlightState::Fault {
+            FlightMode::Land
+        } else if battery.critical && !matches!(mode, FlightMode::Land) {
+            if gps.fix_ok && home_set {
+                warn!("Critical battery — forcing RTH");
+                state::set(state::FlightState::Landing);
+                FlightMode::ReturnToHome
+            } else {
+                warn!("Critical battery — forcing Land");
+                state::set(state::FlightState::Landing);
+                FlightMode::Land
+            }
+        } else {
+            mode
+        };
+
+        let cmd = match effective_mode {
             FlightMode::Auto => {
-                navigate_mission(&mut mission, gps, baro.altitude_m)
+                if !gps.fix_ok {
+                    warn!("Auto: no GPS fix — loitering in place");
+                    NavCommand { autonomous: false, ..Default::default() }
+                } else {
+                    navigate_mission(&mut mission, gps.pos(), baro.altitude_m)
+                }
             }
             FlightMode::ReturnToHome => {
-                navigate_to(mission.home, gps, baro.altitude_m, 30.0)
+                if !gps.fix_ok || !home_set {
+                    warn!("RTH: no GPS fix or home — forcing Land");
+                    land_setpoint(baro.altitude_m)
+                } else {
+                    navigate_to(mission.home, gps.pos(), baro.altitude_m, 30.0)
+                }
             }
             FlightMode::Land => {
                 land_setpoint(baro.altitude_m)
             }
             FlightMode::PositionHold => {
                 if prev_mode != FlightMode::PositionHold {
-                    hold_alt = baro.altitude_m;
+                    hold_alt  = baro.altitude_m;
+                    hold_pos  = gps.pos();
+                    pos_pid_n.reset();
+                    pos_pid_e.reset();
                     alt_pid.reset();
-                    info!("PositionHold: locking altitude at {} m", hold_alt);
+                    info!("PositionHold: alt={=f32}m  lat={=f64}  lon={=f64}",
+                          hold_alt, hold_pos.lat_deg, hold_pos.lon_deg);
                 }
+
+                let (roll_sp, pitch_sp) = if gps.fix_ok {
+                    // Position error in NED metres (f64 for precision, cast before PIDs)
+                    let lat_rad = (gps.lat_deg as f32).to_radians();
+                    let err_n   = ((hold_pos.lat_deg - gps.lat_deg) * 111_320.0) as f32;
+                    let err_e   = ((hold_pos.lon_deg - gps.lon_deg) * 111_320.0
+                                   * cosf(lat_rad) as f64) as f32;
+
+                    // Rotate NED error into body frame using drone heading
+                    let yaw = atan2f(
+                        2.0 * (attitude.w * attitude.z + attitude.x * attitude.y),
+                        1.0 - 2.0 * (attitude.y * attitude.y + attitude.z * attitude.z),
+                    );
+                    let fwd_m   =  err_n * cosf(yaw) + err_e * sinf(yaw);
+                    let right_m = -err_n * sinf(yaw) + err_e * cosf(yaw);
+
+                    // Pitch nose-down to go forward (negative pitch = forward).
+                    // Roll right to go east (positive roll = right).
+                    let pitch = -pos_pid_n.update(fwd_m);
+                    let roll  =  pos_pid_e.update(right_m);
+                    (roll, pitch)
+                } else {
+                    // No GPS fix — altitude hold only, zero horizontal lean
+                    (0.0, 0.0)
+                };
+
                 NavCommand {
                     autonomous: true,
                     attitude_setpoint: AttitudeSetpoint {
-                        roll: 0.0, pitch: 0.0, yaw_rate: 0.0,
+                        roll:     roll_sp,
+                        pitch:    pitch_sp,
+                        yaw_rate: 0.0,
                         throttle: alt_pid.update(hold_alt, baro.altitude_m),
                     },
-                    target: gps,
+                    target: hold_pos,
                 }
             }
             _ => NavCommand { autonomous: false, ..Default::default() },
         };
 
         *STATE.nav_command.lock().await = cmd;
-        prev_mode = mode;
+        prev_mode = effective_mode;
     }
 }
 

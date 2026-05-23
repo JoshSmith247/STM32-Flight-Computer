@@ -43,6 +43,34 @@ pub struct LatLonAlt {
     pub alt_m:   f32,
 }
 
+/// Live GPS fix from u-blox M8N, updated by gps_task.
+#[derive(Clone, Copy, defmt::Format)]
+pub struct GpsFix {
+    pub lat_deg:  f64,
+    pub lon_deg:  f64,
+    pub alt_m:    f32,
+    pub vel_n_ms: f32,    // NED velocity m/s
+    pub vel_e_ms: f32,
+    pub vel_d_ms: f32,
+    pub hacc_m:   f32,    // horizontal accuracy estimate
+    pub fix_ok:   bool,
+}
+
+impl Default for GpsFix {
+    fn default() -> Self {
+        Self { lat_deg: 0.0, lon_deg: 0.0, alt_m: 0.0,
+               vel_n_ms: 0.0, vel_e_ms: 0.0, vel_d_ms: 0.0,
+               hacc_m: 9999.0, fix_ok: false }
+    }
+}
+
+impl GpsFix {
+    /// Extract a plain waypoint coordinate for use with navigation helpers.
+    pub fn pos(&self) -> LatLonAlt {
+        LatLonAlt { lat_deg: self.lat_deg, lon_deg: self.lon_deg, alt_m: self.alt_m }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sensor data
 // ---------------------------------------------------------------------------
@@ -59,6 +87,21 @@ pub struct BaroData {
     pub pressure_pa: f32,
     pub temp_c:      f32,
     pub altitude_m:  f32,   // derived via ISA model
+}
+
+/// Battery state — updated at 2 Hz by battery_task.
+#[derive(Clone, Copy, defmt::Format)]
+pub struct BatteryData {
+    pub voltage_v: f32,
+    pub pct:       u8,      // 0–100 %
+    pub critical:  bool,    // true when per-cell V < 3.50 V for ≥ 2.5 s
+}
+
+impl Default for BatteryData {
+    fn default() -> Self {
+        // Optimistic defaults so the drone can arm before the battery task reads hardware.
+        Self { voltage_v: 12.6, pct: 100, critical: false }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -146,7 +189,8 @@ pub struct SharedState {
     pub rc_input:     Mutex<CriticalSectionRawMutex, RcInput>,
     pub nav_command:  Mutex<CriticalSectionRawMutex, NavCommand>,
     pub motor_outputs:Mutex<CriticalSectionRawMutex, MotorOutputs>,
-    pub gps_fix:      Mutex<CriticalSectionRawMutex, LatLonAlt>,
+    pub gps_fix:      Mutex<CriticalSectionRawMutex, GpsFix>,
+    pub battery:      Mutex<CriticalSectionRawMutex, BatteryData>,
     pub armed:        Mutex<CriticalSectionRawMutex, bool>,
 }
 
@@ -159,7 +203,8 @@ impl SharedState {
             rc_input:      Mutex::new(RcInput    { throttle:0.0, roll:0.0, pitch:0.0, yaw:0.0, arm:false, mode: FlightMode::Stabilise, failsafe: false }),
             nav_command:   Mutex::new(NavCommand { autonomous: false, attitude_setpoint: AttitudeSetpoint { roll:0.0, pitch:0.0, yaw_rate:0.0, throttle:0.0 }, target: LatLonAlt { lat_deg:0.0, lon_deg:0.0, alt_m:0.0 } }),
             motor_outputs: Mutex::new(MotorOutputs { m1:0.0, m2:0.0, m3:0.0, m4:0.0 }),
-            gps_fix:       Mutex::new(LatLonAlt  { lat_deg:0.0, lon_deg:0.0, alt_m:0.0 }),
+            gps_fix:       Mutex::new(GpsFix { lat_deg:0.0, lon_deg:0.0, alt_m:0.0, vel_n_ms:0.0, vel_e_ms:0.0, vel_d_ms:0.0, hacc_m:9999.0, fix_ok:false }),
+            battery:       Mutex::new(BatteryData { voltage_v:12.6, pct:100, critical:false }),
             armed:         Mutex::new(false),
         }
     }

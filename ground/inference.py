@@ -22,7 +22,8 @@ flow tracker, same YOLO background thread, same MAVLink stub).
 import os
 import sys
 import math
-# import socket
+import json
+import socket
 import threading
 # import queue
 import cv2
@@ -38,10 +39,11 @@ except ImportError:
 
 load_dotenv()
 
-LAPTOP_IP     = os.environ.get('LAPTOP_IP',    '192.168.4.2')
-VIDEO_PORT    = int(os.environ.get('VIDEO_PORT',  '5600'))
-GCS_PORT      = int(os.environ.get('GCS_PORT',    '14550'))
-PI_IP         = os.environ.get('PI_IP',        '192.168.4.1')
+LAPTOP_IP         = os.environ.get('LAPTOP_IP',        '192.168.4.2')
+VIDEO_PORT        = int(os.environ.get('VIDEO_PORT',      '5600'))
+GCS_PORT          = int(os.environ.get('GCS_PORT',        '14550'))
+PI_IP             = os.environ.get('PI_IP',            '192.168.4.1')
+WEED_TARGET_PORT  = int(os.environ.get('WEED_TARGET_PORT', '5700'))
 # MODEL_PATH    = os.environ.get('MODEL_PATH',   'yolov8n.pt')
 # CONF_THRESH   = float(os.environ.get('CONF_THRESH',  '0.4'))
 # IOU_THRESH    = float(os.environ.get('IOU_THRESH',   '0.45'))
@@ -52,7 +54,10 @@ EXG_THRESH    = float(os.environ.get('EXG_THRESH',  '20.0'))  # 2G-R-B cutoff
 EXG_MIN_AREA  = int(os.environ.get('EXG_MIN_AREA',  '250'))   # px² minimum blob
 EXG_SAT_MIN   = int(os.environ.get('EXG_SAT_MIN',   '40'))    # HSV saturation floor (0-255); rocks score low here
 EXG_MAX_FRAC       = float(os.environ.get('EXG_MAX_FRAC',        '0.04'))  # max blob as fraction of frame area
-REMATCH_THRESH     = 0.45    # normalized correlation floor for template re-ID
+REMATCH_THRESH     = 0.35    # template correlation floor — no GPS (multiple blobs competing)
+REMATCH_THRESH_GPS = 0.12    # template correlation floor — GPS world-gate already fired;
+                             #   just confirms something green is at the right location
+TEMPLATE_POOL_SIZE = 3       # rolling window of templates kept per weed
 MAX_LOST_FRAMES    = 90      # frames (~3 s at 30 fps) before a lost named weed is discarded
 CAM_HFOV           = float(os.environ.get('CAM_HFOV',           '62.0'))  # camera horizontal FOV, degrees
 WORLD_REMATCH_DIST = float(os.environ.get('WORLD_REMATCH_DIST',  '0.4'))  # metres radius for position-based re-ID
@@ -65,6 +70,29 @@ FFMPEG_URL = f"udp://@0.0.0.0:{VIDEO_PORT}?overrun_nonfatal=1&fifo_size=5000000"
 
 LK_PARAMS = dict(winSize=(21, 21), maxLevel=3,
                  criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+
+# Sidebar dimensions (drawn at display resolution, appended to the right of the frame)
+SIDEBAR_W      = 200
+SIDEBAR_HDR_H  = 40   # title bar height
+SIDEBAR_ROW_H  = 28   # height per weed entry
+
+# ---------------------------------------------------------------------------
+# Weed target sender — UDP to Pi weed_pilot.py
+# ---------------------------------------------------------------------------
+
+_target_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+
+def send_weed_target(wid: int, east_m: float, north_m: float) -> None:
+    """Send selected weed's world position to the Pi over UDP."""
+    msg = json.dumps({'wid': wid, 'east_m': round(east_m, 3),
+                      'north_m': round(north_m, 3)}).encode()
+    try:
+        _target_sock.sendto(msg, (PI_IP, WEED_TARGET_PORT))
+        print(f"Sent W{wid} → Pi: {east_m:.2f}m E, {north_m:.2f}m N", flush=True)
+    except OSError as exc:
+        print(f"UDP send failed: {exc}", flush=True)
+
 
 # ---------------------------------------------------------------------------
 # MAVLink position receiver
@@ -202,6 +230,7 @@ class WeedTracker:
         self._next_id = 1
         self._pending_click: tuple[int, int] | None = None
         self._frame_size: tuple[int, int] | None = None
+        self._selected_wid: int | None = None  # weed shown in red / highlighted in sidebar
 
     def set_frame_size(self, w: int, h: int) -> None:
         self._frame_size = (w, h)
@@ -251,8 +280,8 @@ class WeedTracker:
 
     # ── Named-weed tracking ──────────────────────────────────────────────────
 
-    def _tmatch(self, template: np.ndarray, frame: np.ndarray, box: tuple) -> float:
-        """Normalized cross-correlation between stored template and a candidate blob."""
+    def _tmatch_one(self, template: np.ndarray, frame: np.ndarray, box: tuple) -> float:
+        """Normalized cross-correlation between one template and a candidate blob."""
         if template is None or template.size == 0:
             return 0.0
         x1, y1, x2, y2 = box
@@ -266,8 +295,19 @@ class WeedTracker:
         result = cv2.matchTemplate(cand_g, tmpl_g, cv2.TM_CCOEFF_NORMED)
         return float(result[0, 0])
 
+    def _tmatch(self, templates: list, frame: np.ndarray, box: tuple) -> float:
+        """Best match score across the entire template pool for this weed."""
+        return max((self._tmatch_one(t, frame, box) for t in templates), default=0.0)
+
+    @staticmethod
+    def _push_template(w: dict, crop: np.ndarray) -> None:
+        """Add a new crop to the rolling template pool, evicting the oldest if full."""
+        w['templates'].append(crop.copy())
+        if len(w['templates']) > TEMPLATE_POOL_SIZE:
+            w['templates'].pop(0)
+
     def _name_box(self, box: tuple, frame: np.ndarray) -> None:
-        """Capture template, optical flow seed, and world position for a new named weed."""
+        """Capture template pool, optical flow seed, and world position for a new named weed."""
         x1, y1, x2, y2 = box
         template = frame[y1:y2, x1:x2].copy()
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -285,7 +325,7 @@ class WeedTracker:
         wid = self._next_id
         self._next_id += 1
         self._named[wid] = {
-            'box': box, 'template': template, 'pts': pts,
+            'box': box, 'templates': [template], 'pts': pts,
             'lost_frames': 0, 'world_pos': world_pos,
         }
         loc = (f"{world_pos[0]:.2f}m E, {world_pos[1]:.2f}m N"
@@ -342,8 +382,8 @@ class WeedTracker:
                 if pts2 is not None:
                     pts2[:, 0, 0] += ex1
                     pts2[:, 0, 1] += ey1
-                w['pts']      = pts2
-                w['template'] = frame[ey1:ey2, ex1:ex2].copy()
+                w['pts'] = pts2
+                self._push_template(w, frame[ey1:ey2, ex1:ex2])
                 if self._frame_size is not None:
                     wp = pixel_to_world((ex1 + ex2) / 2, (ey1 + ey2) / 2,
                                         self._frame_size[0], self._frame_size[1])
@@ -372,6 +412,7 @@ class WeedTracker:
             for i, box in enumerate(exg_blobs):
                 if i in claimed:
                     continue
+                world_confirmed = False
                 if w['world_pos'] is not None and self._frame_size is not None:
                     bcx = (box[0] + box[2]) / 2
                     bcy = (box[1] + box[3]) / 2
@@ -382,8 +423,13 @@ class WeedTracker:
                                           wp[1] - w['world_pos'][1])
                         if dist > WORLD_REMATCH_DIST:
                             continue   # too far in the world
-                score = self._tmatch(w['template'], frame, box)
-                if score > REMATCH_THRESH:
+                        world_confirmed = True
+                # GPS-confirmed candidates need only a loose template sanity check;
+                # without GPS, template matching is the only discriminator so we
+                # require a stricter score to avoid cross-ID between similar weeds.
+                thresh = REMATCH_THRESH_GPS if world_confirmed else REMATCH_THRESH
+                score  = self._tmatch(w['templates'], frame, box)
+                if score > thresh:
                     candidates.append((score, i))
             if not candidates:
                 continue
@@ -395,8 +441,8 @@ class WeedTracker:
             if pts2 is not None:
                 pts2[:, 0, 0] += ex1
                 pts2[:, 0, 1] += ey1
-            w['pts']      = pts2
-            w['template'] = frame[ey1:ey2, ex1:ex2].copy()
+            w['pts'] = pts2
+            self._push_template(w, frame[ey1:ey2, ex1:ex2])
             if self._frame_size is not None:
                 wp = pixel_to_world((ex1 + ex2) / 2, (ey1 + ey2) / 2,
                                      self._frame_size[0], self._frame_size[1])
@@ -452,13 +498,18 @@ class WeedTracker:
         out = frame.copy()
         named_boxes = {w['box'] for w in self._named.values()}
 
-        # Named weeds — teal label when active, grey when searching for re-entry
+        # Named weeds — red when selected, teal when active, grey when lost
         for wid, w in self._named.items():
             x1, y1, x2, y2 = w['box']
-            active = w['lost_frames'] == 0
-            color  = (0, 230, 160) if active else (90, 90, 90)
-            label  = f"W{wid}" if active else f"W{wid}?"
-            cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+            active   = w['lost_frames'] == 0
+            selected = wid == self._selected_wid
+            if selected:
+                color, label, thick = (0, 0, 220), f"W{wid}", 3   # red (BGR)
+            elif active:
+                color, label, thick = (0, 230, 160), f"W{wid}", 2  # teal
+            else:
+                color, label, thick = (90, 90, 90), f"W{wid}?", 2  # grey
+            cv2.rectangle(out, (x1, y1), (x2, y2), color, thick)
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             cv2.rectangle(out, (x1, y1 - th - 6), (x1 + tw + 6, y1), color, -1)
             cv2.putText(out, label, (x1 + 3, y1 - 3),
@@ -478,6 +529,61 @@ class WeedTracker:
             cv2.putText(out, f"{track['label']} #{tid}",
                         (x1, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 0, 200), 1, cv2.LINE_AA)
         return out
+
+    def sidebar_click(self, y: int) -> None:
+        """Toggle selection of the weed at sidebar row y."""
+        if y < SIDEBAR_HDR_H:
+            return
+        idx  = (y - SIDEBAR_HDR_H) // SIDEBAR_ROW_H
+        wids = sorted(self._named.keys())
+        if 0 <= idx < len(wids):
+            wid = wids[idx]
+            self._selected_wid = None if self._selected_wid == wid else wid
+
+    def draw_sidebar(self, h: int) -> np.ndarray:
+        """Return a SIDEBAR_W × h panel listing all named weeds."""
+        panel = np.full((h, SIDEBAR_W, 3), (35, 35, 35), dtype=np.uint8)
+
+        # Title bar
+        cv2.rectangle(panel, (0, 0), (SIDEBAR_W, SIDEBAR_HDR_H - 1), (55, 55, 55), -1)
+        cv2.putText(panel, "Named Weeds", (8, 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (210, 210, 210), 1, cv2.LINE_AA)
+        cv2.line(panel, (0, SIDEBAR_HDR_H - 1), (SIDEBAR_W, SIDEBAR_HDR_H - 1),
+                 (70, 70, 70), 1)
+
+        mid = SIDEBAR_ROW_H // 2
+        for i, wid in enumerate(sorted(self._named.keys())):
+            w        = self._named[wid]
+            y0       = SIDEBAR_HDR_H + i * SIDEBAR_ROW_H
+            active   = w['lost_frames'] == 0
+            selected = wid == self._selected_wid
+
+            # Row highlight for selected weed
+            if selected:
+                cv2.rectangle(panel, (2, y0 + 1), (SIDEBAR_W - 2, y0 + SIDEBAR_ROW_H - 1),
+                              (60, 25, 25), -1)
+
+            # Status dot
+            dot_color = (50, 200, 80) if active else (70, 70, 70)
+            cv2.circle(panel, (12, y0 + mid), 4, dot_color, -1)
+
+            # Weed label
+            label = f"W{wid}" if active else f"W{wid}?"
+            if selected:
+                text_color = (80, 80, 220)    # red-ish (BGR) for selected
+            elif active:
+                text_color = (180, 220, 180)  # light green for active
+            else:
+                text_color = (100, 100, 100)  # grey for lost
+            cv2.putText(panel, label, (22, y0 + mid + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, text_color, 1, cv2.LINE_AA)
+
+            # GPS indicator
+            if w['world_pos']:
+                cv2.putText(panel, "GPS", (SIDEBAR_W - 38, y0 + mid + 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 150, 80), 1, cv2.LINE_AA)
+
+        return panel
 
     def centroids(self) -> list[tuple[float, float]]:
         result = []
@@ -549,18 +655,25 @@ def main() -> None:
     disp_w = int(frame_w * disp_scale)
     disp_h = int(frame_h * disp_scale)
 
-    # sock     = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     tracker  = WeedTracker()
     tracker.set_frame_size(frame_w, frame_h)
-    show_exg = False
+    show_exg      = False
+    prev_selected: int | None = None
 
     WIN = "Weed Detection — ExG"
     cv2.namedWindow(WIN, cv2.WINDOW_AUTOSIZE)
-    cv2.setMouseCallback(
-        WIN,
-        lambda e, x, y, *_: tracker.queue_click(int(x / disp_scale), int(y / disp_scale))
-        if e == cv2.EVENT_LBUTTONDOWN else None,
-    )
+
+    def on_mouse(event, x, y, _flags, _param):
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        if x >= disp_w:
+            # Click in sidebar — toggle weed selection
+            tracker.sidebar_click(y)
+        else:
+            # Click in camera feed — name / remove weed
+            tracker.queue_click(int(x / disp_scale), int(y / disp_scale))
+
+    cv2.setMouseCallback(WIN, on_mouse)
 
     # worker = threading.Thread(target=_inference_worker, daemon=True)
     # worker.start()
@@ -615,12 +728,22 @@ def main() -> None:
         cv2.putText(display, hud, (8, 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
 
-        # for cx, cy in tracker.centroids():
-        #     send_target(sock,
-        #                 (cx - frame_w / 2) / (frame_w / 2),
-        #                 (cy - frame_h / 2) / (frame_h / 2))
+        # Sidebar — appended to the right; mouse callback uses disp_w as the boundary
+        sidebar  = tracker.draw_sidebar(disp_h)
+        combined = np.hstack([display, sidebar])
 
-        cv2.imshow(WIN, display)
+        # Send weed target to Pi when the operator selects (or changes) a weed
+        sel = tracker._selected_wid
+        if sel != prev_selected:
+            prev_selected = sel
+            if sel is not None:
+                wp = tracker._named.get(sel, {}).get('world_pos')
+                if wp is not None:
+                    send_weed_target(sel, wp[0], wp[1])
+                else:
+                    print(f"W{sel} selected — no GPS fix yet, target not sent", flush=True)
+
+        cv2.imshow(WIN, combined)
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
@@ -631,7 +754,7 @@ def main() -> None:
     # _infer_queue.put(None)
     cap.release()
     cv2.destroyAllWindows()
-    # sock.close()
+    _target_sock.close()
     print(f"\nDone. {frame_count} frames processed.", flush=True)
 
 

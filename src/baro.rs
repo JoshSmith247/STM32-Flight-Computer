@@ -24,7 +24,6 @@ use embassy_stm32::{
 use embassy_time::{Duration, Ticker, Timer};
 
 use crate::{
-    state::FlightState,
     types::BaroData,
     STATE,
 };
