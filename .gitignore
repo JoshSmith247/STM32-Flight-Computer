@@ -4,3 +4,4 @@
 ground/training/*
 pi/demo/*
 ground/models/*
+**/__pycache__/*

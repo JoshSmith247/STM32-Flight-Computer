@@ -28,7 +28,7 @@ use crate::{state, types::BatteryData, STATE};
 
 // ── Tune these for your hardware ────────────────────────────────────────────
 
-const CELL_COUNT: u32 = 3;          // 3 for 3S, 4 for 4S
+const CELL_COUNT: u32 = 4;          // 3 for 3S, 4 for 4S
 const V_DIVIDER:  f32 = 5.7;        // (R1 + R2) / R2
 const VREF:       f32 = 3.3;        // STM32 VDDA
 const ADC_FULL:   f32 = 4095.0;     // 12-bit resolution
