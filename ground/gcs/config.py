@@ -36,6 +36,11 @@ SIDEBAR_HDR_H  = 40   # title bar height
 SIDEBAR_ROW_H  = 28   # height per weed entry
 STATS_W        = 1800  # drone stats panel width (2-column) — mutated by main() after window probe
 PROGRAMS  = ['MANUAL', 'FOLLOW ME', 'WEED PICKER', "RETURN HOME"]
-PAYLOADS  = ['ExG Camera', 'Weed Sprayer']
+
+# Payload flag bit → display name.  Must match payload_flags constants in src/types.rs.
+PAYLOAD_NAMES = {
+    0: 'Servo Bus (4ch)',
+}
+
 OVERLAY_W = 210
 OVERLAY_H = 28 + len(PROGRAMS) * 26 + 10 + 30 + 8

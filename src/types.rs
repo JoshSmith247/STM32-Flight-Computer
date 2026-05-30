@@ -182,16 +182,56 @@ pub struct MotorOutputs {
 // Global shared state (Embassy async mutexes, ISR-safe)
 // ---------------------------------------------------------------------------
 
+/// Optical flow + rangefinder data from MTF-02P, updated by flow_task.
+#[derive(Clone, Copy, Default, defmt::Format)]
+pub struct FlowData {
+    pub quality:      u8,    // 0–255
+    pub vel_x_mrad_s: i32,   // body-frame X velocity (mrad/s × 1000)
+    pub vel_y_mrad_s: i32,   // body-frame Y velocity (mrad/s × 1000)
+    pub height_mm:    i32,   // rangefinder reading in mm; -1 = no data
+    pub valid:        bool,  // quality > 50 and recent frame received
+}
+
+/// Magnetometer data from QMC5883L, updated by mag_task at 25 Hz.
+#[derive(Clone, Copy, Default, defmt::Format)]
+pub struct MagData {
+    pub x:           f32,  // raw X (LSB, sensor frame)
+    pub y:           f32,  // raw Y (LSB, sensor frame)
+    pub z:           f32,  // raw Z (LSB, sensor frame)
+    pub heading_rad: f32,  // tilt-compensated magnetic heading (0=N, clockwise +)
+    pub valid:       bool,
+}
+
+/// Normalised servo positions [0.0, 1.0] written by navigation/ground station.
+/// 0.0 = 1000 µs (min), 1.0 = 2000 µs (max). Defaults to 0.0 (retracted).
+#[derive(Clone, Copy, Default, defmt::Format)]
+pub struct ServoOutputs {
+    pub s1: f32,
+    pub s2: f32,
+    pub s3: f32,
+    pub s4: f32,
+}
+
+/// Payload presence flags — set by each payload task on successful hardware init.
+/// Packed into HEARTBEAT custom_mode bits [31:16] and forwarded to the GCS.
+pub mod payload_flags {
+    pub const SERVO_OUTPUTS: u32 = 1 << 0;  // TIM4 servo bus (4 channels, PD12–PD15)
+}
+
 pub struct SharedState {
-    pub attitude:     Mutex<CriticalSectionRawMutex, Quaternion>,
-    pub imu_data:     Mutex<CriticalSectionRawMutex, ImuData>,
-    pub baro_data:    Mutex<CriticalSectionRawMutex, BaroData>,
-    pub rc_input:     Mutex<CriticalSectionRawMutex, RcInput>,
-    pub nav_command:  Mutex<CriticalSectionRawMutex, NavCommand>,
-    pub motor_outputs:Mutex<CriticalSectionRawMutex, MotorOutputs>,
-    pub gps_fix:      Mutex<CriticalSectionRawMutex, GpsFix>,
-    pub battery:      Mutex<CriticalSectionRawMutex, BatteryData>,
-    pub armed:        Mutex<CriticalSectionRawMutex, bool>,
+    pub attitude:      Mutex<CriticalSectionRawMutex, Quaternion>,
+    pub imu_data:      Mutex<CriticalSectionRawMutex, ImuData>,
+    pub baro_data:     Mutex<CriticalSectionRawMutex, BaroData>,
+    pub rc_input:      Mutex<CriticalSectionRawMutex, RcInput>,
+    pub nav_command:   Mutex<CriticalSectionRawMutex, NavCommand>,
+    pub motor_outputs: Mutex<CriticalSectionRawMutex, MotorOutputs>,
+    pub gps_fix:       Mutex<CriticalSectionRawMutex, GpsFix>,
+    pub battery:       Mutex<CriticalSectionRawMutex, BatteryData>,
+    pub armed:         Mutex<CriticalSectionRawMutex, bool>,
+    pub flow:          Mutex<CriticalSectionRawMutex, FlowData>,
+    pub servo_outputs: Mutex<CriticalSectionRawMutex, ServoOutputs>,
+    pub mag_data:      Mutex<CriticalSectionRawMutex, MagData>,
+    pub payload_flags: Mutex<CriticalSectionRawMutex, u32>,
 }
 
 impl SharedState {
@@ -206,6 +246,10 @@ impl SharedState {
             gps_fix:       Mutex::new(GpsFix { lat_deg:0.0, lon_deg:0.0, alt_m:0.0, vel_n_ms:0.0, vel_e_ms:0.0, vel_d_ms:0.0, hacc_m:9999.0, fix_ok:false }),
             battery:       Mutex::new(BatteryData { voltage_v:12.6, pct:100, critical:false }),
             armed:         Mutex::new(false),
+            flow:          Mutex::new(FlowData { quality:0, vel_x_mrad_s:0, vel_y_mrad_s:0, height_mm:-1, valid:false }),
+            servo_outputs: Mutex::new(ServoOutputs { s1:0.0, s2:0.0, s3:0.0, s4:0.0 }),
+            mag_data:      Mutex::new(MagData { x:0.0, y:0.0, z:0.0, heading_rad:0.0, valid:false }),
+            payload_flags: Mutex::new(0u32),
         }
     }
 }

@@ -46,6 +46,10 @@ _mav_state: dict = {
     'voltage_mv': -1, 'current_ca': -1,
     'mah_consumed': -1, 'time_remaining_s': 0,
     'motor_pwm': [0, 0, 0, 0],
+    # Decoded from HEARTBEAT custom_mode (see telemetry.rs build_heartbeat)
+    'flight_mode_id': 0,   # FlightMode enum value [7:0]
+    'flight_state':   0,   # FlightState enum value [15:8]
+    'payload_flags':  0,   # connected payload bitmask [31:16]
 }
 
 
@@ -82,8 +86,11 @@ def _mav_listener() -> None:
             elif msg.get_type() == 'SYS_STATUS':
                 _mav_state['battery_pct'] = msg.battery_remaining
             elif msg.get_type() == 'HEARTBEAT':
-                _mav_state['armed'] = bool(msg.base_mode & 128)
-                _mav_state['mode']  = str(msg.custom_mode)
+                cm = msg.custom_mode
+                _mav_state['armed']          = bool(msg.base_mode & 128)
+                _mav_state['flight_mode_id'] = cm & 0xFF
+                _mav_state['flight_state']   = (cm >> 8) & 0xFF
+                _mav_state['payload_flags']  = (cm >> 16) & 0xFFFF
             elif msg.get_type() == 'BATTERY_STATUS':
                 valid = [v for v in msg.voltages if v != 65535]
                 _mav_state.update(

@@ -1,4 +1,5 @@
 /target
+/reading
 */.venv
 */.env
 ground/training/*

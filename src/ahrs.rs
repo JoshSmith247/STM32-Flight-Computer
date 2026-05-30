@@ -70,7 +70,7 @@ impl MadgwickFilter {
         let q = &self.q;
         Euler {
             roll:  libm::atan2f(2.0*(q.w*q.x + q.y*q.z), 1.0 - 2.0*(q.x*q.x + q.y*q.y)),
-            pitch: libm::asinf( 2.0*(q.w*q.y - q.z*q.x)),
+            pitch: libm::asinf((2.0*(q.w*q.y - q.z*q.x)).clamp(-1.0, 1.0)),
             yaw:   libm::atan2f(2.0*(q.w*q.z + q.x*q.y), 1.0 - 2.0*(q.y*q.y + q.z*q.z)),
         }
     }

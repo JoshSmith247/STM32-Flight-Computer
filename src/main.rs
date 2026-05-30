@@ -4,13 +4,16 @@
 mod ahrs;
 mod baro;
 mod battery;
+mod flow;
 mod gps;
 mod imu;
 mod led;
+mod mag;
 mod motor;
 mod navigation;
 mod pid;
 mod rc;
+mod payloads;
 mod state;
 mod telemetry;
 mod types;
@@ -34,8 +37,10 @@ bind_interrupts!(pub struct Irqs {
     USART1       => embassy_stm32::usart::InterruptHandler<embassy_stm32::peripherals::USART1>;
     USART2       => embassy_stm32::usart::InterruptHandler<embassy_stm32::peripherals::USART2>;
     USART3       => embassy_stm32::usart::InterruptHandler<embassy_stm32::peripherals::USART3>;
+    UART4        => embassy_stm32::usart::InterruptHandler<embassy_stm32::peripherals::UART4>;
     //SPI1       => embassy_stm32::spi::InterruptHandler<embassy_stm32::peripherals::SPI1>;
     DMA1_STREAM1 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH1>;
+    DMA1_STREAM2 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH2>;
     DMA1_STREAM3 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH3>;
     DMA1_STREAM5 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH5>;
     DMA2_STREAM0 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA2_CH0>;
@@ -181,6 +186,9 @@ async fn main(spawner: Spawner) {
     spawner.spawn(navigation::navigation_task().unwrap());
     spawner.spawn(control_task().unwrap());
     spawner.spawn(arming_task().unwrap());
+    spawner.spawn(flow::flow_task(p.UART4, p.PC11, p.DMA1_CH2, Irqs).unwrap());
+    spawner.spawn(payloads::servo::servo_task(p.TIM4, p.PD12, p.PD13, p.PD14, p.PD15).unwrap());
+    spawner.spawn(mag::mag_task(p.I2C1, p.PB8, p.PB9).unwrap());
 
     state::set(FlightState::Idle);
 

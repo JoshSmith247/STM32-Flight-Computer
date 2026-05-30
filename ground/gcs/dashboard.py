@@ -5,13 +5,22 @@ import cv2
 import numpy as np
 
 import config
-from config import PROGRAMS, PAYLOADS, OVERLAY_W, OVERLAY_H
+from config import PROGRAMS, PAYLOAD_NAMES, OVERLAY_W, OVERLAY_H
 from mavlink import _mav_lock, _mav_state
 
-_COPTER_MODES = {
-    0: 'STAB', 1: 'ACRO', 2: 'ALTH', 3: 'AUTO',
-    4: 'GUID', 5: 'LOIT', 6: 'RTL',  7: 'CIRC',
-    9: 'LAND', 16: 'POSH', 17: 'BRAK', 21: 'SRTL',
+_FLIGHT_MODES = {
+    0: 'STAB', 1: 'ALTH', 2: 'POSH', 3: 'AUTO', 4: 'RTH', 5: 'LAND',
+}
+_FLIGHT_STATES = {
+    0: 'IDLE', 1: 'ARMING', 2: 'ARMED', 3: 'FLYING', 4: 'LANDING', 5: 'FAULT',
+}
+_STATE_COLORS = {
+    0: (90,  90,  90),   # IDLE    — grey
+    1: (30, 160, 200),   # ARMING  — amber
+    2: (30, 160, 200),   # ARMED   — amber
+    3: (80, 200,  80),   # FLYING  — green
+    4: (40, 140, 220),   # LANDING — blue
+    5: (40,  40, 210),   # FAULT   — red
 }
 
 _ui_state: dict = {'selected_prog': 0, 'running_prog': None}
@@ -319,18 +328,26 @@ def _draw_motors(panel: np.ndarray, x: int, y: int, w: int, h: int,
                     cv2.FONT_HERSHEY_SIMPLEX, 0.27, (88, 88, 88), 1, cv2.LINE_AA)
 
 
-def _draw_payloads(panel: np.ndarray, x: int, y: int, w: int) -> None:
-    """List all currently attached payloads."""
+def _draw_payloads(panel: np.ndarray, x: int, y: int, w: int,
+                   payload_flags: int, linked: bool) -> None:
+    """Payload health panel — green dot = connected, dark-red dot = not detected."""
     P = 10
     cv2.line(panel, (x, y), (x + w, y), (48, 48, 48), 1)
     cv2.putText(panel, 'PAYLOADS', (x + P, y + 18),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.40, (95, 95, 95), 1, cv2.LINE_AA)
     cv2.line(panel, (x, y + 24), (x + w, y + 24), (48, 48, 48), 1)
     ry = y + 44
-    for payload in PAYLOADS:
-        cv2.circle(panel, (x + P + 4, ry - 4), 4, (50, 200, 100), -1)
-        cv2.putText(panel, payload, (x + P + 14, ry),
+    for bit, name in PAYLOAD_NAMES.items():
+        present = linked and bool(payload_flags & (1 << bit))
+        dot_col = (50, 200, 100) if present else (50, 40, 80)
+        status_col = (130, 210, 130) if present else (90, 65, 100)
+        status_lbl = 'OK' if present else '--'
+        cv2.circle(panel, (x + P + 4, ry - 4), 4, dot_col, -1)
+        cv2.putText(panel, name, (x + P + 14, ry),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (162, 162, 162), 1, cv2.LINE_AA)
+        (sw, _), _ = cv2.getTextSize(status_lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.36, 1)
+        cv2.putText(panel, status_lbl, (x + w - sw - P, ry),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, status_col, 1, cv2.LINE_AA)
         ry += 24
 
 
@@ -436,25 +453,27 @@ def draw_stats_panel(h: int) -> np.ndarray:
     cv2.line(panel, (0, 0), (0, h - 1), (65, 65, 65), 1)
 
     with _mav_lock:
-        lat        = _mav_state['lat']
-        lon        = _mav_state['lon']
-        alt        = _mav_state['alt']
-        yaw        = _mav_state['yaw']
-        roll       = _mav_state['roll']
-        pitch      = _mav_state['pitch']
-        vx         = _mav_state['vx']
-        vy         = _mav_state['vy']
-        vz         = _mav_state['vz']
-        batt       = _mav_state['battery_pct']
-        armed      = _mav_state['armed']
-        mode       = _mav_state['mode']
-        last_t     = _mav_state['last_msg_t']
-        voltage_mv = _mav_state['voltage_mv']
-        current_ca = _mav_state['current_ca']
-        mah_con    = _mav_state['mah_consumed']
-        time_rem   = _mav_state['time_remaining_s']
-        motor_pwm  = list(_mav_state['motor_pwm'])
-        origin     = _mav_state['origin']
+        lat           = _mav_state['lat']
+        lon           = _mav_state['lon']
+        alt           = _mav_state['alt']
+        yaw           = _mav_state['yaw']
+        roll          = _mav_state['roll']
+        pitch         = _mav_state['pitch']
+        vx            = _mav_state['vx']
+        vy            = _mav_state['vy']
+        vz            = _mav_state['vz']
+        batt          = _mav_state['battery_pct']
+        armed         = _mav_state['armed']
+        last_t        = _mav_state['last_msg_t']
+        voltage_mv    = _mav_state['voltage_mv']
+        current_ca    = _mav_state['current_ca']
+        mah_con       = _mav_state['mah_consumed']
+        time_rem      = _mav_state['time_remaining_s']
+        motor_pwm     = list(_mav_state['motor_pwm'])
+        origin        = _mav_state['origin']
+        flight_mode_id = _mav_state['flight_mode_id']
+        flight_state   = _mav_state['flight_state']
+        payload_flags  = _mav_state['payload_flags']
 
     linked = last_t is not None and (time.monotonic() - last_t) < 2.0
     spd    = math.hypot(vx, vy)
@@ -478,11 +497,18 @@ def draw_stats_panel(h: int) -> np.ndarray:
     (aw, _), _ = cv2.getTextSize(arm_lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
     cv2.putText(panel, arm_lbl, (config.STATS_W - aw - 7, sy),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, arm_col, 1, cv2.LINE_AA)
-    if mode:
-        mode_lbl = _COPTER_MODES.get(int(mode), f"M{mode}") if mode.isdigit() else mode
-        (mw, _), _ = cv2.getTextSize(mode_lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.36, 1)
-        cv2.putText(panel, mode_lbl, (config.STATS_W // 2 - mw // 2, sy),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (150, 185, 220), 1, cv2.LINE_AA)
+    if linked:
+        state_lbl = _FLIGHT_STATES.get(flight_state, f"ST{flight_state}")
+        mode_lbl  = _FLIGHT_MODES.get(flight_mode_id, f"M{flight_mode_id}")
+        # Show "FLYING·STAB" when airborne; plain state label otherwise
+        if flight_state in (3, 4):
+            center_lbl = f"{state_lbl}\xb7{mode_lbl}"
+        else:
+            center_lbl = state_lbl
+        state_col = _STATE_COLORS.get(flight_state, (150, 150, 150))
+        (cw, _), _ = cv2.getTextSize(center_lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
+        cv2.putText(panel, center_lbl, (config.STATS_W // 2 - cw // 2, sy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, state_col, 1, cv2.LINE_AA)
 
     CY = sy + 9
     cv2.line(panel, (0, CY), (config.STATS_W, CY), (48, 48, 48), 1)
@@ -545,11 +571,11 @@ def draw_stats_panel(h: int) -> np.ndarray:
     # ── Right column: systems (motors + payloads) ─────────────────────────────
     R        = COL
     # Motors get everything above payloads and program panel
-    payloads_h  = 24 + len(PAYLOADS) * 24 + 20
+    payloads_h  = 24 + len(PAYLOAD_NAMES) * 24 + 20
     motors_h    = max(140, h - CY - 4 - payloads_h - OVERLAY_H - 4)
     _draw_motors(panel, R, CY + 4, COL, motors_h,
                  motor_pwm if linked else [0, 0, 0, 0], armed)
-    _draw_payloads(panel, R, CY + 4 + motors_h, COL)
+    _draw_payloads(panel, R, CY + 4 + motors_h, COL, payload_flags, linked)
     _draw_program_panel(panel, R, h - OVERLAY_H, COL)
 
     return panel
