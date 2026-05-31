@@ -235,8 +235,10 @@ class _Renderer:
                 hud += f"  |  named: {n_active}"
             if n_lost:
                 hud += f"  |  searching: {n_lost}"
-            cv2.putText(display, hud, (8, 22),
+            cv2.putText(display, hud, (9, 23),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+            cv2.putText(display, hud, (8, 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1, cv2.LINE_AA)
 
             sel = self._tracker._selected_wid
             if sel != self._prev_sel:

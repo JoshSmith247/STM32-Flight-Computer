@@ -34,6 +34,8 @@ const MAX_TILT_RAD:      f32 = 0.436;         // 25°
 const RTH_MIN_ALT_M:     f32 = 15.0;         // RTH cruise altitude floor
 const HOME_ARRIVE_M:     f32 = 5.0;          // switch RTH → descend within this radius
 const YAW_TRACK_KP:      f32 = 0.8;          // rad/s per rad heading error
+const FLOW_DAMP_KP:      f32 = 0.3;          // rad/(m/s) — velocity damping gain in PositionHold
+const FLOW_MAX_HEIGHT_MM: i32 = 5_000;       // MTF-02P reliable range ceiling (5 m)
 const DT:                f32 = 1.0 / 100.0;
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -217,14 +219,16 @@ pub async fn navigation_task() {
     let mut nav_pid_n = PosPid::new();
     let mut nav_pid_e = PosPid::new();
 
-    let mut hold_alt:       f32          = 0.0;
-    let mut hold_pos:       LatLonAlt    = Default::default();
-    let mut rth_cruise_alt: f32          = 0.0;
-    let mut land_target:    f32          = 0.0;
-    let mut rth_landing:    bool         = false;
-    let mut wp_arrived_at:  Option<Instant> = None;
-    let mut prev_mode:      FlightMode   = FlightMode::Stabilise;
-    let mut home_set:       bool         = false;
+    let mut hold_alt:        f32             = 0.0;
+    let mut hold_pos:        LatLonAlt       = Default::default();
+    let mut rth_cruise_alt:  f32             = 0.0;
+    let mut land_target:     f32             = 0.0;
+    let mut rth_landing:     bool            = false;
+    let mut wp_arrived_at:   Option<Instant> = None;
+    let mut weed_pull_timer: Option<Instant> = None;
+    let mut prev_mode:       FlightMode      = FlightMode::Stabilise;
+    let mut home_set:        bool            = false;
+    let mut last_gps_ok:     Instant         = Instant::now();
 
     info!("Navigation task started (100 Hz)");
     let mut ticker = Ticker::every(Duration::from_hz(100));
@@ -239,6 +243,8 @@ pub async fn navigation_task() {
         let battery  = *STATE.battery.lock().await;
         let is_armed = *STATE.armed.lock().await;
         let flow     = *STATE.flow.lock().await;
+
+        if gps.fix_ok { last_gps_ok = Instant::now(); }
 
         let pos = gps.pos();
         let yaw = atan2f(
@@ -260,7 +266,7 @@ pub async fn navigation_task() {
 
         // Fault state: force Land; auto-disarm at touch-down
         if state::get() == state::FlightState::Fault {
-            let agl = if flow.valid && flow.height_mm > 0 {
+            let agl = if flow.valid && flow.height_mm > 0 && flow.height_mm <= FLOW_MAX_HEIGHT_MM {
                 flow.height_mm as f32 / 1000.0
             } else {
                 baro.altitude_m
@@ -286,6 +292,11 @@ pub async fn navigation_task() {
                 state::set(state::FlightState::Landing);
                 FlightMode::Land
             }
+        } else if last_gps_ok.elapsed() > Duration::from_secs(5)
+            && matches!(mode, FlightMode::PositionHold | FlightMode::Auto | FlightMode::ReturnToHome)
+        {
+            warn!("GPS fix lost >5s — forcing AltitudeHold");
+            FlightMode::AltitudeHold
         } else {
             mode
         };
@@ -296,6 +307,10 @@ pub async fn navigation_task() {
             nav_pid_n.reset(); nav_pid_e.reset();
             rth_landing   = false;
             wp_arrived_at = None;
+            if weed_pull_timer.take().is_some() {
+                STATE.servo_outputs.lock().await.s1 = 0.0;
+                STATE.weed_target.lock().await.valid = false;
+            }
 
             match effective_mode {
                 FlightMode::AltitudeHold => {
@@ -345,9 +360,21 @@ pub async fn navigation_task() {
                                    * cosf(lat_rad) as f64) as f32;
                     let fwd_m   =  err_n * cosf(yaw) + err_e * sinf(yaw);
                     let right_m = -err_n * sinf(yaw) + err_e * cosf(yaw);
-                    let pitch   = (-pos_pid_n.update(fwd_m)).clamp(-MAX_TILT_RAD, MAX_TILT_RAD);
-                    let roll    = pos_pid_e.update(right_m).clamp(-MAX_TILT_RAD, MAX_TILT_RAD);
-                    (roll, pitch)
+                    let mut pitch = -pos_pid_n.update(fwd_m);
+                    let mut roll  =  pos_pid_e.update(right_m);
+
+                    // Optical-flow velocity damping: oppose measured body-frame drift.
+                    // vel_x/y are body-frame drone velocity (positive = forward/right).
+                    // Polarity may need sign reversal depending on sensor mounting orientation.
+                    if flow.valid && flow.height_mm > 0 && flow.height_mm <= FLOW_MAX_HEIGHT_MM {
+                        let h_m          = flow.height_mm as f32 / 1000.0;
+                        let vel_fwd_ms   = flow.vel_x_mrad_s as f32 * h_m / 1_000_000.0;
+                        let vel_right_ms = flow.vel_y_mrad_s as f32 * h_m / 1_000_000.0;
+                        pitch += FLOW_DAMP_KP * vel_fwd_ms;
+                        roll  -= FLOW_DAMP_KP * vel_right_ms;
+                    }
+
+                    (roll.clamp(-MAX_TILT_RAD, MAX_TILT_RAD), pitch.clamp(-MAX_TILT_RAD, MAX_TILT_RAD))
                 } else {
                     (0.0, 0.0)
                 };
@@ -364,7 +391,7 @@ pub async fn navigation_task() {
                 }
             }
 
-            // ── Auto: fly MAVLink mission waypoints ───────────────────────────
+            // ── Auto: fly MAVLink mission waypoints; weed targets take priority ──
             FlightMode::Auto => {
                 // Load any freshly uploaded mission
                 {
@@ -381,32 +408,61 @@ pub async fn navigation_task() {
                 if !gps.fix_ok {
                     warn!("Auto: no GPS fix");
                     NavCommand { autonomous: false, ..Default::default() }
-                } else if mission.is_complete() {
-                    // Hold current position once mission is done
-                    guide_to(pos, pos, baro.altitude_m, baro.altitude_m,
-                             yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
                 } else {
-                    let wp   = mission.current_wp().unwrap();
-                    let dist = haversine_m(pos, wp.position);
+                    let weed = *STATE.weed_target.lock().await;
+                    let mut weed_valid = weed.valid;
 
-                    if dist < WAYPOINT_RADIUS_M {
-                        if wp_arrived_at.is_none() {
-                            wp_arrived_at = Some(Instant::now());
-                            info!("WP {} reached (hold {=f32}s)", mission.current, wp.hold_time_s);
+                    // Expire the pull timer: release servo and clear target
+                    if let Some(t) = weed_pull_timer {
+                        if t.elapsed() >= Duration::from_millis(500) {
+                            STATE.servo_outputs.lock().await.s1 = 0.0;
+                            STATE.weed_target.lock().await.valid = false;
+                            weed_pull_timer = None;
+                            weed_valid = false;
+                            info!("Weed pull complete — target cleared");
                         }
-                        if wp_arrived_at.map_or(false, |t| {
-                            t.elapsed() >= Duration::from_millis((wp.hold_time_s * 1000.0) as u64)
-                        }) {
-                            mission.advance();
-                            wp_arrived_at = None;
-                            info!("Advancing to WP {}", mission.current);
-                        }
-                    } else {
-                        wp_arrived_at = None;
                     }
 
-                    guide_to(wp.position, pos, wp.position.alt_m, baro.altitude_m,
-                             yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
+                    if weed_valid || weed_pull_timer.is_some() {
+                        // Fly to weed; actuate servo on arrival
+                        let dist = haversine_m(pos, weed.position);
+                        if weed_valid && weed_pull_timer.is_none() && dist < 0.5 {
+                            STATE.servo_outputs.lock().await.s1 = 1.0;
+                            weed_pull_timer = Some(Instant::now());
+                            info!("Weed reached (dist={=f32}m) — servo actuated", dist);
+                        }
+                        // Hold the weed target's altitude (set when the target was received).
+                        guide_to(weed.position, pos, weed.position.alt_m, baro.altitude_m,
+                                 yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
+                    } else if mission.is_complete() {
+                        // Hold current position once mission is done
+                        guide_to(pos, pos, baro.altitude_m, baro.altitude_m,
+                                 yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
+                    } else if let Some(wp) = mission.current_wp() {
+                        let dist = haversine_m(pos, wp.position);
+
+                        if dist < WAYPOINT_RADIUS_M {
+                            if wp_arrived_at.is_none() {
+                                wp_arrived_at = Some(Instant::now());
+                                info!("WP {} reached (hold {=f32}s)", mission.current, wp.hold_time_s);
+                            }
+                            if wp_arrived_at.map_or(false, |t| {
+                                t.elapsed() >= Duration::from_millis((wp.hold_time_s * 1000.0) as u64)
+                            }) {
+                                mission.advance();
+                                wp_arrived_at = None;
+                                info!("Advancing to WP {}", mission.current);
+                            }
+                        } else {
+                            wp_arrived_at = None;
+                        }
+
+                        guide_to(wp.position, pos, wp.position.alt_m, baro.altitude_m,
+                                 yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
+                    } else {
+                        // Unreachable: !is_complete() guarantees current < count.
+                        NavCommand { autonomous: false, ..Default::default() }
+                    }
                 }
             }
 

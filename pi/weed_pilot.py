@@ -42,11 +42,33 @@ SERIAL_BAUD      = int(os.environ.get('STM32_BAUD',    '57600'))
 LAPTOP_IP        = sys.argv[1] if len(sys.argv) > 1 else os.environ.get('LAPTOP_IP', '192.168.4.2')
 GCS_PORT         = int(os.environ.get('GCS_PORT',        '14550'))
 WEED_TARGET_PORT = int(os.environ.get('WEED_TARGET_PORT', '5700'))
+WEED_LOG_PATH    = os.environ.get('WEED_LOG',
+                       f"weed_events_{time.strftime('%Y%m%d_%H%M%S')}.jsonl")
 
 # MAVLink v2 constants for the Pi GCS component
 PI_SYS_ID        = 10   # distinct from drone's sys_id=1
 PI_COMP_ID       = 1
-HEARTBEAT_HZ     = 2    # send heartbeat at 2 Hz (generous margin above 3s watchdog)
+HEARTBEAT_HZ     = 4    # send heartbeat at 4 Hz — tolerates 3 consecutive missed frames within 3 s watchdog
+
+# Shared monotonic sequence number for all frames sent from PI_SYS_ID/PI_COMP_ID.
+# Lock required: heartbeat and weed-target threads both increment it.
+_seq_lock = threading.Lock()
+_seq      = 0
+
+# Reference point for time_boot_ms (ms since this process started).
+_BOOT_TIME = time.monotonic()
+
+
+def _next_seq() -> int:
+    global _seq
+    with _seq_lock:
+        s = _seq
+        _seq = (s + 1) & 0xFF
+        return s
+
+
+def _time_boot_ms() -> int:
+    return int((time.monotonic() - _BOOT_TIME) * 1000) & 0xFFFFFFFF
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +82,33 @@ def _mavlink_crc(data: bytes, extra: int) -> int:
         tmp ^= (tmp << 4) & 0xFF
         crc = ((crc >> 8) ^ (tmp << 8) ^ (tmp << 3) ^ (tmp >> 4)) & 0xFFFF
     return crc
+
+
+def _build_set_position_target_local_ned(seq: int, north_m: float, east_m: float) -> bytes:
+    """Build a MAVLink v2 SET_POSITION_TARGET_LOCAL_NED frame (msg_id=84, CRC_EXTRA=143).
+
+    Sends a position-only command (type_mask=0x0FF8) in MAV_FRAME_LOCAL_NED.
+    The drone will fly to (north_m, east_m) offset from its current position
+    while holding its current altitude (z=0.0, down=0 → no altitude change).
+    """
+    # MAVLink v2 wire format: fields sorted largest-first (all floats before u16/u8)
+    payload = struct.pack(
+        '<IfffffffffffHBBB',
+        _time_boot_ms(),                        # time_boot_ms          @0
+        float(north_m), float(east_m), 0.0,    # x(N), y(E), z(D=0)   @4,8,12
+        0.0, 0.0, 0.0,                          # vx, vy, vz (ignored)  @16,20,24
+        0.0, 0.0, 0.0,                          # afx, afy, afz         @28,32,36
+        0.0, 0.0,                               # yaw, yaw_rate         @40,44
+        0x0FF8,                                 # type_mask: pos only   @48
+        1,                                      # target_system         @50
+        1,                                      # target_component      @51
+        1,                                      # MAV_FRAME_LOCAL_NED   @52
+    )
+    n = len(payload)  # 53
+    header = bytes([n, 0, 0, seq & 0xFF, PI_SYS_ID, PI_COMP_ID,
+                    84 & 0xFF, (84 >> 8) & 0xFF, (84 >> 16) & 0xFF])
+    crc = _mavlink_crc(header + payload, 143)
+    return bytes([0xFD]) + header + payload + struct.pack('<H', crc)
 
 
 def _build_heartbeat(seq: int) -> bytes:
@@ -79,6 +128,23 @@ def _build_heartbeat(seq: int) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# Event log — JSONL, one record per line for easy grep / replay
+# ---------------------------------------------------------------------------
+
+_log_lock = threading.Lock()
+
+
+def _log_event(**kw: object) -> None:
+    entry = json.dumps({'ts': time.time(), **kw})
+    try:
+        with _log_lock:
+            with open(WEED_LOG_PATH, 'a') as f:
+                f.write(entry + '\n')
+    except Exception as exc:
+        print(f"log write: {exc}", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Threads
 # ---------------------------------------------------------------------------
 
@@ -94,60 +160,74 @@ def _serial_to_udp(ser, sock: socket.socket) -> None:
             time.sleep(0.1)
 
 
-def _heartbeat_sender(ser) -> None:
+def _heartbeat_sender(ser, ser_lock: threading.Lock) -> None:
     """Send MAVLink HEARTBEAT to STM32 at HEARTBEAT_HZ."""
-    seq = 0
     interval = 1.0 / HEARTBEAT_HZ
     while True:
-        frame = _build_heartbeat(seq)
+        frame = _build_heartbeat(_next_seq())
         try:
-            ser.write(frame)
+            with ser_lock:
+                ser.write(frame)
         except Exception as exc:
             print(f"heartbeat write: {exc}", flush=True)
-        seq = (seq + 1) & 0xFF
         time.sleep(interval)
 
 
-def _gcs_to_serial(ser, gcs_port: int) -> None:
+def _gcs_to_serial(ser, gcs_port: int, ser_lock: threading.Lock) -> None:
     """Forward GCS commands (UDP:GCS_PORT) → STM32 (serial).
 
     Mirrors the udp_to_serial path from mavlink_bridge.py so arm/disarm,
     mode changes, and mission uploads from the GCS reach the STM32.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(('0.0.0.0', gcs_port))
     sock.settimeout(1.0)
     while True:
         try:
-            data, _ = sock.recvfrom(4096)
-            ser.write(data)
+            data, addr = sock.recvfrom(4096)
+            if addr[0] != LAPTOP_IP:
+                continue
+            with ser_lock:
+                ser.write(data)
         except socket.timeout:
             pass
         except Exception as exc:
             print(f"gcs→serial: {exc}", flush=True)
 
 
-def _weed_target_listener() -> None:
-    """Receive weed target positions from the ground station."""
+def _weed_target_listener(ser, ser_lock: threading.Lock) -> None:
+    """Receive weed target positions from the GCS and forward to STM32 as
+    SET_POSITION_TARGET_LOCAL_NED (msg 84) so navigation_task can fly to them."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(('0.0.0.0', WEED_TARGET_PORT))
     sock.settimeout(1.0)
     print(f"Weed target listener on UDP:{WEED_TARGET_PORT}", flush=True)
     while True:
         try:
             data, addr = sock.recvfrom(256)
-            target = json.loads(data.decode())
+            if addr[0] != LAPTOP_IP:
+                continue
+            target  = json.loads(data.decode())
             wid     = target['wid']
-            east_m  = target['east_m']
-            north_m = target['north_m']
+            east_m  = float(target['east_m'])
+            north_m = float(target['north_m'])
             print(f"Target W{wid}: {east_m:.2f}m E, {north_m:.2f}m N  (from {addr[0]})",
                   flush=True)
-            # TODO: forward as MAVLink SET_POSITION_TARGET_LOCAL_NED to STM32
-            # once the STM32 navigation task can parse incoming MAVLink RX commands.
+            _log_event(event='target_received', wid=wid, east_m=east_m, north_m=north_m,
+                       from_ip=addr[0])
+            frame = _build_set_position_target_local_ned(_next_seq(), north_m, east_m)
+            with ser_lock:
+                ser.write(frame)
+            print(f"  → forwarded W{wid} to STM32 as SET_POSITION_TARGET_LOCAL_NED",
+                  flush=True)
+            _log_event(event='target_forwarded', wid=wid, east_m=east_m, north_m=north_m)
         except socket.timeout:
             pass
         except (json.JSONDecodeError, KeyError) as exc:
             print(f"Bad target packet: {exc}", flush=True)
+            _log_event(event='bad_packet', error=str(exc))
         except Exception as exc:
             print(f"weed listener: {exc}", flush=True)
 
@@ -163,7 +243,7 @@ def main() -> None:
         print("pyserial not installed — run: pip install pyserial", flush=True)
         sys.exit(1)
 
-    ser = _serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=0.05)
+    ser = _serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=0.05, write_timeout=0.5)
 
     # UDP socket for forwarding STM32 telemetry to the ground station
     gcs_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -172,16 +252,30 @@ def main() -> None:
     print(f"  Serial:  {SERIAL_PORT} @ {SERIAL_BAUD} baud", flush=True)
     print(f"  Telem → {LAPTOP_IP}:{GCS_PORT}", flush=True)
     print(f"  GCS  ← UDP:{GCS_PORT}  (commands forwarded to STM32)", flush=True)
-    print(f"  HB rate: {HEARTBEAT_HZ} Hz  (watchdog timeout: 3 s)", flush=True)
+    print(f"  HB rate: {HEARTBEAT_HZ} Hz  (watchdog timeout: 5 s)", flush=True)
+    print(f"  Event log: {WEED_LOG_PATH}", flush=True)
+    _log_event(event='pilot_started', serial=SERIAL_PORT, baud=SERIAL_BAUD,
+               laptop_ip=LAPTOP_IP, gcs_port=GCS_PORT)
 
-    threading.Thread(target=_serial_to_udp,       args=(ser, gcs_sock), daemon=True).start()
-    threading.Thread(target=_heartbeat_sender,     args=(ser,),          daemon=True).start()
-    threading.Thread(target=_gcs_to_serial,        args=(ser, GCS_PORT), daemon=True).start()
-    threading.Thread(target=_weed_target_listener,                        daemon=True).start()
+    ser_lock = threading.Lock()
+
+    threads = [
+        threading.Thread(target=_serial_to_udp,       args=(ser, gcs_sock),           name='serial→udp',    daemon=True),
+        threading.Thread(target=_heartbeat_sender,     args=(ser, ser_lock),           name='heartbeat',     daemon=True),
+        threading.Thread(target=_gcs_to_serial,        args=(ser, GCS_PORT, ser_lock), name='gcs→serial',    daemon=True),
+        threading.Thread(target=_weed_target_listener, args=(ser, ser_lock),           name='weed-listener', daemon=True),
+    ]
+    for t in threads:
+        t.start()
 
     try:
         while True:
             time.sleep(1)
+            dead = [t.name for t in threads if not t.is_alive()]
+            if dead:
+                print(f"Thread(s) died: {dead} — exiting for systemd restart", flush=True)
+                _log_event(event='thread_died', threads=dead)
+                sys.exit(1)
     except KeyboardInterrupt:
         print("Stopping.", flush=True)
     finally:

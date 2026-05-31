@@ -26,7 +26,7 @@ FFMPEG_CMD = [
     '-vcodec', 'libx264',    # re-encode to H.264 (handles any source codec)
     '-preset', 'ultrafast',
     '-tune', 'zerolatency',
-    '-g', '15',              # keyframe every 30 frames, decoder syncs within 1 s
+    '-g', '15',              # keyframe every 15 frames, decoder syncs within 0.5 s
     '-f', 'mpegts',
     f'udp://{LAPTOP_IP}:{VIDEO_PORT}',
 ]

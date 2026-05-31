@@ -47,6 +47,7 @@ const DMAMUX_TIM3_UP: u8 = 22;
 // ── DSHOT frame encoding ─────────────────────────────────────────────────────
 
 fn throttle_to_dshot(t: f32) -> u16 {
+    let t = t.clamp(0.0, 1.0);
     if t <= 0.0 { 0 } else { (48.0 + t * (2047.0 - 48.0)) as u16 }
 }
 
@@ -180,6 +181,17 @@ unsafe fn dshot_send() {
     s.m0ar().write(|w| *w = core::ptr::addr_of!(DSHOT_BUF) as u32);
     s.ndtr().write(|w| w.set_ndt(BUF_LEN as u16));
     s.cr().modify(|w| w.set_en(true)); // timer update event fires DMA
+}
+
+// ── Emergency stop (called from panic handler) ───────────────────────────────
+
+/// Zero all motors and fire one DSHOT frame. Safe to call from a panic handler:
+/// spins ≤30 µs waiting for any in-flight DMA to drain, then sends a zero frame
+/// so ESCs receive an explicit stop rather than relying on signal-loss timeout.
+pub(crate) unsafe fn emergency_stop() {
+    fill_buf(&mut *(&raw mut DSHOT_BUF), [0.0f32; MOTORS]);
+    compiler_fence(Ordering::SeqCst);
+    dshot_send();
 }
 
 // ── Task ─────────────────────────────────────────────────────────────────────

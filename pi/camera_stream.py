@@ -52,9 +52,17 @@ def main() -> None:
         f'udp://{LAPTOP_IP}:{VIDEO_PORT}?pkt_size=1316&buffer_size=65536',
     ]
 
+    if not os.path.exists(CAM_DEVICE):
+        print(f"Camera device not found: {CAM_DEVICE}", flush=True)
+        sys.exit(1)
+
     print(f"Streaming {WIDTH}x{HEIGHT}@{FRAMERATE}fps → udp://{LAPTOP_IP}:{VIDEO_PORT} (mpegts)", flush=True)
 
-    proc = subprocess.Popen(cmd)
+    try:
+        proc = subprocess.Popen(cmd)
+    except FileNotFoundError:
+        print("ffmpeg not found — install with: sudo apt install ffmpeg", flush=True)
+        sys.exit(1)
 
     try:
         proc.wait()
@@ -62,6 +70,10 @@ def main() -> None:
         proc.send_signal(signal.SIGTERM)
     finally:
         proc.wait()
+
+    if proc.returncode not in (0, -signal.SIGTERM):
+        print(f"ffmpeg exited with code {proc.returncode}", flush=True)
+        sys.exit(proc.returncode)
 
 
 if __name__ == '__main__':

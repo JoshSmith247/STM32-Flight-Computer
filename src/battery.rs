@@ -56,6 +56,7 @@ pub async fn battery_task(
 
     let mut ticker       = Ticker::every(Duration::from_hz(2));
     let mut consec_crit: u8 = 0;
+    let mut consec_good: u8 = 0;
 
     info!("Battery task started — {}S on PC0, divider {=f32}×", CELL_COUNT, V_DIVIDER);
 
@@ -68,21 +69,33 @@ pub async fn battery_task(
         let pct    = voltage_to_pct(v_batt);
         let low    = v_batt / (CELL_COUNT as f32) < V_CELL_CRIT;
 
-        // Symmetric hysteresis: 5 consecutive low samples to go critical,
-        // 5 consecutive good samples to clear it.
-        if low { consec_crit = consec_crit.saturating_add(1); }
-        else   { consec_crit = consec_crit.saturating_sub(1); }
-        let critical = consec_crit >= 5;
+        // Asymmetric hysteresis: 3 consecutive low samples (~1.5 s) to go
+        // critical; 10 consecutive good samples (~5 s) without any low sample
+        // to clear it. Any bad reading resets the recovery counter.
+        if low {
+            consec_crit = consec_crit.saturating_add(1);
+            consec_good = 0;
+        } else {
+            consec_good = consec_good.saturating_add(1);
+            if consec_good >= 10 { consec_crit = 0; consec_good = 0; }
+        }
+        let critical = consec_crit >= 3;
 
         *STATE.battery.lock().await = BatteryData { voltage_v: v_batt, pct, critical };
 
         if critical {
             warn!("CRITICAL BATTERY {=f32} V  ({=u8} %)", v_batt, pct);
 
-            // Fault-lock once on the ground: arm switch reset required after pack swap
-            let alt   = STATE.baro_data.lock().await.altitude_m;
+            // Fault-lock once on the ground: arm switch reset required after pack swap.
+            // Prefer rangefinder AGL; fall back to baro when flow sensor is invalid.
+            let flow  = *STATE.flow.lock().await;
             let armed = *STATE.armed.lock().await;
-            if armed && alt < 0.3 {
+            let agl   = if flow.valid && flow.height_mm > 0 && flow.height_mm < 5_000 {
+                flow.height_mm as f32 / 1000.0
+            } else {
+                STATE.baro_data.lock().await.altitude_m
+            };
+            if armed && agl < 0.15 {
                 *STATE.armed.lock().await = false;
                 state::set(state::FlightState::Fault);
                 warn!("Critical battery — on ground — disarmed, Fault state set");

@@ -21,7 +21,6 @@ import sys
 import socket
 import threading
 import time
-import serial
 
 SERIAL_PORT = os.environ.get('STM32_PORT', '/dev/serial0')
 SERIAL_BAUD = int(os.environ.get('STM32_BAUD', '57600'))
@@ -29,7 +28,7 @@ LAPTOP_IP   = sys.argv[1] if len(sys.argv) > 1 else os.environ.get('LAPTOP_IP', 
 GCS_PORT    = int(os.environ.get('GCS_PORT', '14550'))
 
 
-def serial_to_udp(ser: serial.Serial, sock: socket.socket) -> None:
+def serial_to_udp(ser, sock: socket.socket) -> None:
     while True:
         try:
             data = ser.read(256)
@@ -40,7 +39,7 @@ def serial_to_udp(ser: serial.Serial, sock: socket.socket) -> None:
             time.sleep(0.1)
 
 
-def udp_to_serial(ser: serial.Serial, sock: socket.socket) -> None:
+def udp_to_serial(ser, sock: socket.socket) -> None:
     while True:
         try:
             data, _ = sock.recvfrom(4096)
@@ -53,21 +52,38 @@ def udp_to_serial(ser: serial.Serial, sock: socket.socket) -> None:
 
 
 def main() -> None:
-    ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=0.1)
+    try:
+        import serial as _serial
+    except ImportError:
+        print("pyserial not installed — run: pip install pyserial", flush=True)
+        sys.exit(1)
+
+    ser = _serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=0.1)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(('0.0.0.0', GCS_PORT))
     sock.settimeout(1.0)
 
     print(f"MAVLink bridge: {SERIAL_PORT}@{SERIAL_BAUD} <-> {LAPTOP_IP}:{GCS_PORT}", flush=True)
 
-    threading.Thread(target=serial_to_udp, args=(ser, sock), daemon=True).start()
-    threading.Thread(target=udp_to_serial, args=(ser, sock), daemon=True).start()
+    threads = [
+        threading.Thread(target=serial_to_udp, args=(ser, sock), name='serial→udp', daemon=True),
+        threading.Thread(target=udp_to_serial, args=(ser, sock), name='udp→serial', daemon=True),
+    ]
+    for t in threads:
+        t.start()
 
     try:
         while True:
             time.sleep(1)
+            dead = [t.name for t in threads if not t.is_alive()]
+            if dead:
+                print(f"Thread(s) died: {dead} — exiting for systemd restart", flush=True)
+                sys.exit(1)
     except KeyboardInterrupt:
+        pass
+    finally:
         ser.close()
         sock.close()
 

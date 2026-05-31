@@ -16,33 +16,40 @@ pub struct Pid {
     kp: f32,
     ki: f32,
     kd: f32,
-    integral:  f32,
-    prev_error: f32,
-    i_limit:   f32,    // anti-windup clamp
-    output_limit: f32,
+    integral:         f32,
+    prev_measurement: f32,
+    i_limit:          f32,    // anti-windup clamp
+    output_limit:     f32,
 }
 
 impl Pid {
     pub const fn new(kp: f32, ki: f32, kd: f32, i_limit: f32, output_limit: f32) -> Self {
-        Self { kp, ki, kd, integral: 0.0, prev_error: 0.0, i_limit, output_limit }
+        Self { kp, ki, kd, integral: 0.0, prev_measurement: 0.0, i_limit, output_limit }
     }
 
     /// Run one PID step. `dt` in seconds.
+    ///
+    /// Uses derivative-on-measurement (D acts on -Δmeasurement, not Δerror) so
+    /// setpoint step-changes don't produce a derivative spike ("D-kick").
     pub fn update(&mut self, setpoint: f32, measurement: f32, dt: f32) -> f32 {
         let error = setpoint - measurement;
 
         self.integral = (self.integral + error * dt).clamp(-self.i_limit, self.i_limit);
 
-        let derivative = if dt > 0.0 { (error - self.prev_error) / dt } else { 0.0 };
-        self.prev_error = error;
+        let derivative = if dt > 0.0 {
+            -(measurement - self.prev_measurement) / dt
+        } else {
+            0.0
+        };
+        self.prev_measurement = measurement;
 
         let output = self.kp * error + self.ki * self.integral + self.kd * derivative;
         output.clamp(-self.output_limit, self.output_limit)
     }
 
     pub fn reset(&mut self) {
-        self.integral   = 0.0;
-        self.prev_error = 0.0;
+        self.integral         = 0.0;
+        self.prev_measurement = 0.0;
     }
 }
 
@@ -79,9 +86,11 @@ impl Default for FlightPids {
 
             // Inner loop: rate error (rad/s) → torque demand (→ normalised ±1.0).
             // Kd on yaw omitted — gyro noise on z-axis amplifies into yaw chatter.
-            rate_roll:  Pid::new(50.0, 30.0, 2.0, 200.0, RATE_OUTPUT_LIMIT),
-            rate_pitch: Pid::new(50.0, 30.0, 2.0, 200.0, RATE_OUTPUT_LIMIT),
-            rate_yaw:   Pid::new(70.0, 20.0, 0.0, 200.0, RATE_OUTPUT_LIMIT),
+            // i_limit = output_limit / Ki so the I-term alone cannot saturate the
+            // output (Ki × i_limit ≤ output_limit), preventing slow integral unwind.
+            rate_roll:  Pid::new(50.0, 30.0, 2.0,  16.0, RATE_OUTPUT_LIMIT),
+            rate_pitch: Pid::new(50.0, 30.0, 2.0,  16.0, RATE_OUTPUT_LIMIT),
+            rate_yaw:   Pid::new(70.0, 20.0, 0.0,  25.0, RATE_OUTPUT_LIMIT),
         }
     }
 }
@@ -155,7 +164,9 @@ impl PosPid {
     /// Returns a lean angle in radians; sign convention: positive = lean positive.
     pub fn update(&mut self, err_m: f32) -> f32 {
         const DT: f32 = 1.0 / 100.0;
-        self.0.update(err_m, 0.0, DT)
+        // Pass error as -measurement so Pid's derivative-on-measurement gives
+        // d(err)/dt, which damps oscillation. Setpoint=0 keeps P+I identical.
+        self.0.update(0.0, -err_m, DT)
     }
 
     pub fn reset(&mut self) { self.0.reset(); }

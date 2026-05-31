@@ -1,5 +1,5 @@
 [Unit]
-Description=MAVLink bridge (STM32 serial <-> GCS UDP)
+Description=Weed pilot (STM32 serial <-> GCS UDP, weed target relay)
 After=network-online.target
 Wants=network-online.target
 

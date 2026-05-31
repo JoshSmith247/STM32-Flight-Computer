@@ -1,10 +1,17 @@
-//! u-blox M8N GPS — UBX NAV-PVT parser on USART1 (PA10 RX, PA9 TX, 9600 baud).
+//! u-blox M10 GPS (SEQURE M10-18) — UBX NAV-PVT parser on USART1 (PA10 RX, PA9 TX).
+//!
+//! The M10 chip replaced the M8N's CFG-PRT / CFG-MSG protocol with UBX-CFG-VALSET.
+//! Default baud rate on M10 is 38400 (M8N was 9600).
 //!
 //! Startup sequence:
-//!   1. UBX-CFG-PRT  — switch UART1 to UBX-only I/O at 9600 baud
-//!   2. UBX-CFG-MSG  — enable NAV-PVT at 1 Hz on UART1
+//!   1. UBX-CFG-VALSET — enable NAV-PVT output at 1 Hz on UART1
+//!      (module typically ships with NMEA enabled; we add UBX NAV-PVT on top)
 //!
 //! Then loops reading NAV-PVT frames (92-byte payload) and writing STATE.gps_fix.
+//! Non-NAV-PVT frames (NMEA or other UBX) are drained and discarded.
+//!
+//! If the module doesn't respond, verify the default baud rate with a logic
+//! analyzer on PA10 — some M10 modules ship at 115200 instead of 38400.
 //!
 //! NAV-PVT payload offsets used here:
 //!   byte 20      fixType  (3 = 3-D fix)
@@ -27,32 +34,25 @@ use embassy_time::{Duration, Timer};
 
 use crate::{types::GpsFix, Irqs, STATE};
 
-// ── UBX configuration frames (checksums pre-computed) ──────────────────────
+// ── UBX configuration frame (checksum pre-computed) ────────────────────────
 
-/// UBX-CFG-PRT: UART1, UBX-only in/out, 8N1, 9600 baud.
-const CFG_PRT: &[u8] = &[
-    0xB5, 0x62,                          // sync chars
-    0x06, 0x00, 0x14, 0x00,             // class=CFG, id=PRT, len=20
-    0x01,                                // portID = UART1
-    0x00, 0x00, 0x00,                    // reserved0, txReady (disabled)
-    0xC0, 0x08, 0x00, 0x00,             // mode: 8N1
-    0x80, 0x25, 0x00, 0x00,             // baudRate: 9600 (0x2580)
-    0x01, 0x00,                          // inProtoMask:  UBX only
-    0x01, 0x00,                          // outProtoMask: UBX only
-    0x00, 0x00,                          // flags
-    0x00, 0x00,                          // reserved5
-    0x8A, 0xEF,                          // CK_A, CK_B
-];
-
-/// UBX-CFG-MSG: enable NAV-PVT (class=0x01 id=0x07) at 1 Hz on UART1.
-const CFG_MSG: &[u8] = &[
-    0xB5, 0x62,
-    0x06, 0x01, 0x08, 0x00,             // class=CFG, id=MSG, len=8
-    0x01, 0x07,                          // msgClass=NAV, msgID=PVT
-    0x00,                                // I2C rate (off)
-    0x01,                                // UART1 rate: 1 per nav epoch
-    0x00, 0x00, 0x00, 0x00,             // UART2, USB, SPI, reserved
-    0x18, 0xE1,                          // CK_A, CK_B
+/// UBX-CFG-VALSET (M10): enable NAV-PVT output at 1 Hz on UART1.
+///
+/// Payload (9 bytes):
+///   version=0x00, layers=0x01 (RAM), reserved=0x00 0x00,
+///   key=0x20910007 (CFG-MSGOUT-UBX_NAV_PVT_UART1, type U1), value=0x01
+///
+/// Checksum covers class+id+len+payload: CK_A=0x53, CK_B=0x48.
+const CFG_VALSET_NAV_PVT: &[u8] = &[
+    0xB5, 0x62,              // sync chars
+    0x06, 0x8A,              // class=CFG, id=VALSET
+    0x09, 0x00,              // length = 9
+    0x00,                    // version
+    0x01,                    // layers: RAM (takes effect immediately)
+    0x00, 0x00,              // reserved
+    0x07, 0x00, 0x91, 0x20, // key: CFG-MSGOUT-UBX_NAV_PVT_UART1
+    0x01,                    // value: 1 per nav epoch
+    0x53, 0x48,              // CK_A, CK_B
 ];
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -101,19 +101,17 @@ pub async fn gps_task(
     irqs:      Irqs,
 ) {
     let mut cfg = Config::default();
-    cfg.baudrate = 9600;
+    cfg.baudrate = 38400; // u-blox M10 default (M8N was 9600)
 
     let uart = Uart::new(uart_peri, rx_pin, tx_pin, tx_dma, rx_dma, irqs, cfg)
         .expect("USART1 (GPS) init failed");
     let (mut tx, mut rx) = uart.split();
 
-    // Give the module time to boot, then send configuration
+    // Give the module time to boot, then enable NAV-PVT via CFG-VALSET (M10 API)
     Timer::after(Duration::from_millis(200)).await;
-    tx.write(CFG_PRT).await.ok();
-    Timer::after(Duration::from_millis(100)).await;
-    tx.write(CFG_MSG).await.ok();
+    tx.write(CFG_VALSET_NAV_PVT).await.ok();
 
-    info!("GPS task started — UBX NAV-PVT @ 9600 baud on USART1");
+    info!("GPS task started — UBX NAV-PVT @ 38400 baud on USART1 (M10)");
 
     let mut byte    = [0u8; 1];
     let mut hdr     = [0u8; 4];   // [class, id, len_l, len_h]

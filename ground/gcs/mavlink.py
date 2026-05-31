@@ -103,7 +103,7 @@ def _mav_listener() -> None:
     while True:
         msg = conn.recv_match(
             type=['GLOBAL_POSITION_INT', 'ATTITUDE', 'SYS_STATUS',
-                  'HEARTBEAT', 'BATTERY_STATUS', 'SERVO_OUTPUT_RAW'],
+                  'HEARTBEAT', 'BATTERY_STATUS', 'SERVO_OUTPUT_RAW', 'COMMAND_ACK'],
             blocking=True, timeout=1.0)
         if msg is None:
             continue
@@ -122,7 +122,8 @@ def _mav_listener() -> None:
                 _mav_state.update(roll=msg.roll, pitch=msg.pitch,
                                   yaw=msg.yaw, last_msg_t=t)
             elif msg.get_type() == 'SYS_STATUS':
-                _mav_state['battery_pct'] = msg.battery_remaining
+                if _mav_state['battery_pct'] < 0:   # BATTERY_STATUS is authoritative once received
+                    _mav_state['battery_pct'] = msg.battery_remaining
             elif msg.get_type() == 'HEARTBEAT':
                 cm = msg.custom_mode
                 _mav_state['armed']          = bool(msg.base_mode & 128)
@@ -143,39 +144,73 @@ def _mav_listener() -> None:
                     msg.servo1_raw, msg.servo2_raw,
                     msg.servo3_raw, msg.servo4_raw,
                 ]
+            elif msg.get_type() == 'COMMAND_ACK':
+                _RESULT = {0: 'ACCEPTED', 1: 'DENIED', 2: 'UNSUPPORTED',
+                           3: 'FAILED', 4: 'IN_PROGRESS'}
+                if msg.result != 0:
+                    print(f"COMMAND_ACK cmd={msg.command} "
+                          f"result={_RESULT.get(msg.result, msg.result)}", flush=True)
 
 
 def pixel_to_world(px: float, py: float,
                    frame_w: int, frame_h: int) -> tuple[float, float] | None:
     """Project a pixel centroid to local ENU metres (East, North).
 
-    Assumes nadir camera: image-right = drone-right, image-up = drone-forward.
+    Uses a 3-D ray → ground-plane intersection that accounts for drone tilt
+    (roll and pitch), not just heading. When the drone tilts to accelerate, the
+    camera tilts with it; a pure yaw rotation of pre-scaled offsets would produce
+    incorrect weed coordinates.
+
+    Camera assumed nadir-pointing: image +X = body +Y (right), image +Y = body +X (forward).
     Returns None until the first MAVLink GLOBAL_POSITION_INT is received.
     """
     with _mav_lock:
         if _mav_state['lat'] is None:
             return None
-        lat, lon, alt, yaw, orig = (
-            _mav_state['lat'], _mav_state['lon'],
-            _mav_state['alt'], _mav_state['yaw'], _mav_state['origin'],
+        lat, lon, alt, yaw, orig, roll, pitch = (
+            _mav_state['lat'],   _mav_state['lon'],
+            _mav_state['alt'],   _mav_state['yaw'],
+            _mav_state['origin'], _mav_state['roll'], _mav_state['pitch'],
         )
 
-    # Pixel offset from principal point → drone-body metres
-    fx    = (frame_w / 2) / math.tan(math.radians(config.CAM_HFOV / 2))
-    scale = alt / fx
-    u =  (px - frame_w / 2) * scale   # rightward  (East  when yaw = 0)
-    v = -(py - frame_h / 2) * scale   # forward    (North when yaw = 0, y-axis flipped)
+    # Pixel ray in body frame (x=forward, y=right, z=down — NED body convention).
+    # The frame is displayed after a 90° CW rotation, so the camera's physical HFOV axis
+    # (original width) now spans frame_h pixels — use frame_h for the focal length.
+    fx = (frame_h / 2) / math.tan(math.radians(config.CAM_HFOV / 2))
+    dx = -(py - frame_h / 2) / fx   # forward (body X)
+    dy =  (px - frame_w / 2) / fx   # rightward (body Y)
+    dz = 1.0                          # downward (body Z)
 
-    # Rotate body frame into ENU by drone yaw
-    east  =  math.cos(yaw) * u + math.sin(yaw) * v
-    north = -math.sin(yaw) * u + math.cos(yaw) * v
+    # Rotate body ray to NED earth frame using ZYX Euler (roll → pitch → yaw)
+    cr, sr = math.cos(roll),  math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw),   math.sin(yaw)
 
-    # Drone ENU position relative to first fix
+    # Apply roll around body X
+    dx1, dy1, dz1 = dx, cr*dy - sr*dz, sr*dy + cr*dz
+    # Apply pitch around body Y
+    dx2, dy2, dz2 = cp*dx1 + sp*dz1, dy1, -sp*dx1 + cp*dz1
+    # Apply yaw around body Z → NED earth frame
+    ned_n, ned_e, ned_d = cy*dx2 - sy*dy2, sy*dx2 + cy*dy2, dz2
+
+    # Convert NED ray to ENU: E=NED-E, N=NED-N, U=-NED-D
+    ray_e, ray_n, ray_u = ned_e, ned_n, -ned_d
+
+    # Intersect ray with ground plane (ENU Z=0, drone at Z=alt).
+    # Solve: alt + t * ray_u = 0  →  t = -alt / ray_u
+    if abs(ray_u) < 1e-6:   # ray nearly horizontal — no valid intersection
+        return None
+    t = -alt / ray_u        # positive when ray_u < 0 (pointing down)
+
+    east_offset  = t * ray_e
+    north_offset = t * ray_n
+
+    # Drone ENU position relative to first GPS fix
     R = 6_371_000.0
     drone_e = math.radians(lon - orig[1]) * R * math.cos(math.radians(orig[0]))
     drone_n = math.radians(lat - orig[0]) * R
 
-    return drone_e + east, drone_n + north
+    return drone_e + east_offset, drone_n + north_offset
 
 
 # ---------------------------------------------------------------------------

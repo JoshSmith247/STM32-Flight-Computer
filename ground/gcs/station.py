@@ -121,7 +121,8 @@ def main() -> None:
     disp_h         = screen_h
 
     _no_stream_img = None
-    _nsi_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'feednotfound.png')
+    _nsi_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             'assets', 'feednotfound.png')
     if os.path.exists(_nsi_path):
         _no_stream_img = cv2.imread(_nsi_path, cv2.IMREAD_UNCHANGED)
 

@@ -56,7 +56,7 @@ const ACCEL_SCALE: f32 = (16.0 / 32768.0) * 9.80665;
 async fn write_reg(cs: &mut Output<'_>, addr: u8, val: u8) {
     let mut buf = [addr & 0x7F, val];
     let mut bus = crate::SPI1_BUS.lock().await;
-    let spi = bus.as_mut().unwrap();
+    let Some(spi) = bus.as_mut() else { return; };
     cs.set_low();
     spi.transfer_in_place(&mut buf).await.ok();
     cs.set_high();
@@ -66,7 +66,7 @@ async fn write_reg(cs: &mut Output<'_>, addr: u8, val: u8) {
 async fn read_reg(cs: &mut Output<'_>, addr: u8) -> u8 {
     let mut buf = [addr | 0x80, 0x00];
     let mut bus = crate::SPI1_BUS.lock().await;
-    let spi = bus.as_mut().unwrap();
+    let Some(spi) = bus.as_mut() else { return 0; };
     cs.set_low();
     spi.transfer_in_place(&mut buf).await.ok();
     cs.set_high();
@@ -131,7 +131,7 @@ pub async fn imu_task(cs_pin: Peri<'static, peripherals::PA4>) {
         buf[0] = TEMP_DATA1 | 0x80;
         {
             let mut bus = crate::SPI1_BUS.lock().await;
-            let spi = bus.as_mut().unwrap();
+            let Some(spi) = bus.as_mut() else { continue; };
             cs.set_low();
             if spi.transfer_in_place(&mut buf).await.is_err() {
                 cs.set_high();

@@ -48,7 +48,7 @@ const CONV_DELAY: Duration = Duration::from_millis(10); // OSR=4096 → 8.22 ms 
 async fn cmd(cs: &mut Output<'_>, command: u8) {
     let mut buf = [command];
     let mut bus = crate::SPI1_BUS.lock().await;
-    let spi = bus.as_mut().unwrap();
+    let Some(spi) = bus.as_mut() else { return Default::default(); };
     cs.set_low();
     spi.transfer_in_place(&mut buf).await.ok();
     cs.set_high();
@@ -58,7 +58,7 @@ async fn cmd(cs: &mut Output<'_>, command: u8) {
 async fn prom_read(cs: &mut Output<'_>, prom_addr: u8) -> u16 {
     let mut buf = [prom_addr, 0x00, 0x00];
     let mut bus = crate::SPI1_BUS.lock().await;
-    let spi = bus.as_mut().unwrap();
+    let Some(spi) = bus.as_mut() else { return Default::default(); };
     cs.set_low();
     spi.transfer_in_place(&mut buf).await.ok();
     cs.set_high();
@@ -69,7 +69,7 @@ async fn prom_read(cs: &mut Output<'_>, prom_addr: u8) -> u16 {
 async fn adc_read(cs: &mut Output<'_>) -> u32 {
     let mut buf = [CMD_ADC_READ, 0x00, 0x00, 0x00];
     let mut bus = crate::SPI1_BUS.lock().await;
-    let spi = bus.as_mut().unwrap();
+    let Some(spi) = bus.as_mut() else { return Default::default(); };
     cs.set_low();
     spi.transfer_in_place(&mut buf).await.ok();
     cs.set_high();

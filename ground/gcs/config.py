@@ -10,10 +10,10 @@ VIDEO_PORT        = int(os.environ.get('VIDEO_PORT',      '5600'))
 GCS_PORT          = int(os.environ.get('GCS_PORT',        '14550'))
 PI_IP             = os.environ.get('PI_IP',            '192.168.4.1')
 WEED_TARGET_PORT  = int(os.environ.get('WEED_TARGET_PORT', '5700'))
-EXG_THRESH        = float(os.environ.get('EXG_THRESH',  '20.0'))   # 2G-R-B cutoff
-EXG_MIN_AREA      = int(os.environ.get('EXG_MIN_AREA',  '250'))    # px² minimum blob
-EXG_SAT_MIN       = int(os.environ.get('EXG_SAT_MIN',   '40'))     # HSV saturation floor (0-255)
-EXG_MAX_FRAC      = float(os.environ.get('EXG_MAX_FRAC', '0.04'))  # max blob as fraction of frame area
+EXG_THRESH        = float(os.environ.get('EXG_THRESH',  '20.0'))
+EXG_MIN_AREA      = max(1,     int(os.environ.get('EXG_MIN_AREA',  '250')))
+EXG_SAT_MIN       = max(0, min(255, int(os.environ.get('EXG_SAT_MIN', '40'))))
+EXG_MAX_FRAC      = max(1e-4, min(0.99, float(os.environ.get('EXG_MAX_FRAC', '0.04'))))
 REMATCH_THRESH     = 0.35    # template correlation floor — no GPS
 REMATCH_THRESH_GPS = 0.12    # template correlation floor — GPS world-gate already fired
 TEMPLATE_POOL_SIZE = 3       # rolling window of templates kept per weed
@@ -42,5 +42,4 @@ PAYLOAD_NAMES = {
     0: 'Servo Bus (4ch)',
 }
 
-OVERLAY_W = 210
 OVERLAY_H = 28 + len(PROGRAMS) * 26 + 10 + 30 + 8

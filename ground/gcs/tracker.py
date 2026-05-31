@@ -129,7 +129,6 @@ class WeedTracker:
             return
         gray    = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         claimed = set()
-        dead    = []
 
         # Pass 1 — optical flow predicts new position; ExG center check confirms it.
         # The predicted box is NOT written back unless its center lands inside a blob,
@@ -182,17 +181,13 @@ class WeedTracker:
                 # points so drift doesn't accumulate while the weed is out of view.
                 w['pts'] = None
                 w['lost_frames'] += 1
-                # Only expire weeds that never got a GPS fix — those with a world
-                # position are remembered indefinitely and re-identified on re-entry.
-                # if w['lost_frames'] > config.MAX_LOST_FRAMES and w['world_pos'] is None:
-                #     dead.append(wid)
 
         # Pass 2 — re-identification for lost named weeds.
         # World position gates candidates to blobs within WORLD_REMATCH_DIST metres;
         # template matching then picks the best among those (graceful fallback when
         # no GPS fix is available: all blobs are considered).
         for wid, w in self._named.items():
-            if wid in dead or w['lost_frames'] == 0:
+            if w['lost_frames'] == 0:
                 continue
             candidates: list[tuple[float, int]] = []
             for i, box in enumerate(exg_blobs):
@@ -238,11 +233,6 @@ class WeedTracker:
             claimed.add(best_blob)
             print(f"Re-identified W{wid} (score={best_score:.2f})", flush=True)
 
-        for wid in dead:
-            print(f"Expired W{wid} — no GPS fix and not seen for {config.MAX_LOST_FRAMES} frames",
-                  flush=True)
-            del self._named[wid]
-
     # ── Click handling ───────────────────────────────────────────────────────
 
     def queue_click(self, x: int, y: int) -> None:
@@ -262,6 +252,8 @@ class WeedTracker:
             if x1 <= x <= x2 and y1 <= y <= y2:
                 print(f"Removed W{wid}", flush=True)
                 del self._named[wid]
+                if self._selected_wid == wid:
+                    self._selected_wid = None
                 return
 
         # Click an unnamed ExG blob → assign next ID

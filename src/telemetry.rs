@@ -27,7 +27,7 @@ const MAVLINK_SYSTEM_ID:     u8 = 1;
 const MAVLINK_COMPONENT_ID:  u8 = 1;
 const MAV_TYPE_QUAD:         u8 = 2;
 const MAV_AUTOPILOT_GENERIC: u8 = 0;
-const PI_HEARTBEAT_TIMEOUT:  Duration = Duration::from_secs(3);
+const PI_HEARTBEAT_TIMEOUT:  Duration = Duration::from_secs(5);
 
 // CRC_EXTRA (MAGIC) per message definition
 const MAGIC_HEARTBEAT:           u8 = 50;
@@ -43,7 +43,8 @@ const MAGIC_BATTERY_STATUS:      u8 = 154;
 const MAGIC_MISSION_COUNT:       u8 = 221;
 const MAGIC_MISSION_ITEM_INT:    u8 = 38;
 const MAGIC_MISSION_REQUEST_INT: u8 = 196;
-const MAGIC_MISSION_ACK:         u8 = 153;
+const MAGIC_MISSION_ACK:                    u8 = 153;
+const MAGIC_SET_POSITION_TARGET_LOCAL_NED: u8 = 143;
 
 const MAV_RESULT_ACCEPTED:    u8 = 0;
 const MAV_RESULT_UNSUPPORTED: u8 = 3;
@@ -266,7 +267,7 @@ async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
                 let rc = *STATE.rc_input.lock().await;
                 if rc.throttle < 0.05 && !rc.failsafe && state::get() != FlightState::Fault {
                     *STATE.armed.lock().await = true;
-                    state::set(FlightState::Flying);
+                    state::set(FlightState::Armed);
                     info!("MAVLink: armed");
                     MAV_RESULT_ACCEPTED
                 } else {
@@ -332,6 +333,7 @@ pub async fn telemetry_task(
     // Mission upload handshake
     let dl_count:            Cell<u16>               = Cell::new(0);
     let dl_next:             Cell<u16>               = Cell::new(0);
+    let wp_count:            Cell<u16>               = Cell::new(0); // NAV_WAYPOINT items only
     let pending_mission_req: Cell<Option<u16>>        = Cell::new(None);
     let pending_mission_ack: Cell<Option<u8>>         = Cell::new(None);
 
@@ -347,9 +349,10 @@ pub async fn telemetry_task(
             ticker.next().await;
             time_ms = time_ms.wrapping_add(100);
 
-            // Pi heartbeat watchdog
+            // Pi heartbeat watchdog — triggers regardless of armed state so the
+            // operator cannot arm into a dead-Pi configuration.
             if pi_ever_seen.get() && last_pi_hb.get().elapsed() > PI_HEARTBEAT_TIMEOUT {
-                if *STATE.armed.lock().await && state::get() != FlightState::Fault {
+                if state::get() != FlightState::Fault {
                     warn!("Pi heartbeat lost — forcing Fault");
                     state::set(FlightState::Fault);
                 }
@@ -514,6 +517,7 @@ pub async fn telemetry_task(
                         44 => MAGIC_MISSION_COUNT,
                         73 => MAGIC_MISSION_ITEM_INT,
                         76 => MAGIC_COMMAND_LONG,
+                        84 => MAGIC_SET_POSITION_TARGET_LOCAL_NED,
                         _  => continue,
                     };
 
@@ -555,6 +559,7 @@ pub async fn telemetry_task(
                             let count = u16_le(&payload, 0) as usize;
                             dl_count.set(count as u16);
                             dl_next.set(0);
+                            wp_count.set(0);
                             {
                                 let mut pm = navigation::PENDING_MISSION.lock().await;
                                 pm.count = 0;
@@ -581,16 +586,23 @@ pub async fn telemetry_task(
                             let command = u16_le(&payload, 30);
                             let hold_s = f32_le(&payload, 0).max(0.0); // param1 = hold time
 
-                            // Only NAV_WAYPOINT (16) creates a flight waypoint
-                            if command == 16 && wp_seq < MAX_WAYPOINTS {
-                                let lat_deg = (i32_le(&payload, 16) as f64) / 1e7;
-                                let lon_deg = (i32_le(&payload, 20) as f64) / 1e7;
-                                let alt_m   = f32_le(&payload, 24);
-                                let mut pm = navigation::PENDING_MISSION.lock().await;
-                                pm.waypoints[wp_seq] = Waypoint {
-                                    position: LatLonAlt { lat_deg, lon_deg, alt_m },
-                                    hold_time_s: hold_s,
-                                };
+                            // Only NAV_WAYPOINT (16) creates a flight waypoint.
+                            // Store contiguously from index 0, ignoring seq gaps from
+                            // non-NAV items (TAKEOFF, RTL, etc.) so navigation always
+                            // starts at waypoints[0] and count reflects real WP count.
+                            if command == 16 {
+                                let wc = wp_count.get() as usize;
+                                if wc < MAX_WAYPOINTS {
+                                    let lat_deg = (i32_le(&payload, 16) as f64) / 1e7;
+                                    let lon_deg = (i32_le(&payload, 20) as f64) / 1e7;
+                                    let alt_m   = f32_le(&payload, 24);
+                                    let mut pm = navigation::PENDING_MISSION.lock().await;
+                                    pm.waypoints[wc] = Waypoint {
+                                        position: LatLonAlt { lat_deg, lon_deg, alt_m },
+                                        hold_time_s: hold_s,
+                                    };
+                                    wp_count.set(wc as u16 + 1);
+                                }
                             }
 
                             let next = (wp_seq + 1) as u16;
@@ -601,11 +613,12 @@ pub async fn telemetry_task(
                                 // All items received — mark ready
                                 {
                                     let mut pm = navigation::PENDING_MISSION.lock().await;
-                                    pm.count = dl_count.get() as usize;
+                                    pm.count = wp_count.get() as usize;
                                     pm.ready = true;
                                 }
                                 pending_mission_ack.set(Some(MAV_MISSION_ACCEPTED));
-                                info!("Mission upload complete ({} WPs)", dl_count.get());
+                                info!("Mission upload complete ({} NAV_WPs of {} items)",
+                                      wp_count.get(), dl_count.get());
                             }
                         }
 
@@ -617,6 +630,50 @@ pub async fn telemetry_task(
                             let cmd_id = u16_le(&payload, 28);
                             let result = handle_command(cmd_id, param1, param2).await;
                             pending_ack.set(Some((cmd_id, result)));
+                        }
+
+                        84 => {
+                            // SET_POSITION_TARGET_LOCAL_NED — weed pull target from Pi
+                            // MAVLink v2 wire layout (largest fields first):
+                            //   time_boot_ms(u32@0), x(f32@4), y(f32@8), z(f32@12),
+                            //   vx..yaw_rate(f32@16..44), type_mask(u16@48),
+                            //   target_sys(u8@50), target_comp(u8@51), frame(u8@52)
+                            if pay_len < 53 { continue; }
+                            let ned_n = f32_le(&payload,  4); // North metres (x in NED)
+                            let ned_e = f32_le(&payload,  8); // East metres  (y in NED)
+                            let ned_d = f32_le(&payload, 12); // Down metres  (z in NED)
+
+                            // Reject NaN/Inf and physically implausible offsets.
+                            // 50 m covers any realistic weed-target radius from the drone.
+                            const MAX_NED_OFFSET_M: f32 = 50.0;
+                            if !ned_n.is_finite() || !ned_e.is_finite() || !ned_d.is_finite()
+                                || ned_n.abs() > MAX_NED_OFFSET_M
+                                || ned_e.abs() > MAX_NED_OFFSET_M
+                                || ned_d.abs() > MAX_NED_OFFSET_M
+                            {
+                                warn!("Weed target rejected: NED out of range \
+                                       ({=f32}, {=f32}, {=f32})", ned_n, ned_e, ned_d);
+                                continue;
+                            }
+
+                            let gps = *STATE.gps_fix.lock().await;
+                            if gps.fix_ok {
+                                let lat_rad   = (gps.lat_deg as f32).to_radians();
+                                let target_lat = gps.lat_deg + (ned_n as f64) / 111_320.0;
+                                let target_lon = gps.lon_deg
+                                    + (ned_e as f64) / (111_320.0 * libm::cosf(lat_rad) as f64);
+                                let target_alt = gps.alt_m - ned_d;
+                                let mut wt = STATE.weed_target.lock().await;
+                                wt.position = LatLonAlt {
+                                    lat_deg: target_lat,
+                                    lon_deg: target_lon,
+                                    alt_m:   target_alt,
+                                };
+                                wt.valid = true;
+                                info!("Weed target set: {=f32}m N, {=f32}m E", ned_n, ned_e);
+                            } else {
+                                warn!("Weed target dropped: no GPS fix");
+                            }
                         }
 
                         _ => {}

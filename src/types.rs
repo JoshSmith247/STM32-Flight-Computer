@@ -99,8 +99,10 @@ pub struct BatteryData {
 
 impl Default for BatteryData {
     fn default() -> Self {
-        // Optimistic defaults so the drone can arm before the battery task reads hardware.
-        Self { voltage_v: 12.6, pct: 100, critical: false }
+        // Pessimistic defaults: GCS shows 0 V / critical until battery_task
+        // confirms healthy voltage (~2.5 s after boot). Prevents the operator
+        // from receiving a false "battery OK" before the first ADC reading.
+        Self { voltage_v: 0.0, pct: 0, critical: true }
     }
 }
 
@@ -212,6 +214,20 @@ pub struct ServoOutputs {
     pub s4: f32,
 }
 
+/// Active weed pull target set by telemetry_task when a SET_POSITION_TARGET_LOCAL_NED
+/// message arrives from the Pi. Cleared by navigation_task after servo actuation.
+#[derive(Clone, Copy, defmt::Format)]
+pub struct WeedTarget {
+    pub position: LatLonAlt,
+    pub valid:    bool,
+}
+
+impl Default for WeedTarget {
+    fn default() -> Self {
+        Self { position: LatLonAlt::default(), valid: false }
+    }
+}
+
 /// Payload presence flags — set by each payload task on successful hardware init.
 /// Packed into HEARTBEAT custom_mode bits [31:16] and forwarded to the GCS.
 pub mod payload_flags {
@@ -232,6 +248,7 @@ pub struct SharedState {
     pub servo_outputs: Mutex<CriticalSectionRawMutex, ServoOutputs>,
     pub mag_data:      Mutex<CriticalSectionRawMutex, MagData>,
     pub payload_flags: Mutex<CriticalSectionRawMutex, u32>,
+    pub weed_target:   Mutex<CriticalSectionRawMutex, WeedTarget>,
 }
 
 impl SharedState {
@@ -244,12 +261,13 @@ impl SharedState {
             nav_command:   Mutex::new(NavCommand { autonomous: false, attitude_setpoint: AttitudeSetpoint { roll:0.0, pitch:0.0, yaw_rate:0.0, throttle:0.0 }, target: LatLonAlt { lat_deg:0.0, lon_deg:0.0, alt_m:0.0 } }),
             motor_outputs: Mutex::new(MotorOutputs { m1:0.0, m2:0.0, m3:0.0, m4:0.0 }),
             gps_fix:       Mutex::new(GpsFix { lat_deg:0.0, lon_deg:0.0, alt_m:0.0, vel_n_ms:0.0, vel_e_ms:0.0, vel_d_ms:0.0, hacc_m:9999.0, fix_ok:false }),
-            battery:       Mutex::new(BatteryData { voltage_v:12.6, pct:100, critical:false }),
+            battery:       Mutex::new(BatteryData { voltage_v:0.0, pct:0, critical:true }),
             armed:         Mutex::new(false),
             flow:          Mutex::new(FlowData { quality:0, vel_x_mrad_s:0, vel_y_mrad_s:0, height_mm:-1, valid:false }),
             servo_outputs: Mutex::new(ServoOutputs { s1:0.0, s2:0.0, s3:0.0, s4:0.0 }),
             mag_data:      Mutex::new(MagData { x:0.0, y:0.0, z:0.0, heading_rad:0.0, valid:false }),
             payload_flags: Mutex::new(0u32),
+            weed_target:   Mutex::new(WeedTarget { position: LatLonAlt { lat_deg:0.0, lon_deg:0.0, alt_m:0.0 }, valid: false }),
         }
     }
 }

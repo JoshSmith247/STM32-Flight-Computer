@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 
 import config
-from config import PROGRAMS, PAYLOAD_NAMES, OVERLAY_W, OVERLAY_H
+from config import PROGRAMS, PAYLOAD_NAMES, OVERLAY_H
 from mavlink import _mav_lock, _mav_state, send_mavlink_command
 
 _FLIGHT_MODES = {
@@ -27,7 +27,7 @@ _ui_state: dict = {'selected_prog': 0, 'running_prog': None, 'stopped': False, '
 
 # GCS-side payload enable/disable overrides (bit index → manually disabled)
 _payload_disabled: set = set()
-_payload_panel_rect: list = [0, 0, 0, 0]   # [x, y, w, h] in panel-local coords
+_payload_panel_rect: tuple = (0, 0, 0, 0)   # (x, y, w, h) in panel-local coords — atomic tuple swap
 
 
 def toggle_payload_override(bit: int) -> None:
@@ -573,9 +573,7 @@ def _draw_program_panel(panel: np.ndarray, x: int, y: int, w: int) -> None:
         _btn(bx0, bx1, (26, 30, 34), (45, 52, 58), label, (65, 78, 90), scale)
 
     if _ui_state['landing']:
-        _gbtn(x + 8,      x + 88,      'LAND')
-        _gbtn(x + 92,     x + 172,     'RESUME', 0.38)
-        _gbtn(x + w - 88, x + w - 8,   'SEND')
+        _btn(x + 8, x + w - 8, (18, 18, 100), (40, 40, 200), 'ABORT LAND', (80, 80, 235))
     elif _ui_state['stopped']:
         _btn(x + 8,      x + 88,      (18, 18, 120), (40, 40, 190), 'LAND',   (80, 80, 230))
         _btn(x + 92,     x + 172,     (18, 80, 18),  (40, 160, 40), 'RESUME', (80, 220, 80), 0.38)
@@ -584,66 +582,6 @@ def _draw_program_panel(panel: np.ndarray, x: int, y: int, w: int) -> None:
         _btn(x + 8,      x + 88,      (18, 18, 120), (40, 40, 190),  'STOP',   (80, 80, 230))
         _btn(x + w - 88, x + w - 8,   (34, 54, 90),  (72, 108, 160), 'SEND',   (172, 210, 255))
 
-
-def _draw_program_overlay(frame: np.ndarray, x: int, y: int) -> None:
-    """Semi-transparent program selector box overlaid on the camera feed."""
-    w, h = OVERLAY_W, OVERLAY_H
-    if y < 0 or x < 0 or y + h > frame.shape[0] or x + w > frame.shape[1]:
-        return
-    roi = frame[y:y + h, x:x + w]
-    cv2.addWeighted(np.full_like(roi, (16, 16, 16)), 0.86, roi, 0.14, 0, roi)
-    frame[y:y + h, x:x + w] = roi
-    cv2.rectangle(frame, (x, y), (x + w, y + h), (72, 72, 72), 1)
-    cv2.rectangle(frame, (x + 1, y + 1), (x + w - 1, y + 27), (38, 44, 50), -1)
-    cv2.putText(frame, 'PROGRAMS', (x + 9, y + 18),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (178, 188, 196), 1, cv2.LINE_AA)
-    cv2.line(frame, (x, y + 27), (x + w, y + 27), (58, 58, 58), 1)
-
-    sel = _ui_state['selected_prog']
-    run = _ui_state['running_prog']
-    for i, prog in enumerate(PROGRAMS):
-        ry     = y + 28 + i * 26
-        is_sel = (i == sel)
-        is_run = (i == run)
-        if is_sel and not is_run:
-            cv2.rectangle(frame, (x + 2, ry + 1), (x + w - 2, ry + 24), (44, 37, 16), -1)
-        cv2.circle(frame, (x + 13, ry + 13), 4,
-                   (50, 210, 50) if is_run else (52, 52, 52), -1)
-        if is_run:
-            text_col = (72, 72, 72)
-        elif is_sel:
-            text_col = (100, 200, 255)
-        else:
-            text_col = (162, 162, 162)
-        cv2.putText(frame, prog, (x + 25, ry + 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, text_col, 1, cv2.LINE_AA)
-
-    sep_y    = y + 28 + len(PROGRAMS) * 26 + 4
-    cv2.line(frame, (x + 4, sep_y), (x + w - 4, sep_y), (52, 52, 52), 1)
-    by0, by1 = sep_y + 6, sep_y + 30
-
-    def _obtn(bx0, bx1, bg, border, label, fg, scale=0.38):
-        cv2.rectangle(frame, (bx0, by0), (bx1, by1), bg, -1)
-        cv2.rectangle(frame, (bx0, by0), (bx1, by1), border, 1)
-        (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
-        cv2.putText(frame, label,
-                    (bx0 + (bx1 - bx0 - lw) // 2, by0 + (by1 - by0 + lh) // 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, scale, fg, 1, cv2.LINE_AA)
-
-    def _gobtn(bx0, bx1, label, scale=0.38):
-        _obtn(bx0, bx1, (26, 30, 34), (45, 52, 58), label, (65, 78, 90), scale)
-
-    if _ui_state['landing']:
-        _gobtn(x + 4,      x + 68,      'LAND')
-        _gobtn(x + 71,     x + 135,     'RESUME', 0.30)
-        _gobtn(x + w - 68, x + w - 4,   'SEND')
-    elif _ui_state['stopped']:
-        _obtn(x + 4,      x + 68,      (18, 18, 120), (40, 40, 190), 'LAND',   (80, 80, 230))
-        _obtn(x + 71,     x + 135,     (18, 80, 18),  (40, 160, 40), 'RESUME', (80, 220, 80), 0.30)
-        _gobtn(x + w - 68, x + w - 4,  'SEND')
-    else:
-        _obtn(x + 4,      x + 84,      (18, 18, 120), (40, 40, 190), 'STOP',   (80, 80, 230))
-        _obtn(x + w - 84, x + w - 4,   (34, 54, 90),  (72, 108, 160), 'SEND',   (172, 210, 255))
 
 
 def _handle_overlay_click(lx: int, ly: int) -> None:
@@ -659,7 +597,11 @@ def _handle_overlay_click(lx: int, ly: int) -> None:
     if ly < sep_y + 6:
         return
     if _ui_state['landing']:
-        return                             # all buttons grayed — no interaction
+        _ui_state['landing'] = False
+        _ui_state['stopped'] = False
+        send_mavlink_command(20)           # MAV_CMD_NAV_RETURN_TO_LAUNCH
+        print("Landing aborted — RTH commanded", flush=True)
+        return
     panel_w   = config.STATS_W // 2
     on_left   = lx <= 88                  # STOP / LAND
     on_resume = 88 < lx <= 172            # RESUME (stopped state only)
@@ -820,7 +762,7 @@ def draw_stats_panel(h: int, tracker=None) -> np.ndarray:
         ('CTRL',   ('FAULT' if flight_state == 5
                     else 'CHECK' if flight_state == 1
                     else 'OK')  if linked else '--'),
-        ('Pi',     'OK'   if linked else 'FAULT'),
+        ('LINK',   'OK'   if linked else 'FAULT'),
         (None, None),
         ('GPS',    ('OK'  if lat is not None else 'CHECK') if linked else '--'),
         ('IMU',    'OK'   if linked else '--'),
@@ -847,7 +789,8 @@ def draw_stats_panel(h: int, tracker=None) -> np.ndarray:
         _draw_weed_map(panel, R, map_y, COL, map_h,
                        lat, lon, yaw, origin, weed_world_pos, linked)
 
-    _payload_panel_rect[:] = [R, map_y + map_h, COL, payloads_h]
+    global _payload_panel_rect
+    _payload_panel_rect = (R, map_y + map_h, COL, payloads_h)
     _draw_payloads(panel, R, map_y + map_h, COL, payload_flags, linked)
     _draw_program_panel(panel, R, h - OVERLAY_H, COL)
 

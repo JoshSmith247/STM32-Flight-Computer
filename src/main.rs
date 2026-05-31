@@ -63,6 +63,7 @@ async fn control_task() {
         ticker.next().await;
 
         let imu      = *STATE.imu_data.lock().await;
+        let mag      = *STATE.mag_data.lock().await;
         let is_armed = *STATE.armed.lock().await;
         let nav_cmd  = *STATE.nav_command.lock().await;
         let rc       = *STATE.rc_input.lock().await;
@@ -73,7 +74,14 @@ async fn control_task() {
             rc.to_attitude_setpoint()
         };
 
-        let quat = filter.update(imu.gyro, imu.accel);
+        let quat = if mag.valid {
+            filter.update_with_mag(
+                imu.gyro, imu.accel,
+                types::Vec3 { x: mag.x, y: mag.y, z: mag.z },
+            )
+        } else {
+            filter.update(imu.gyro, imu.accel)
+        };
         *STATE.attitude.lock().await = quat;
         let euler = filter.euler();
 
@@ -119,10 +127,13 @@ async fn arming_task() {
                 *STATE.armed.lock().await = false;
                 state::set(FlightState::Idle);
                 info!("Disarmed");
+            } else if state::get() == FlightState::Armed && rc.throttle > 0.15 {
+                // Promote Armed → Flying once the pilot spools up past idle throttle.
+                state::set(FlightState::Flying);
             }
         } else if rc.arm && rc.throttle < 0.05 && !rc.failsafe {
             *STATE.armed.lock().await = true;
-            state::set(FlightState::Flying);
+            state::set(FlightState::Armed);
             info!("Armed");
         }
     }
@@ -200,9 +211,11 @@ async fn main(spawner: Spawner) {
 #[inline(never)]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    // FORCE PORT G PIN 7 LOW TO TURN OFF THE LED
     unsafe {
-        // This directly writes to the hardware register to turn off PG7
+        // Send a zero DSHOT frame before halting so ESCs receive an explicit stop.
+        // Spins ≤30 µs for any in-flight DMA to drain, then fires once and halts.
+        motor::emergency_stop();
+        // Turn off status LED (PG7, active-low: set ODR bit to drive HIGH = off)
         let gpiog = 0x40021800 as *mut u32;
         *gpiog.offset(5) = 1 << 7;
     }
