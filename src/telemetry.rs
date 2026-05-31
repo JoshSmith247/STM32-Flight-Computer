@@ -131,7 +131,8 @@ fn build_heartbeat(flight_state: u8, mode: FlightMode, payload_flags: u32) -> [u
 // SYS_STATUS #1 — 31 bytes: 3×u32, 9×u16/i16, 1×i8
 fn build_sys_status(voltage_mv: u16, pct: u8) -> [u8; 31] {
     let mut p = [0u8; 31];
-    let sensors: u32 = 0x61; // IMU 0x1, baro 0x20, GPS 0x40
+    // MAVLink MAV_SYS_STATUS_SENSOR bits: gyro=0x01, accel=0x02, baro=0x08, GPS=0x20
+    let sensors: u32 = 0x2B;
     p[0..4].copy_from_slice(&sensors.to_le_bytes());
     p[4..8].copy_from_slice(&sensors.to_le_bytes());
     p[8..12].copy_from_slice(&sensors.to_le_bytes());

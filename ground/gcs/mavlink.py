@@ -1,5 +1,7 @@
+import datetime
 import json
 import math
+import os
 import socket
 import struct
 import threading
@@ -88,6 +90,14 @@ _mav_state: dict = {
     'flight_mode_id': 0,   # FlightMode enum value [7:0]
     'flight_state':   0,   # FlightState enum value [15:8]
     'payload_flags':  0,   # connected payload bitmask [31:16]
+    # GPS_RAW_INT fix quality (0=no GPS, 1=no fix, 2=2D, 3=3D, 4+=DGPS/RTK)
+    'gps_fix_type':   0,
+    # VFR_HUD collective throttle percentage (0–100)
+    'throttle_pct':   0,
+    # SYS_STATUS onboard_control_sensors_health bitmask (0 = not yet received)
+    'sensors_health': 0,
+    # Last COMMAND_ACK received — (cmd_id, result_code); consumed by draw_stats_panel
+    'last_ack': None,
 }
 
 
@@ -103,7 +113,8 @@ def _mav_listener() -> None:
     while True:
         msg = conn.recv_match(
             type=['GLOBAL_POSITION_INT', 'ATTITUDE', 'SYS_STATUS',
-                  'HEARTBEAT', 'BATTERY_STATUS', 'SERVO_OUTPUT_RAW', 'COMMAND_ACK'],
+                  'HEARTBEAT', 'BATTERY_STATUS', 'SERVO_OUTPUT_RAW', 'COMMAND_ACK',
+                  'GPS_RAW_INT', 'VFR_HUD'],
             blocking=True, timeout=1.0)
         if msg is None:
             continue
@@ -124,6 +135,11 @@ def _mav_listener() -> None:
             elif msg.get_type() == 'SYS_STATUS':
                 if _mav_state['battery_pct'] < 0:   # BATTERY_STATUS is authoritative once received
                     _mav_state['battery_pct'] = msg.battery_remaining
+                _mav_state['sensors_health'] = msg.onboard_control_sensors_health
+            elif msg.get_type() == 'GPS_RAW_INT':
+                _mav_state['gps_fix_type'] = msg.fix_type
+            elif msg.get_type() == 'VFR_HUD':
+                _mav_state['throttle_pct'] = msg.throttle
             elif msg.get_type() == 'HEARTBEAT':
                 cm = msg.custom_mode
                 _mav_state['armed']          = bool(msg.base_mode & 128)
@@ -147,6 +163,7 @@ def _mav_listener() -> None:
             elif msg.get_type() == 'COMMAND_ACK':
                 _RESULT = {0: 'ACCEPTED', 1: 'DENIED', 2: 'UNSUPPORTED',
                            3: 'FAILED', 4: 'IN_PROGRESS'}
+                _mav_state['last_ack'] = (msg.command, msg.result)
                 if msg.result != 0:
                     print(f"COMMAND_ACK cmd={msg.command} "
                           f"result={_RESULT.get(msg.result, msg.result)}", flush=True)
@@ -214,9 +231,60 @@ def pixel_to_world(px: float, py: float,
 
 
 # ---------------------------------------------------------------------------
-# MAVLink targeting stub (commented out — ExG-only mode)
+# Telemetry logger
 # ---------------------------------------------------------------------------
 
-# def send_target(sock: socket.socket, x_norm: float, y_norm: float) -> None:
-#     print(f"Target offset: x={x_norm:+.2f} y={y_norm:+.2f}", flush=True)
-#     # TODO: sock.sendto(mavlink_frame, (PI_IP, GCS_PORT))
+_LOG_INTERVAL = 0.5   # seconds between rows (2 Hz)
+
+_STATE_LOG_LABELS = {0: 'IDLE', 1: 'ARMING', 2: 'ARMED', 3: 'FLYING', 4: 'LANDING', 5: 'FAULT'}
+_MODE_LOG_LABELS  = {0: 'STAB', 1: 'ALTH',   2: 'POSH',  3: 'AUTO',   4: 'RTH',     5: 'LAND'}
+
+_LOG_HEADER = (
+    'time,state,mode,armed,lat,lon,alt_m,roll_deg,pitch_deg,hdg_deg,'
+    'spd_ms,climb_ms,batt_pct,volt_v,curr_a,thr_pct,m1_us,m2_us,m3_us,m4_us\n'
+)
+
+
+def start_logging() -> None:
+    """Open a timestamped log file in ground/logs/ and start the background writer."""
+    log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    fname = datetime.datetime.now().strftime('flight_%Y%m%d_%H%M%S.txt')
+    path  = os.path.join(log_dir, fname)
+    threading.Thread(target=_log_writer, args=(path,), daemon=True).start()
+    print(f"Telemetry log: {path}", flush=True)
+
+
+def _log_writer(path: str) -> None:
+    with open(path, 'w') as f:
+        f.write(_LOG_HEADER)
+        while True:
+            time.sleep(_LOG_INTERVAL)
+            with _mav_lock:
+                s = dict(_mav_state)
+
+            now       = datetime.datetime.now()
+            ts        = now.strftime('%Y-%m-%dT%H:%M:%S.') + f'{now.microsecond // 1000:03d}'
+            state_lbl = _STATE_LOG_LABELS.get(s['flight_state'], str(s['flight_state']))
+            mode_lbl  = _MODE_LOG_LABELS.get(s['flight_mode_id'], str(s['flight_mode_id']))
+            roll_deg  = round(math.degrees(s['roll']),  1)
+            pitch_deg = round(math.degrees(s['pitch']), 1)
+            hdg_deg   = round(math.degrees(s['yaw']) % 360, 1)
+            spd_ms    = round(math.hypot(s['vx'], s['vy']), 2)
+            climb_ms  = round(-s['vz'], 2)
+            volt_v    = round(s['voltage_mv'] / 1000, 2) if s['voltage_mv'] > 0  else -1.0
+            curr_a    = round(s['current_ca'] / 100,   2) if s['current_ca'] >= 0 else -1.0
+            lat_s     = f"{s['lat']:.6f}"  if s['lat'] is not None else ''
+            lon_s     = f"{s['lon']:.6f}"  if s['lon'] is not None else ''
+
+            row = (f"{ts},{state_lbl},{mode_lbl},"
+                   f"{'1' if s['armed'] else '0'},"
+                   f"{lat_s},{lon_s},{round(s['alt'], 1)},"
+                   f"{roll_deg},{pitch_deg},{hdg_deg},"
+                   f"{spd_ms},{climb_ms},"
+                   f"{s['battery_pct']},{volt_v},{curr_a},"
+                   f"{s['throttle_pct']},"
+                   f"{s['motor_pwm'][0]},{s['motor_pwm'][1]},"
+                   f"{s['motor_pwm'][2]},{s['motor_pwm'][3]}\n")
+            f.write(row)
+            f.flush()

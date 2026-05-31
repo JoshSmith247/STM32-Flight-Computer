@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """
-Hybrid ExG + YOLO weed detection.
+ExG weed detection ground control station.
 
-Adds an Excess Green (ExG) colour-based pre-filter on top of the YOLO pipeline:
+Excess Green (ExG = 2G - R - B) detects vegetation blobs in each camera frame:
 
-  - ExG (2G - R - B) runs on every frame on CPU (~1 ms) to find green blobs.
-  - YOLO inference is skipped on frames where ExG finds nothing, saving GPU
-    compute — useful on pavement/slate where most frames have no weeds.
-  - ExG-only candidates are drawn in orange.
-  - YOLO-confirmed tracks are drawn in purple (yellow when targeted).
+  - ExG candidates are drawn in orange; click a blob to assign a persistent ID.
+  - Named weeds track via optical flow + template re-identification across frames.
   - Press 'e' to toggle a semi-transparent green ExG mask overlay.
 
 Tune EXG_THRESH and EXG_MIN_AREA in .env for your surface:
-  - Lower EXG_THRESH  → more sensitive, more false positives on concrete
+  - Lower EXG_THRESH   → more sensitive, more false positives on concrete
   - Higher EXG_MIN_AREA → ignores tiny specks, catches only meaningful blobs
 """
 
@@ -26,7 +23,7 @@ import numpy as np
 
 import config
 from dashboard import _handle_overlay_click, handle_payload_double_click
-from mavlink import _HAVE_MAVLINK, _mav_listener, _target_sock
+from mavlink import _HAVE_MAVLINK, _mav_listener, _target_sock, start_logging
 from renderer import FrameGrabber, _Renderer
 from tracker import WeedTracker
 
@@ -77,8 +74,9 @@ def main() -> None:
     # CGDisplayBounds covers the full display frame in logical points (including
     # the Dock area), matching DPG's viewport coordinate space exactly.
     screen_w, screen_h = 2560, 1440
+    pixel_ratio = 1   # physical pixels per logical point (2 on Retina)
     try:
-        import ctypes
+        import ctypes, ctypes.util
         _cg = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
 
         class _CGPoint(ctypes.Structure):
@@ -91,9 +89,27 @@ def main() -> None:
         _cg.CGMainDisplayID.restype  = ctypes.c_uint32
         _cg.CGDisplayBounds.restype  = _CGRect
         _cg.CGDisplayBounds.argtypes = [ctypes.c_uint32]
-        _b = _cg.CGDisplayBounds(_cg.CGMainDisplayID())
+        _b       = _cg.CGDisplayBounds(_cg.CGMainDisplayID())
         screen_w = int(_b.size.width)
         screen_h = int(_b.size.height)
+
+        # NSScreen.mainScreen.backingScaleFactor is the authoritative HiDPI scale factor.
+        # CGDisplayPixelsWide returns the scaled render resolution on modern macOS,
+        # not the panel's physical pixel count, so it can equal the logical size.
+        _objc = ctypes.CDLL(ctypes.util.find_library('objc'))
+        _objc.objc_getClass.restype     = ctypes.c_void_p
+        _objc.objc_getClass.argtypes    = [ctypes.c_char_p]
+        _objc.sel_registerName.restype  = ctypes.c_void_p
+        _objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        _objc.objc_msgSend.restype      = ctypes.c_void_p
+        _objc.objc_msgSend.argtypes     = [ctypes.c_void_p, ctypes.c_void_p]
+        _objc_d = ctypes.CDLL(ctypes.util.find_library('objc'))
+        _objc_d.objc_msgSend.restype    = ctypes.c_double
+        _objc_d.objc_msgSend.argtypes   = [ctypes.c_void_p, ctypes.c_void_p]
+        _ns  = _objc.objc_getClass(b'NSScreen')
+        _ms  = _objc.objc_msgSend(_ns,  _objc.sel_registerName(b'mainScreen'))
+        _bsf = _objc_d.objc_msgSend(_ms, _objc.sel_registerName(b'backingScaleFactor'))
+        pixel_ratio = max(1, round(_bsf))
     except Exception:
         try:
             import tkinter as _tk
@@ -102,7 +118,7 @@ def main() -> None:
             _root.destroy()
         except Exception:
             pass
-    print(f"Screen: {screen_w}×{screen_h}", flush=True)
+    print(f"Screen: {screen_w}×{screen_h}  pixel ratio: {pixel_ratio}×", flush=True)
     print(f"ExG threshold: {config.EXG_THRESH}  min blob: {config.EXG_MIN_AREA}px²", flush=True)
     print("Keys: 'e' ExG overlay  'q' quit  |  click blob to name (W1,W2…), click name to remove",
           flush=True)
@@ -112,10 +128,12 @@ def main() -> None:
     else:
         print("pymavlink not installed — world-frame re-ID disabled (pip install pymavlink)",
               flush=True)
+    start_logging()
 
     # ── Layout ────────────────────────────────────────────────────────────────
     frame_w, frame_h = 1920, 1080
     config.STATS_W = max(screen_w // 2, 800)
+    config.PR      = pixel_ratio
     disp_w         = max(400, screen_w - config.SIDEBAR_W - config.STATS_W) - 30
     config.STATS_W = screen_w - config.SIDEBAR_W - disp_w
     disp_h         = screen_h
@@ -148,15 +166,16 @@ def main() -> None:
     # ── Dear PyGui setup ──────────────────────────────────────────────────────
     dpg.create_context()
 
+    pr = pixel_ratio   # short alias used throughout texture setup
     with dpg.texture_registry():
-        dpg.add_raw_texture(disp_w, disp_h,
-                            np.zeros(disp_w * disp_h * 4, dtype=np.float32),
+        dpg.add_raw_texture(disp_w * pr, disp_h * pr,
+                            np.zeros(disp_w * pr * disp_h * pr * 4, dtype=np.float32),
                             format=dpg.mvFormat_Float_rgba, tag="tex_vid")
-        dpg.add_raw_texture(config.SIDEBAR_W, disp_h,
-                            np.zeros(config.SIDEBAR_W * disp_h * 4, dtype=np.float32),
+        dpg.add_raw_texture(config.SIDEBAR_W * pr, disp_h * pr,
+                            np.zeros(config.SIDEBAR_W * pr * disp_h * pr * 4, dtype=np.float32),
                             format=dpg.mvFormat_Float_rgba, tag="tex_side")
-        dpg.add_raw_texture(config.STATS_W, disp_h,
-                            np.zeros(config.STATS_W * disp_h * 4, dtype=np.float32),
+        dpg.add_raw_texture(config.STATS_W * pr, disp_h * pr,
+                            np.zeros(config.STATS_W * pr * disp_h * pr * 4, dtype=np.float32),
                             format=dpg.mvFormat_Float_rgba, tag="tex_stats")
 
     stream_ok       = [False]
@@ -227,7 +246,9 @@ def main() -> None:
     dpg.show_viewport()
     _macos_set_presentation(True)   # hide menu bar + Dock
 
-    # BGR uint8 → flat RGBA float32 for DPG texture upload
+    # BGR uint8 → flat RGBA float32 for DPG texture upload.
+    # Panels are pre-rendered at physical pixel resolution (config.PR applied by each
+    # drawing module), so no resize is needed here.
     def _to_tex(bgr: np.ndarray) -> np.ndarray:
         h, w = bgr.shape[:2]
         out = np.empty((h, w, 4), dtype=np.float32)

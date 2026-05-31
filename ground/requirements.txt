@@ -3,3 +3,4 @@ pymavlink>=2.4.0
 python-dotenv>=1.0.0
 numpy>=1.24.0
 dearpygui>=1.9.0
+Pillow>=9.0.0

@@ -4,6 +4,7 @@ import time
 import cv2
 import numpy as np
 
+import config
 from dashboard import draw_stats_panel
 from exg import exg_candidates, exg_mask
 from mavlink import send_weed_target
@@ -11,40 +12,50 @@ from tracker import WeedTracker
 
 
 def _make_no_stream_frame(w: int, h: int, img) -> tuple:
-    """Gray standby frame with optional overlay image and a Connect Device button."""
-    frame  = np.full((h, w, 3), 72, dtype=np.uint8)
-    btn_w, btn_h = 200, 42
+    """Physical-pixel standby frame; returns logical btn_rect for click detection."""
+    s = config.PR
+    W, H = w * s, h * s
+    frame    = np.full((H, W, 3), 72, dtype=np.uint8)
+    btn_w_l  = 200          # logical button dimensions
+    btn_h_l  = 42
+    btn_w, btn_h = btn_w_l * s, btn_h_l * s
 
     if img is not None:
         ih, iw = img.shape[:2]
-        max_iw = min(w * 2 // 3, w - 40)
-        max_ih = min(h * 2 // 5, h - 120)
-        scale  = min(max_iw / iw, max_ih / ih)
-        niw, nih = int(iw * scale), int(ih * scale)
+        max_iw = min(W * 2 // 3, W - 40 * s)
+        max_ih = min(H * 2 // 5, H - 120 * s)
+        sc     = min(max_iw / iw, max_ih / ih)
+        niw, nih = int(iw * sc), int(ih * sc)
         resized = cv2.resize(img, (niw, nih), interpolation=cv2.INTER_AREA)
         if resized.ndim == 3 and resized.shape[2] == 4:
             alpha   = resized[:, :, 3:4].astype(np.float32) / 255.0
             bg      = np.full((nih, niw, 3), 72, dtype=np.float32)
             resized = (resized[:, :, :3].astype(np.float32) * alpha
                        + bg * (1.0 - alpha)).astype(np.uint8)
-        ox  = (w - niw) // 2
-        oy  = max(0, (h - nih) // 2 - btn_h - 20)
+        ox  = (W - niw) // 2
+        oy  = max(0, (H - nih) // 2 - btn_h - 20 * s)
         frame[oy:oy + nih, ox:ox + niw] = resized
-        btn_y = min(oy + nih + 20, h - btn_h - 10)
+        btn_y = min(oy + nih + 20 * s, H - btn_h - 10 * s)
     else:
-        cv2.putText(frame, 'NO STREAM', (w // 2 - 90, h // 2 - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (130, 130, 130), 2, cv2.LINE_AA)
-        btn_y = h // 2 + 30
+        (tw, _), _ = cv2.getTextSize('NO STREAM', cv2.FONT_HERSHEY_SIMPLEX, 1.2 * s, 2)
+        cv2.putText(frame, 'NO STREAM', (W // 2 - tw // 2, H // 2 - 20 * s),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2 * s, (130, 130, 130),
+                    max(1, 2 * s), cv2.LINE_AA)
+        btn_y = H // 2 + 30 * s
 
-    btn_x = (w - btn_w) // 2
+    btn_x = (W - btn_w) // 2
     cv2.rectangle(frame, (btn_x, btn_y), (btn_x + btn_w, btn_y + btn_h), (60, 110, 190), -1)
-    cv2.rectangle(frame, (btn_x, btn_y), (btn_x + btn_w, btn_y + btn_h), (90, 145, 225), 1)
+    cv2.rectangle(frame, (btn_x, btn_y), (btn_x + btn_w, btn_y + btn_h),
+                  (90, 145, 225), max(1, s))
     lbl = 'Connect Device'
-    (lw, lh), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)
-    cv2.putText(frame, lbl, (btn_x + (btn_w - lw) // 2, btn_y + (btn_h + lh) // 2),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (230, 230, 230), 1, cv2.LINE_AA)
+    (lw, lh), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.52 * s, 1)
+    cv2.putText(frame, lbl,
+                (btn_x + (btn_w - lw) // 2, btn_y + (btn_h + lh) // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52 * s, (230, 230, 230),
+                max(1, s), cv2.LINE_AA)
 
-    return frame, (btn_x, btn_y, btn_w, btn_h)
+    # Return logical btn_rect so station.py click detection works with logical mouse coords
+    return frame, (btn_x // s, btn_y // s, btn_w_l, btn_h_l)
 
 
 class FrameGrabber:
@@ -123,11 +134,13 @@ class _Renderer:
             self.stream_alive = True
 
     def display_to_frame(self, dx: int, dy: int) -> tuple[int, int] | None:
-        """Map a display-space click to source frame coordinates.
+        """Map a logical-pixel display click to source frame coordinates.
         Returns None if the point lands in a letterbox border."""
-        fx = (dx - self._vid_x_off) / self._vid_scale
-        fy = (dy - self._vid_y_off) / self._vid_scale
-        if fx < 0 or fy < 0:
+        pr = config.PR
+        fx = (dx * pr - self._vid_x_off) / self._vid_scale
+        fy = (dy * pr - self._vid_y_off) / self._vid_scale
+        fs = self._tracker._frame_size
+        if fx < 0 or fy < 0 or (fs is not None and (fx >= fs[0] or fy >= fs[1])):
             return None
         return int(fx), int(fy)
 
@@ -204,7 +217,6 @@ class _Renderer:
             blobs = exg_candidates(mask)
             self._tracker.process_click(frame)
             self._tracker.propagate_named(frame, blobs)
-            self._tracker.propagate(frame)
             self._tracker.update_exg(blobs)
             display = self._tracker.draw(frame, blobs)
 
@@ -213,18 +225,21 @@ class _Renderer:
                 tint[:, :, 1] = mask
                 display = cv2.addWeighted(display, 1.0, tint, 0.4, 0)
 
+            pr    = config.PR
+            pw    = self._disp_w * pr   # physical canvas dimensions
+            ph    = self._disp_h * pr
             src_h, src_w = display.shape[:2]
-            scale  = min(self._disp_w / src_w, self._disp_h / src_h)
+            scale  = min(pw / src_w, ph / src_h)
             fit_w  = int(src_w * scale)
             fit_h  = int(src_h * scale)
-            x_off  = (self._disp_w - fit_w) // 2
-            y_off  = (self._disp_h - fit_h) // 2
+            x_off  = (pw - fit_w) // 2
+            y_off  = (ph - fit_h) // 2
             resized = cv2.resize(display, (fit_w, fit_h), interpolation=cv2.INTER_LINEAR)
-            canvas  = np.zeros((self._disp_h, self._disp_w, 3), dtype=np.uint8)
+            canvas  = np.zeros((ph, pw, 3), dtype=np.uint8)
             canvas[y_off:y_off + fit_h, x_off:x_off + fit_w] = resized
             display = canvas
-            self._vid_scale = scale
-            self._vid_x_off = x_off
+            self._vid_scale = scale   # physical px / source px
+            self._vid_x_off = x_off   # physical px
             self._vid_y_off = y_off
 
             n_active = sum(1 for w in self._tracker._named.values()
@@ -235,10 +250,12 @@ class _Renderer:
                 hud += f"  |  named: {n_active}"
             if n_lost:
                 hud += f"  |  searching: {n_lost}"
-            cv2.putText(display, hud, (9, 23),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-            cv2.putText(display, hud, (8, 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1, cv2.LINE_AA)
+            cv2.putText(display, hud, (9 * pr, 23 * pr),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5 * pr, (0, 0, 0),
+                        max(1, pr), cv2.LINE_AA)
+            cv2.putText(display, hud, (8 * pr, 22 * pr),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5 * pr, (220, 220, 220),
+                        max(1, pr), cv2.LINE_AA)
 
             sel = self._tracker._selected_wid
             if sel != self._prev_sel:
@@ -255,28 +272,3 @@ class _Renderer:
                 self._vid_arr = display
                 self._vid_seq += 1
             self.frame_count += 1
-
-
-# ---------------------------------------------------------------------------
-# Background YOLO inference thread (commented out — ExG-only mode)
-# ---------------------------------------------------------------------------
-
-# from ultralytics import YOLO
-# import queue
-# model = YOLO(MODEL_PATH)
-# _infer_queue: queue.Queue = queue.Queue(maxsize=1)
-# _det_lock = threading.Lock()
-# _latest_det = None
-
-# def _inference_worker() -> None:
-#     global _latest_det
-#     while True:
-#         frame = _infer_queue.get()
-#         if frame is None:
-#             break
-#         results = model.track(
-#             frame, conf=CONF_THRESH, iou=IOU_THRESH, persist=True,
-#             verbose=False, imgsz=INFER_IMGSZ, device=DEVICE,
-#         )
-#         with _det_lock:
-#             _latest_det = (frame, results[0].boxes, results[0].names)

@@ -2,7 +2,6 @@
 /reading
 */.venv
 */.env
-ground/training/*
 pi/demo/*
-ground/models/*
+ground/logs/*
 **/__pycache__/*

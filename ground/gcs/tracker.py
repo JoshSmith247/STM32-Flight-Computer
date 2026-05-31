@@ -4,12 +4,12 @@ import cv2
 import numpy as np
 
 import config
+import gfx
 from mavlink import pixel_to_world
 
 
 class WeedTracker:
     def __init__(self):
-        self._tracks: dict = {}            # YOLO tracks (re-enable with YOLO section)
         self._prev_gray = None
         self._exg_boxes: list = []
         self._named: dict[int, dict] = {}  # weed_id → {box, template, pts, lost_frames, world_pos}
@@ -20,49 +20,6 @@ class WeedTracker:
 
     def set_frame_size(self, w: int, h: int) -> None:
         self._frame_size = (w, h)
-
-    # ── YOLO integration (kept for re-enable) ───────────────────────────────
-
-    def update_detections(self, frame: np.ndarray, boxes, names: dict) -> None:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        for i, box in enumerate(boxes):
-            tid = int(box.id) if box.id is not None else -(i + 1)
-            x1, y1, x2, y2 = [int(v) for v in box.xyxy[0]]
-            roi = gray[y1:y2, x1:x2]
-            pts = cv2.goodFeaturesToTrack(roi, maxCorners=30, qualityLevel=0.3, minDistance=5)
-            if pts is not None:
-                pts[:, 0, 0] += x1
-                pts[:, 0, 1] += y1
-            self._tracks[tid] = {'pts': pts, 'box': (x1, y1, x2, y2), 'label': names[int(box.cls)]}
-        self._prev_gray = gray
-
-    def propagate(self, frame: np.ndarray) -> None:
-        """Propagate YOLO tracks via optical flow; keeps _prev_gray current."""
-        if self._prev_gray is None or not self._tracks:
-            self._prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            return
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        dead = []
-        for tid, track in self._tracks.items():
-            pts = track['pts']
-            if pts is None or len(pts) < 3:
-                dead.append(tid)
-                continue
-            new_pts, status, _ = cv2.calcOpticalFlowPyrLK(
-                self._prev_gray, gray, pts, None, **config.LK_PARAMS
-            )
-            good = status.ravel() == 1
-            if good.sum() < 3:
-                dead.append(tid)
-                continue
-            dx = float((new_pts[good] - pts[good]).mean(axis=0)[0, 0])
-            dy = float((new_pts[good] - pts[good]).mean(axis=0)[0, 1])
-            x1, y1, x2, y2 = track['box']
-            track['box'] = (int(x1 + dx), int(y1 + dy), int(x2 + dx), int(y2 + dy))
-            track['pts'] = new_pts[good].reshape(-1, 1, 2)
-        for tid in dead:
-            del self._tracks[tid]
-        self._prev_gray = gray
 
     # ── Named-weed tracking ──────────────────────────────────────────────────
 
@@ -121,13 +78,13 @@ class WeedTracker:
     def propagate_named(self, frame: np.ndarray, exg_blobs: list) -> None:
         """Track named weeds via optical flow; re-identify lost ones by template matching.
 
-        Called each frame BEFORE propagate() so _prev_gray still holds last frame's gray.
         Pass 1 — optical flow + ExG overlap snaps each named weed to its blob.
         Pass 2 — template matching recovers weeds that went out of view and returned.
         """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if self._prev_gray is None or not self._named:
+            self._prev_gray = gray
             return
-        gray    = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         claimed = set()
 
         # Pass 1 — optical flow predicts new position; ExG center check confirms it.
@@ -232,6 +189,7 @@ class WeedTracker:
             w['lost_frames'] = 0
             claimed.add(best_blob)
             print(f"Re-identified W{wid} (score={best_score:.2f})", flush=True)
+        self._prev_gray = gray
 
     # ── Click handling ───────────────────────────────────────────────────────
 
@@ -301,12 +259,6 @@ class WeedTracker:
             x1, y1, x2, y2 = box
             cv2.rectangle(out, (x1, y1), (x2, y2), (0, 140, 255), 2)
 
-        # YOLO tracks (currently unused, kept for re-enable)
-        for tid, track in self._tracks.items():
-            x1, y1, x2, y2 = track['box']
-            cv2.rectangle(out, (x1, y1), (x2, y2), (200, 0, 200), 2)
-            cv2.putText(out, f"{track['label']} #{tid}",
-                        (x1, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 0, 200), 1, cv2.LINE_AA)
         return out
 
     def sidebar_click(self, y: int) -> None:
@@ -320,54 +272,44 @@ class WeedTracker:
             self._selected_wid = None if self._selected_wid == wid else wid
 
     def draw_sidebar(self, h: int) -> np.ndarray:
-        """Return a SIDEBAR_W × h panel listing all named weeds."""
-        panel = np.full((h, config.SIDEBAR_W, 3), (35, 35, 35), dtype=np.uint8)
+        """Return a physical-pixel SIDEBAR_W*PR × h*PR panel listing all named weeds."""
+        s  = config.PR
+        W  = config.SIDEBAR_W * s
+        H  = h * s
+        panel = np.full((H, W, 3), (35, 35, 35), dtype=np.uint8)
 
-        # Title bar — same height, background and separator as the FLIGHT COMPUTER header
-        cv2.rectangle(panel, (0, 0), (config.SIDEBAR_W, config.SIDEBAR_HDR_H - 1), (40, 44, 50), -1)
-        cv2.putText(panel, "Named Weeds", (8, 23),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (185, 192, 200), 1, cv2.LINE_AA)
-        cv2.line(panel, (0, config.SIDEBAR_HDR_H - 1),
-                 (config.SIDEBAR_W, config.SIDEBAR_HDR_H - 1), (60, 60, 60), 1)
+        gfx.begin()
 
-        mid = config.SIDEBAR_ROW_H // 2
+        HDR = config.SIDEBAR_HDR_H * s
+        cv2.rectangle(panel, (0, 0), (W, HDR - s), (40, 44, 50), -1)
+        gfx.put_text(panel, "Named Weeds", (8 * s, 23 * s), 0.5 * s, (185, 192, 200))
+        cv2.line(panel, (0, HDR - s), (W, HDR - s), (60, 60, 60), max(1, s))
+
+        ROW = config.SIDEBAR_ROW_H * s
+        mid = ROW // 2
         for i, wid in enumerate(sorted(self._named.keys())):
             w        = self._named[wid]
-            y0       = config.SIDEBAR_HDR_H + i * config.SIDEBAR_ROW_H
+            y0       = HDR + i * ROW
             active   = w['lost_frames'] == 0
             selected = wid == self._selected_wid
 
-            # Row highlight for selected weed
             if selected:
-                cv2.rectangle(panel, (2, y0 + 1),
-                              (config.SIDEBAR_W - 2, y0 + config.SIDEBAR_ROW_H - 1),
+                cv2.rectangle(panel, (2 * s, y0 + s), (W - 2 * s, y0 + ROW - s),
                               (60, 25, 25), -1)
 
-            # Status dot
             dot_color = (50, 200, 80) if active else (70, 70, 70)
-            cv2.circle(panel, (12, y0 + mid), 4, dot_color, -1)
+            cv2.circle(panel, (12 * s, y0 + mid), 4 * s, dot_color, -1)
 
-            # Weed label
             label = f"W{wid}" if active else f"W{wid}?"
-            if selected:
-                text_color = (80, 80, 220)    # red-ish (BGR) for selected
-            elif active:
-                text_color = (180, 220, 180)  # light green for active
-            else:
-                text_color = (100, 100, 100)  # grey for lost
-            cv2.putText(panel, label, (22, y0 + mid + 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, text_color, 1, cv2.LINE_AA)
+            text_color = ((80, 80, 220) if selected else
+                          (180, 220, 180) if active else
+                          (100, 100, 100))
+            gfx.put_text(panel, label, (22 * s, y0 + mid + 5 * s), 0.48 * s, text_color)
 
-            # GPS indicator
             if w['world_pos']:
-                cv2.putText(panel, "GPS", (config.SIDEBAR_W - 38, y0 + mid + 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 150, 80), 1, cv2.LINE_AA)
+                gfx.put_text(panel, "GPS", (W - 38 * s, y0 + mid + 5 * s),
+                             0.35 * s, (80, 150, 80))
 
+        gfx.flush(panel)
         return panel
 
-    def centroids(self) -> list[tuple[float, float]]:
-        result = []
-        for track in self._tracks.values():
-            x1, y1, x2, y2 = track['box']
-            result.append(((x1 + x2) / 2, (y1 + y2) / 2))
-        return result
