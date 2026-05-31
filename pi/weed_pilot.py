@@ -108,6 +108,25 @@ def _heartbeat_sender(ser) -> None:
         time.sleep(interval)
 
 
+def _gcs_to_serial(ser, gcs_port: int) -> None:
+    """Forward GCS commands (UDP:GCS_PORT) → STM32 (serial).
+
+    Mirrors the udp_to_serial path from mavlink_bridge.py so arm/disarm,
+    mode changes, and mission uploads from the GCS reach the STM32.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(('0.0.0.0', gcs_port))
+    sock.settimeout(1.0)
+    while True:
+        try:
+            data, _ = sock.recvfrom(4096)
+            ser.write(data)
+        except socket.timeout:
+            pass
+        except Exception as exc:
+            print(f"gcs→serial: {exc}", flush=True)
+
+
 def _weed_target_listener() -> None:
     """Receive weed target positions from the ground station."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -152,10 +171,12 @@ def main() -> None:
     print(f"Weed pilot started", flush=True)
     print(f"  Serial:  {SERIAL_PORT} @ {SERIAL_BAUD} baud", flush=True)
     print(f"  Telem → {LAPTOP_IP}:{GCS_PORT}", flush=True)
+    print(f"  GCS  ← UDP:{GCS_PORT}  (commands forwarded to STM32)", flush=True)
     print(f"  HB rate: {HEARTBEAT_HZ} Hz  (watchdog timeout: 3 s)", flush=True)
 
     threading.Thread(target=_serial_to_udp,       args=(ser, gcs_sock), daemon=True).start()
     threading.Thread(target=_heartbeat_sender,     args=(ser,),          daemon=True).start()
+    threading.Thread(target=_gcs_to_serial,        args=(ser, GCS_PORT), daemon=True).start()
     threading.Thread(target=_weed_target_listener,                        daemon=True).start()
 
     try:

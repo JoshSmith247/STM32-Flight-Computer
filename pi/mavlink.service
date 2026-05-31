@@ -7,7 +7,7 @@ Wants=network-online.target
 User=pi
 WorkingDirectory=/home/pi/drone
 EnvironmentFile=/home/pi/drone/.env
-ExecStart=/usr/bin/python3 /home/pi/drone/mavlink_bridge.py
+ExecStart=/usr/bin/python3 /home/pi/drone/weed_pilot.py
 Restart=always
 RestartSec=3
 

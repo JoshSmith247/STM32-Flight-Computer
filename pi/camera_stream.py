@@ -37,17 +37,22 @@ def main() -> None:
     cmd = [
         'ffmpeg',
         '-f', 'v4l2',
+        '-input_format', 'mjpeg',
         '-framerate', str(FRAMERATE),
         '-video_size', f'{WIDTH}x{HEIGHT}',
         '-i', CAM_DEVICE,
         '-c:v', 'libx264',
         '-preset', 'ultrafast',
         '-tune', 'zerolatency',
-        '-f', 'rtp',
-        f'rtp://{LAPTOP_IP}:{VIDEO_PORT}',
+        '-g', '15',
+        '-b:v', '1M',
+        '-muxdelay', '0',
+        '-muxpreload', '0',
+        '-f', 'mpegts',
+        f'udp://{LAPTOP_IP}:{VIDEO_PORT}?pkt_size=1316&buffer_size=65536',
     ]
 
-    print(f"Streaming {WIDTH}x{HEIGHT}@{FRAMERATE}fps → rtp://{LAPTOP_IP}:{VIDEO_PORT}", flush=True)
+    print(f"Streaming {WIDTH}x{HEIGHT}@{FRAMERATE}fps → udp://{LAPTOP_IP}:{VIDEO_PORT} (mpegts)", flush=True)
 
     proc = subprocess.Popen(cmd)
 

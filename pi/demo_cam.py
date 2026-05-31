@@ -38,7 +38,7 @@ def main() -> None:
         print(f"Place your test video at: {VIDEO_FILE}", flush=True)
         sys.exit(1)
 
-    print(f"Demo stream: active.mp4 → rtp://{LAPTOP_IP}:{VIDEO_PORT} (looping)", flush=True)
+    print(f"Demo stream: active.mp4 → udp://{LAPTOP_IP}:{VIDEO_PORT} (mpegts, looping)", flush=True)
 
     proc = subprocess.Popen(FFMPEG_CMD)
     try:

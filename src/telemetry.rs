@@ -38,6 +38,7 @@ const MAGIC_SERVO_OUTPUT_RAW:    u8 = 222;
 const MAGIC_VFR_HUD:             u8 = 20;
 const MAGIC_COMMAND_LONG:        u8 = 152;
 const MAGIC_COMMAND_ACK:         u8 = 143;
+const MAGIC_GLOBAL_POSITION_INT: u8 = 104;
 const MAGIC_BATTERY_STATUS:      u8 = 154;
 const MAGIC_MISSION_COUNT:       u8 = 221;
 const MAGIC_MISSION_ITEM_INT:    u8 = 38;
@@ -158,6 +159,28 @@ fn build_gps_raw(gps: &crate::types::GpsFix, time_ms: u32) -> [u8; 30] {
     p
 }
 
+// GLOBAL_POSITION_INT #33 — 28 bytes: u32, 3×i32, i32, 3×i16, u16
+fn build_global_position_int(
+    time_ms: u32,
+    gps: &crate::types::GpsFix,
+    baro_alt_m: f32,
+    yaw_rad: f32,
+) -> [u8; 28] {
+    let mut p = [0u8; 28];
+    p[0..4].copy_from_slice(&time_ms.to_le_bytes());
+    p[4..8].copy_from_slice(&((gps.lat_deg * 1e7) as i32).to_le_bytes());
+    p[8..12].copy_from_slice(&((gps.lon_deg * 1e7) as i32).to_le_bytes());
+    p[12..16].copy_from_slice(&((gps.alt_m * 1000.0) as i32).to_le_bytes());
+    p[16..20].copy_from_slice(&((baro_alt_m * 1000.0) as i32).to_le_bytes());
+    p[20..22].copy_from_slice(&((gps.vel_n_ms * 100.0) as i16).to_le_bytes());
+    p[22..24].copy_from_slice(&((gps.vel_e_ms * 100.0) as i16).to_le_bytes());
+    p[24..26].copy_from_slice(&((gps.vel_d_ms * 100.0) as i16).to_le_bytes());
+    let hdg = ((yaw_rad * (180.0 / core::f32::consts::PI) * 100.0) as i32)
+                  .rem_euclid(36000) as u16;
+    p[26..28].copy_from_slice(&hdg.to_le_bytes());
+    p
+}
+
 // ATTITUDE #30 — 28 bytes (all f32)
 fn build_attitude(
     time_ms: u32, roll: f32, pitch: f32, yaw: f32,
@@ -203,8 +226,9 @@ fn build_battery_status(voltage_v: f32, pct: u8) -> [u8; 36] {
     p[0..4].copy_from_slice(&(-1i32).to_le_bytes());
     p[4..8].copy_from_slice(&(-1i32).to_le_bytes());
     p[8..10].copy_from_slice(&i16::MAX.to_le_bytes()); // temperature unknown
-    p[10..12].copy_from_slice(&((voltage_v / 4.0 * 1000.0) as u16).to_le_bytes());
-    for i in 1..10usize { p[10 + i*2..12 + i*2].copy_from_slice(&u16::MAX.to_le_bytes()); }
+    let cell_mv = (voltage_v / 4.0 * 1000.0) as u16;
+    for i in 0..4usize { p[10 + i*2..12 + i*2].copy_from_slice(&cell_mv.to_le_bytes()); }
+    for i in 4..10usize { p[10 + i*2..12 + i*2].copy_from_slice(&u16::MAX.to_le_bytes()); }
     p[30..32].copy_from_slice(&(-1i16).to_le_bytes());
     p[34] = 3; // MAV_BATTERY_TYPE_LIPO
     p[35] = pct;
@@ -396,6 +420,14 @@ pub async fn telemetry_task(
                     let bat = *STATE.battery.lock().await;
                     let p = build_battery_status(bat.voltage_v, bat.pct);
                     let n = write_frame(&mut buf, seq, 147, &p, MAGIC_BATTERY_STATUS);
+                    tx.write(&buf[..n]).await.ok();
+                    seq = seq.wrapping_add(1);
+                }
+                8 => {
+                    let gps  = *STATE.gps_fix.lock().await;
+                    let baro = *STATE.baro_data.lock().await;
+                    let p = build_global_position_int(time_ms, &gps, baro.altitude_m, yaw);
+                    let n = write_frame(&mut buf, seq, 33, &p, MAGIC_GLOBAL_POSITION_INT);
                     tx.write(&buf[..n]).await.ok();
                     seq = seq.wrapping_add(1);
                 }

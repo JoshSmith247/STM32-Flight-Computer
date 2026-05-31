@@ -99,12 +99,21 @@ class _Renderer:
         self._btn_out  = btn_rect_out
 
         self._grabber: FrameGrabber | None = None
-        self._combined: np.ndarray | None  = None
+        self._vid_arr:     np.ndarray | None = None
+        self._sidebar_arr: np.ndarray | None = None
+        self._stats_arr:   np.ndarray | None = None
+        self._vid_seq     = 0
+        self._sidebar_seq = 0
+        self._stats_seq   = 0
         self._lock     = threading.Lock()
         self.show_exg     = False
         self.frame_count  = 0
         self.stream_alive = False
         self._prev_sel: int | None = None
+        # Letterbox state — written by renderer thread, read by main thread (GIL-safe)
+        self._vid_scale = 1.0
+        self._vid_x_off = 0
+        self._vid_y_off = 0
 
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -113,9 +122,21 @@ class _Renderer:
             self._grabber     = grabber
             self.stream_alive = True
 
-    def latest_frame(self) -> np.ndarray | None:
+    def display_to_frame(self, dx: int, dy: int) -> tuple[int, int] | None:
+        """Map a display-space click to source frame coordinates.
+        Returns None if the point lands in a letterbox border."""
+        fx = (dx - self._vid_x_off) / self._vid_scale
+        fy = (dy - self._vid_y_off) / self._vid_scale
+        if fx < 0 or fy < 0:
+            return None
+        return int(fx), int(fy)
+
+    def latest_panels(self) -> tuple | None:
         with self._lock:
-            return self._combined
+            if self._vid_arr is None:
+                return None
+            return (self._vid_arr, self._sidebar_arr, self._stats_arr,
+                    self._vid_seq, self._sidebar_seq, self._stats_seq)
 
     def release(self) -> None:
         with self._lock:
@@ -143,20 +164,26 @@ class _Renderer:
             if _sidebar is None or sidebar_key != _sidebar_key:
                 _sidebar     = self._tracker.draw_sidebar(self._disp_h)
                 _sidebar_key = sidebar_key
+                with self._lock:
+                    self._sidebar_arr = _sidebar
+                    self._sidebar_seq += 1
 
             now = time.monotonic()
             if _stats is None or now >= _stats_next_t:
                 _stats       = draw_stats_panel(self._disp_h)
                 _stats_next_t = now + _STATS_INTERVAL
+                with self._lock:
+                    self._stats_arr = _stats
+                    self._stats_seq += 1
 
             # ── No active stream: build standby frame at ~30 fps ─────────────
             if grabber is None or not alive:
                 display, btn = _make_no_stream_frame(
                     self._disp_w, self._disp_h, self._nsi)
                 self._btn_out[0] = btn
-                combined = np.hstack([display, _sidebar, _stats])
                 with self._lock:
-                    self._combined = combined
+                    self._vid_arr = display
+                    self._vid_seq += 1
                 time.sleep(1 / 30)
                 continue
 
@@ -171,6 +198,8 @@ class _Renderer:
                 time.sleep(0.005)
                 continue
 
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+
             mask  = exg_mask(frame)
             blobs = exg_candidates(mask)
             self._tracker.process_click(frame)
@@ -184,8 +213,19 @@ class _Renderer:
                 tint[:, :, 1] = mask
                 display = cv2.addWeighted(display, 1.0, tint, 0.4, 0)
 
-            display = cv2.resize(display, (self._disp_w, self._disp_h),
-                                 interpolation=cv2.INTER_LINEAR)
+            src_h, src_w = display.shape[:2]
+            scale  = min(self._disp_w / src_w, self._disp_h / src_h)
+            fit_w  = int(src_w * scale)
+            fit_h  = int(src_h * scale)
+            x_off  = (self._disp_w - fit_w) // 2
+            y_off  = (self._disp_h - fit_h) // 2
+            resized = cv2.resize(display, (fit_w, fit_h), interpolation=cv2.INTER_LINEAR)
+            canvas  = np.zeros((self._disp_h, self._disp_w, 3), dtype=np.uint8)
+            canvas[y_off:y_off + fit_h, x_off:x_off + fit_w] = resized
+            display = canvas
+            self._vid_scale = scale
+            self._vid_x_off = x_off
+            self._vid_y_off = y_off
 
             n_active = sum(1 for w in self._tracker._named.values()
                            if w['lost_frames'] == 0)
@@ -209,10 +249,9 @@ class _Renderer:
                         print(f"W{sel} selected — no GPS fix yet, target not sent",
                               flush=True)
 
-            # hstack outside the lock — only the pointer swap needs the lock
-            combined = np.hstack([display, _sidebar, _stats])
             with self._lock:
-                self._combined = combined
+                self._vid_arr = display
+                self._vid_seq += 1
             self.frame_count += 1
 
 

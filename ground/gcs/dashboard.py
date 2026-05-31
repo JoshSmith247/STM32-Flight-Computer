@@ -482,7 +482,8 @@ def draw_stats_panel(h: int) -> np.ndarray:
 
     # ── Header (full width) ───────────────────────────────────────────────────
     cv2.rectangle(panel, (1, 0), (config.STATS_W, 36), (40, 44, 50), -1)
-    cv2.putText(panel, 'FLIGHT COMPUTER', (9, 23),
+    (tw, _), _ = cv2.getTextSize('FLIGHT COMPUTER', cv2.FONT_HERSHEY_SIMPLEX, 0.46, 1)
+    cv2.putText(panel, 'FLIGHT COMPUTER', (config.STATS_W // 2 - tw // 2, 23),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.46, (185, 192, 200), 1, cv2.LINE_AA)
     cv2.line(panel, (0, 36), (config.STATS_W, 36), (60, 60, 60), 1)
 
