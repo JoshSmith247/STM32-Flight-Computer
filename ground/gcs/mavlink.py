@@ -1,6 +1,7 @@
 import json
 import math
 import socket
+import struct
 import threading
 import time
 
@@ -17,6 +18,43 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 _target_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+# ---------------------------------------------------------------------------
+# GCS → STM32 command sender
+# ---------------------------------------------------------------------------
+# Builds a minimal MAVLink v2 COMMAND_LONG frame and sends it as UDP to the
+# Pi's GCS port; the Pi's _gcs_to_serial thread relays it to the STM32.
+
+_cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+_cmd_seq  = 0
+
+
+def _cmd_crc(data: bytes, extra: int) -> int:
+    crc = 0xFFFF
+    for b in list(data) + [extra]:
+        tmp = (b ^ (crc & 0xFF)) & 0xFF
+        tmp ^= (tmp << 4) & 0xFF
+        crc = ((crc >> 8) ^ (tmp << 8) ^ (tmp << 3) ^ (tmp >> 4)) & 0xFFFF
+    return crc
+
+
+def send_mavlink_command(cmd: int, param1: float = 0.0, param2: float = 0.0) -> None:
+    """Send MAVLink v2 COMMAND_LONG to the STM32 via the Pi serial relay."""
+    global _cmd_seq
+    # payload: 7×f32 params + u16 cmd + target_sys + target_comp + confirmation
+    payload = struct.pack('<7fH', param1, param2, 0.0, 0.0, 0.0, 0.0, 0.0, cmd)
+    payload += bytes([1, 1, 0])          # target_sys=1, target_comp=1, confirmation=0
+    n      = len(payload)                # 33 bytes
+    seq    = _cmd_seq & 0xFF
+    _cmd_seq += 1
+    header = bytes([n, 0, 0, seq, 255, 0, 76, 0, 0])   # msgid=76 COMMAND_LONG
+    crc    = _cmd_crc(header + payload, 152)             # CRC_EXTRA for COMMAND_LONG
+    frame  = bytes([0xFD]) + header + payload + struct.pack('<H', crc)
+    try:
+        _cmd_sock.sendto(frame, (config.PI_IP, config.GCS_PORT))
+        print(f"→ STM32 cmd={cmd} param1={param1} param2={param2}", flush=True)
+    except OSError as exc:
+        print(f"send_mavlink_command: {exc}", flush=True)
 
 
 def send_weed_target(wid: int, east_m: float, north_m: float) -> None:

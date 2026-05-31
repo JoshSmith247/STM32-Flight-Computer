@@ -170,7 +170,7 @@ class _Renderer:
 
             now = time.monotonic()
             if _stats is None or now >= _stats_next_t:
-                _stats       = draw_stats_panel(self._disp_h)
+                _stats       = draw_stats_panel(self._disp_h, self._tracker)
                 _stats_next_t = now + _STATS_INTERVAL
                 with self._lock:
                     self._stats_arr = _stats

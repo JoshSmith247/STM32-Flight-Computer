@@ -6,7 +6,7 @@ import numpy as np
 
 import config
 from config import PROGRAMS, PAYLOAD_NAMES, OVERLAY_W, OVERLAY_H
-from mavlink import _mav_lock, _mav_state
+from mavlink import _mav_lock, _mav_state, send_mavlink_command
 
 _FLIGHT_MODES = {
     0: 'STAB', 1: 'ALTH', 2: 'POSH', 3: 'AUTO', 4: 'RTH', 5: 'LAND',
@@ -23,7 +23,34 @@ _STATE_COLORS = {
     5: (40,  40, 210),   # FAULT   — red
 }
 
-_ui_state: dict = {'selected_prog': 0, 'running_prog': None}
+_ui_state: dict = {'selected_prog': 0, 'running_prog': None, 'stopped': False, 'landing': False}
+
+# GCS-side payload enable/disable overrides (bit index → manually disabled)
+_payload_disabled: set = set()
+_payload_panel_rect: list = [0, 0, 0, 0]   # [x, y, w, h] in panel-local coords
+
+
+def toggle_payload_override(bit: int) -> None:
+    if bit in _payload_disabled:
+        _payload_disabled.discard(bit)
+        print(f"Payload '{PAYLOAD_NAMES.get(bit)}' re-enabled", flush=True)
+    else:
+        _payload_disabled.add(bit)
+        print(f"Payload '{PAYLOAD_NAMES.get(bit)}' disabled", flush=True)
+
+
+def handle_payload_double_click(px: int, py: int) -> None:
+    """Toggle a payload override when the operator double-clicks its row."""
+    rx, ry, rw, rh = _payload_panel_rect
+    if not (rx <= px <= rx + rw and ry <= py <= ry + rh):
+        return
+    rel_y = py - ry - 25       # skip section header
+    if rel_y < 0:
+        return
+    idx = rel_y // 24
+    bits = sorted(PAYLOAD_NAMES.keys())
+    if idx < len(bits):
+        toggle_payload_override(bits[idx])
 
 
 def _draw_artificial_horizon(panel: np.ndarray, cx: int, cy: int, r: int,
@@ -138,10 +165,10 @@ def _draw_arc_gauge(panel: np.ndarray, cx: int, cy: int, r: int,
 
     val_s = (f"{value:.0f}" if abs(value) >= 10 else f"{value:.1f}") + unit
     (tw, _), _ = cv2.getTextSize(val_s, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
-    cv2.putText(panel, val_s, (cx - tw // 2, cy + r + 5),
+    cv2.putText(panel, val_s, (cx - tw // 2, cy + r + 1),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.40, (215, 215, 215), 1, cv2.LINE_AA)
     (lw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.32, 1)
-    cv2.putText(panel, label, (cx - lw // 2, cy + r + 20),
+    cv2.putText(panel, label, (cx - lw // 2, cy + r + 14),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.32, (105, 105, 105), 1, cv2.LINE_AA)
 
 
@@ -168,10 +195,10 @@ def _draw_vspeed(panel: np.ndarray, cx: int, cy: int, r: int,
     sign  = '+' if climb_ms >= 0 else ''
     val_s = f"{sign}{climb_ms:.1f}m/s"
     (tw, _), _ = cv2.getTextSize(val_s, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
-    cv2.putText(panel, val_s, (cx - tw // 2, cy + r + 5),
+    cv2.putText(panel, val_s, (cx - tw // 2, cy + r + 1),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1, cv2.LINE_AA)
     (lw, _), _ = cv2.getTextSize('V.SPEED', cv2.FONT_HERSHEY_SIMPLEX, 0.32, 1)
-    cv2.putText(panel, 'V.SPEED', (cx - lw // 2, cy + r + 20),
+    cv2.putText(panel, 'V.SPEED', (cx - lw // 2, cy + r + 14),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.32, (105, 105, 105), 1, cv2.LINE_AA)
 
 
@@ -213,7 +240,7 @@ def _draw_battery_panel(panel: np.ndarray, x: int, y: int, w: int,
 
     cv2.putText(panel, 'CHARGE', (x + P, cy + 11),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.34, (95, 95, 95), 1, cv2.LINE_AA)
-    _draw_battery(panel, x + 65, cy, w - 75 - P, 13, battery_pct)
+    _draw_battery(panel, x + 65, cy, w - 95 - P, 13, battery_pct)
     cy += 24
 
     if time_remaining_s > 0:
@@ -274,6 +301,47 @@ def _draw_distance_home(panel: np.ndarray, x: int, y: int, w: int,
     cy += 18
     cv2.putText(panel, f"LON  {lon:.5f}" if lon is not None else "LON  --",
                 (x + P, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (128, 128, 128), 1, cv2.LINE_AA)
+
+
+_DOT_COLORS = {
+    'OK':    ( 50, 200,  70),   # green
+    'CHECK': ( 50, 185, 255),   # amber
+    'FAULT': ( 55,  55, 210),   # red
+    '--':    ( 50,  50,  50),   # grey — no data
+}
+
+
+def _draw_status_pane(panel: np.ndarray, x: int, y: int, w: int, h: int,
+                      statuses: list) -> None:
+    """Compact per-subsystem status pane.
+
+    statuses: list of (label, status) where status ∈ {'OK','CHECK','FAULT','--'}
+    """
+    P = 6
+    cv2.putText(panel, 'STATUS', (x + P, y + 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (95, 95, 95), 1, cv2.LINE_AA)
+    cv2.line(panel, (x, y + 22), (x + w, y + 22), (48, 48, 48), 1)
+
+    body_y = y + 23
+    n      = len(statuses)
+    row_h  = (h - 21) // n
+
+    for i, (label, status) in enumerate(statuses):
+        ry = body_y + i * row_h + row_h // 2
+        if label is None:
+            continue
+        col = _DOT_COLORS.get(status, _DOT_COLORS['--'])
+        cv2.circle(panel, (x + P + 3, ry), 3, col, -1)
+        cv2.putText(panel, label, (x + P + 10, ry + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.30, (100, 105, 110), 1, cv2.LINE_AA)
+        (sw, _), _ = cv2.getTextSize(status, cv2.FONT_HERSHEY_SIMPLEX, 0.30, 1)
+        cv2.putText(panel, status, (x + w - sw - P, ry + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.30, col, 1, cv2.LINE_AA)
+        # Thin row divider — skip when adjacent to a separator slot
+        next_label = statuses[i + 1][0] if i < n - 1 else None
+        if i < n - 1 and next_label is not None:
+            cv2.line(panel, (x + 4, body_y + (i + 1) * row_h),
+                     (x + w - 4, body_y + (i + 1) * row_h), (38, 38, 38), 1)
 
 
 def _draw_motors(panel: np.ndarray, x: int, y: int, w: int, h: int,
@@ -338,10 +406,14 @@ def _draw_payloads(panel: np.ndarray, x: int, y: int, w: int,
     cv2.line(panel, (x, y + 24), (x + w, y + 24), (48, 48, 48), 1)
     ry = y + 44
     for bit, name in PAYLOAD_NAMES.items():
-        present = linked and bool(payload_flags & (1 << bit))
-        dot_col = (50, 200, 100) if present else (50, 40, 80)
-        status_col = (130, 210, 130) if present else (90, 65, 100)
-        status_lbl = 'OK' if present else '--'
+        manually_off = bit in _payload_disabled
+        present      = linked and bool(payload_flags & (1 << bit)) and not manually_off
+        if manually_off:
+            dot_col, status_col, status_lbl = (30, 110, 160), (50, 160, 210), 'OFF'
+        elif present:
+            dot_col, status_col, status_lbl = (50, 200, 100), (130, 210, 130), 'OK'
+        else:
+            dot_col, status_col, status_lbl = (50, 40, 80),   (90, 65, 100),  '--'
         cv2.circle(panel, (x + P + 4, ry - 4), 4, dot_col, -1)
         cv2.putText(panel, name, (x + P + 14, ry),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (162, 162, 162), 1, cv2.LINE_AA)
@@ -349,6 +421,113 @@ def _draw_payloads(panel: np.ndarray, x: int, y: int, w: int,
         cv2.putText(panel, status_lbl, (x + w - sw - P, ry),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.36, status_col, 1, cv2.LINE_AA)
         ry += 24
+
+
+_MAP_MAX_SCALE = 40.0   # px/m — most zoomed in (1 m = 40 px)
+_MAP_MIN_SCALE =  2.0   # px/m — most zoomed out (~90 m span visible)
+_MAP_DEFAULT_SCALE = 12.0  # px/m used when there are no weeds yet
+
+
+def _draw_weed_map(panel: np.ndarray, x: int, y: int, w: int, h: int,
+                   lat, lon, yaw_rad: float, origin,
+                   weed_world_pos: list, linked: bool) -> None:
+    """Top-down ENU map: drone (centred, heading arrow) + named weed dots."""
+    P = 10
+    cv2.line(panel, (x, y), (x + w, y), (48, 48, 48), 1)
+    cv2.putText(panel, 'MAP', (x + P, y + 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (95, 95, 95), 1, cv2.LINE_AA)
+    cv2.line(panel, (x, y + 24), (x + w, y + 24), (48, 48, 48), 1)
+
+    by = y + 25          # body top
+    bh = h - 25          # body height
+    cv2.rectangle(panel, (x, by), (x + w, by + bh), (16, 20, 16), -1)
+
+    if not linked or origin is None or lat is None:
+        msg = 'NO GPS'
+        (mw, _), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
+        cv2.putText(panel, msg, (x + w // 2 - mw // 2, by + bh // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (55, 55, 55), 1, cv2.LINE_AA)
+        return
+
+    # Drone ENU position relative to first fix (origin)
+    R_earth = 6_371_000.0
+    lat0, lon0 = origin
+    drone_e = math.radians(lon  - lon0) * R_earth * math.cos(math.radians(lat0))
+    drone_n = math.radians(lat  - lat0) * R_earth
+
+    # Auto-scale: fit all points (drone + weeds) inside 70 % of the map
+    if weed_world_pos:
+        all_de = [we - drone_e for we, wn, *_ in weed_world_pos]
+        all_dn = [wn - drone_n for we, wn, *_ in weed_world_pos]
+        span = max(max(abs(v) for v in all_de + all_dn) * 2, 1.0)
+        raw_scale = min(w, bh) * 0.70 / span
+        scale = min(_MAP_MAX_SCALE, max(_MAP_MIN_SCALE, raw_scale))
+    else:
+        scale = _MAP_DEFAULT_SCALE
+
+    # Map centre pixel = drone position
+    mcx = x + w // 2
+    mcy = by + bh // 2
+
+    def w2s(de: float, dn: float) -> tuple[int, int]:
+        return mcx + int(de * scale), mcy - int(dn * scale)
+
+    # Grid — interval chosen so 4–8 lines span the visible half-width
+    metres_half = (min(w, bh) / 2) / scale
+    for interval in (0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500):
+        if metres_half / 3 <= interval:
+            grid_m = interval
+            break
+    else:
+        grid_m = 500
+
+    g_range = int(metres_half / grid_m) + 2
+    for gi in range(-g_range, g_range + 1):
+        # horizontal (constant N offset from drone)
+        dn_val = gi * grid_m
+        _, gy = w2s(0, dn_val)
+        if by <= gy <= by + bh:
+            cv2.line(panel, (x, gy), (x + w, gy), (28, 34, 28), 1)
+        # vertical (constant E offset from drone)
+        de_val = gi * grid_m
+        gx, _ = w2s(de_val, 0)
+        if x <= gx <= x + w:
+            cv2.line(panel, (gx, by), (gx, by + bh), (28, 34, 28), 1)
+
+    # Scale label (bottom-left)
+    scale_lbl = f"{grid_m:.0f}m" if grid_m >= 1 else f"{grid_m * 100:.0f}cm"
+    cv2.putText(panel, scale_lbl, (x + 4, by + bh - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.28, (45, 60, 45), 1, cv2.LINE_AA)
+
+    # North arrow (top-right corner)
+    nax, nay = x + w - 14, by + 20
+    cv2.line(panel, (nax, nay + 8), (nax, nay - 8), (70, 70, 180), 1)
+    cv2.fillPoly(panel,
+                 [np.array([(nax, nay - 8), (nax - 4, nay), (nax + 4, nay)], np.int32)],
+                 (70, 70, 180))
+    cv2.putText(panel, 'N', (nax - 4, nay + 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.28, (70, 70, 180), 1, cv2.LINE_AA)
+
+    # Named weeds
+    for item in weed_world_pos:
+        we, wn, wid, active = item
+        wx, wy = w2s(we - drone_e, wn - drone_n)
+        if x <= wx <= x + w and by <= wy <= by + bh:
+            col = (50, 200, 90) if active else (65, 65, 65)
+            cv2.circle(panel, (wx, wy), 4, col, -1)
+            cv2.putText(panel, f"W{wid}", (wx + 5, wy + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.26, col, 1, cv2.LINE_AA)
+
+    # Drone marker — filled triangle pointing in heading direction
+    dr = 9
+    tip = (mcx + int(dr * math.sin(yaw_rad)),
+           mcy - int(dr * math.cos(yaw_rad)))
+    tl  = (mcx + int(dr * 0.6 * math.sin(yaw_rad + 2.4)),
+           mcy - int(dr * 0.6 * math.cos(yaw_rad + 2.4)))
+    tr  = (mcx + int(dr * 0.6 * math.sin(yaw_rad - 2.4)),
+           mcy - int(dr * 0.6 * math.cos(yaw_rad - 2.4)))
+    cv2.fillPoly(panel, [np.array([tip, tl, tr], np.int32)], (0, 220, 255))
+    cv2.circle(panel, (mcx, mcy), 3, (0, 220, 255), -1)
 
 
 def _draw_program_panel(panel: np.ndarray, x: int, y: int, w: int) -> None:
@@ -378,14 +557,32 @@ def _draw_program_panel(panel: np.ndarray, x: int, y: int, w: int) -> None:
         cv2.putText(panel, prog, (x + P + 18, ry + 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.40, text_col, 1, cv2.LINE_AA)
 
-    sep_y = y + 28 + len(PROGRAMS) * 26 + 4
+    sep_y      = y + 28 + len(PROGRAMS) * 26 + 4
     cv2.line(panel, (x + 4, sep_y), (x + w - 4, sep_y), (52, 52, 52), 1)
-    bx0, bx1 = x + w - 88, x + w - 8
-    by0, by1 = sep_y + 6, sep_y + 30
-    cv2.rectangle(panel, (bx0, by0), (bx1, by1), (34, 54, 90), -1)
-    cv2.rectangle(panel, (bx0, by0), (bx1, by1), (72, 108, 160), 1)
-    cv2.putText(panel, 'SEND', (bx0 + 14, by0 + 16),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (172, 210, 255), 1, cv2.LINE_AA)
+    by0, by1   = sep_y + 6, sep_y + 30
+
+    def _btn(bx0, bx1, bg, border, label, fg, scale=0.40):
+        cv2.rectangle(panel, (bx0, by0), (bx1, by1), bg, -1)
+        cv2.rectangle(panel, (bx0, by0), (bx1, by1), border, 1)
+        (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+        cv2.putText(panel, label,
+                    (bx0 + (bx1 - bx0 - lw) // 2, by0 + (by1 - by0 + lh) // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, scale, fg, 1, cv2.LINE_AA)
+
+    def _gbtn(bx0, bx1, label, scale=0.40):
+        _btn(bx0, bx1, (26, 30, 34), (45, 52, 58), label, (65, 78, 90), scale)
+
+    if _ui_state['landing']:
+        _gbtn(x + 8,      x + 88,      'LAND')
+        _gbtn(x + 92,     x + 172,     'RESUME', 0.38)
+        _gbtn(x + w - 88, x + w - 8,   'SEND')
+    elif _ui_state['stopped']:
+        _btn(x + 8,      x + 88,      (18, 18, 120), (40, 40, 190), 'LAND',   (80, 80, 230))
+        _btn(x + 92,     x + 172,     (18, 80, 18),  (40, 160, 40), 'RESUME', (80, 220, 80), 0.38)
+        _gbtn(x + w - 88, x + w - 8,  'SEND')
+    else:
+        _btn(x + 8,      x + 88,      (18, 18, 120), (40, 40, 190),  'STOP',   (80, 80, 230))
+        _btn(x + w - 88, x + w - 8,   (34, 54, 90),  (72, 108, 160), 'SEND',   (172, 210, 255))
 
 
 def _draw_program_overlay(frame: np.ndarray, x: int, y: int) -> None:
@@ -421,18 +618,36 @@ def _draw_program_overlay(frame: np.ndarray, x: int, y: int) -> None:
         cv2.putText(frame, prog, (x + 25, ry + 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.40, text_col, 1, cv2.LINE_AA)
 
-    sep_y  = y + 28 + len(PROGRAMS) * 26 + 4
+    sep_y    = y + 28 + len(PROGRAMS) * 26 + 4
     cv2.line(frame, (x + 4, sep_y), (x + w - 4, sep_y), (52, 52, 52), 1)
-    bx0, bx1 = x + w - 88, x + w - 4
     by0, by1 = sep_y + 6, sep_y + 30
-    cv2.rectangle(frame, (bx0, by0), (bx1, by1), (34, 54, 90), -1)
-    cv2.rectangle(frame, (bx0, by0), (bx1, by1), (72, 108, 160), 1)
-    cv2.putText(frame, 'SEND', (bx0 + 14, by0 + 16),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (172, 210, 255), 1, cv2.LINE_AA)
+
+    def _obtn(bx0, bx1, bg, border, label, fg, scale=0.38):
+        cv2.rectangle(frame, (bx0, by0), (bx1, by1), bg, -1)
+        cv2.rectangle(frame, (bx0, by0), (bx1, by1), border, 1)
+        (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+        cv2.putText(frame, label,
+                    (bx0 + (bx1 - bx0 - lw) // 2, by0 + (by1 - by0 + lh) // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, scale, fg, 1, cv2.LINE_AA)
+
+    def _gobtn(bx0, bx1, label, scale=0.38):
+        _obtn(bx0, bx1, (26, 30, 34), (45, 52, 58), label, (65, 78, 90), scale)
+
+    if _ui_state['landing']:
+        _gobtn(x + 4,      x + 68,      'LAND')
+        _gobtn(x + 71,     x + 135,     'RESUME', 0.30)
+        _gobtn(x + w - 68, x + w - 4,   'SEND')
+    elif _ui_state['stopped']:
+        _obtn(x + 4,      x + 68,      (18, 18, 120), (40, 40, 190), 'LAND',   (80, 80, 230))
+        _obtn(x + 71,     x + 135,     (18, 80, 18),  (40, 160, 40), 'RESUME', (80, 220, 80), 0.30)
+        _gobtn(x + w - 68, x + w - 4,  'SEND')
+    else:
+        _obtn(x + 4,      x + 84,      (18, 18, 120), (40, 40, 190), 'STOP',   (80, 80, 230))
+        _obtn(x + w - 84, x + w - 4,   (34, 54, 90),  (72, 108, 160), 'SEND',   (172, 210, 255))
 
 
 def _handle_overlay_click(lx: int, ly: int) -> None:
-    """Dispatch a click at local overlay coords to select a program or send."""
+    """Dispatch a click at local overlay coords to select a program or press a button."""
     title_h = 28
     if ly < title_h:
         return
@@ -441,12 +656,33 @@ def _handle_overlay_click(lx: int, ly: int) -> None:
         _ui_state['selected_prog'] = row_i
         return
     sep_y = title_h + len(PROGRAMS) * 26 + 4
-    if ly >= sep_y + 6:
-        _ui_state['running_prog'] = _ui_state['selected_prog']
-        print(f"Instruction sent: {PROGRAMS[_ui_state['running_prog']]}", flush=True)
+    if ly < sep_y + 6:
+        return
+    if _ui_state['landing']:
+        return                             # all buttons grayed — no interaction
+    panel_w   = config.STATS_W // 2
+    on_left   = lx <= 88                  # STOP / LAND
+    on_resume = 88 < lx <= 172            # RESUME (stopped state only)
+    on_right  = lx >= panel_w - 88        # SEND
+    if _ui_state['stopped']:
+        if on_left:      # LAND
+            _ui_state['landing'] = True
+            _ui_state['running_prog'] = None
+            send_mavlink_command(21)       # MAV_CMD_NAV_LAND
+        elif on_resume:  # RESUME
+            _ui_state['stopped'] = False
+            print("Resumed", flush=True)
+        # on_right (grayed SEND): intentionally ignored while stopped
+    else:
+        if on_left:      # STOP
+            _ui_state['stopped'] = True
+            print("STOP — choose LAND or RESUME", flush=True)
+        elif on_right:   # SEND
+            _ui_state['running_prog'] = _ui_state['selected_prog']
+            print(f"Instruction sent: {PROGRAMS[_ui_state['running_prog']]}", flush=True)
 
 
-def draw_stats_panel(h: int) -> np.ndarray:
+def draw_stats_panel(h: int, tracker=None) -> np.ndarray:
     """Return a STATS_W × h flight computer dashboard — 2-column layout."""
     COL = config.STATS_W // 2
     panel = np.full((h, config.STATS_W, 3), (26, 26, 26), dtype=np.uint8)
@@ -569,14 +805,50 @@ def draw_stats_panel(h: int) -> np.ndarray:
                         time_rem   if linked else 0)
     _draw_distance_home(panel, L, power_y + 155, COL, lat, lon, origin, yaw)
 
-    # ── Right column: systems (motors + payloads) ─────────────────────────────
-    R        = COL
-    # Motors get everything above payloads and program panel
-    payloads_h  = 24 + len(PAYLOAD_NAMES) * 24 + 20
-    motors_h    = max(140, h - CY - 4 - payloads_h - OVERLAY_H - 4)
-    _draw_motors(panel, R, CY + 4, COL, motors_h,
+    # ── Right column: motors (compact) + map + payloads + program ────────────
+    R          = COL
+    MOTORS_H   = 260
+    payloads_h = 24 + len(PAYLOAD_NAMES) * 24 + 20
+    map_h      = max(0, h - CY - 4 - MOTORS_H - payloads_h - OVERLAY_H - 4)
+    map_y      = CY + 4 + MOTORS_H
+
+    # ── Per-subsystem statuses ────────────────────────────────────────────────
+    active_pwm   = [p for p in motor_pwm if p > 1050]
+    motor_spread = (max(active_pwm) - min(active_pwm)) if len(active_pwm) >= 2 else 0
+
+    statuses = [
+        ('CTRL',   ('FAULT' if flight_state == 5
+                    else 'CHECK' if flight_state == 1
+                    else 'OK')  if linked else '--'),
+        ('Pi',     'OK'   if linked else 'FAULT'),
+        (None, None),
+        ('GPS',    ('OK'  if lat is not None else 'CHECK') if linked else '--'),
+        ('IMU',    'OK'   if linked else '--'),
+        ('BARO',   'OK'   if linked else '--'),
+        ('BATT',   '--'   if batt < 0
+                   else 'OK'    if batt > 30
+                   else 'CHECK' if batt > 15
+                   else 'FAULT'),
+        ('MOTORS', ('CHECK' if armed and motor_spread > 300 else 'OK') if linked else '--'),
+    ]
+
+    half = COL // 2
+    _draw_status_pane(panel, R,        CY + 4, half,       MOTORS_H, statuses)
+    _draw_motors(     panel, R + half, CY + 4, COL - half, MOTORS_H,
                  motor_pwm if linked else [0, 0, 0, 0], armed)
-    _draw_payloads(panel, R, CY + 4 + motors_h, COL, payload_flags, linked)
+
+    if map_h > 40:
+        weed_world_pos = []
+        if tracker is not None:
+            for wid, w in tracker._named.items():
+                wp = w.get('world_pos')
+                if wp is not None:
+                    weed_world_pos.append((wp[0], wp[1], wid, w['lost_frames'] == 0))
+        _draw_weed_map(panel, R, map_y, COL, map_h,
+                       lat, lon, yaw, origin, weed_world_pos, linked)
+
+    _payload_panel_rect[:] = [R, map_y + map_h, COL, payloads_h]
+    _draw_payloads(panel, R, map_y + map_h, COL, payload_flags, linked)
     _draw_program_panel(panel, R, h - OVERLAY_H, COL)
 
     return panel

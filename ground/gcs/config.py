@@ -31,8 +31,8 @@ LK_PARAMS = dict(winSize=(21, 21), maxLevel=3,
                  criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
 
 # Sidebar dimensions (drawn at display resolution, appended to the right of the frame)
-SIDEBAR_W      = 300
-SIDEBAR_HDR_H  = 40   # title bar height
+SIDEBAR_W      = 180
+SIDEBAR_HDR_H  = 37   # title bar height — matches FLIGHT COMPUTER header (36 px + 1 px separator)
 SIDEBAR_ROW_H  = 28   # height per weed entry
 STATS_W        = 1800  # drone stats panel width (2-column) — mutated by main() after window probe
 PROGRAMS  = ['MANUAL', 'FOLLOW ME', 'WEED PICKER', "RETURN HOME"]

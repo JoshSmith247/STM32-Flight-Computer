@@ -25,7 +25,7 @@ import dearpygui.dearpygui as dpg
 import numpy as np
 
 import config
-from dashboard import _handle_overlay_click
+from dashboard import _handle_overlay_click, handle_payload_double_click
 from mavlink import _HAVE_MAVLINK, _mav_listener, _target_sock
 from renderer import FrameGrabber, _Renderer
 from tracker import WeedTracker
@@ -61,11 +61,12 @@ def _macos_set_presentation(hide: bool) -> None:
             libobjc.objc_getClass(b'NSApplication'),
             libobjc.sel_registerName(b'sharedApplication'),
         )
-        # NSApplicationPresentationHideDock = 2, NSApplicationPresentationHideMenuBar = 8
+        # NSApplicationPresentationAutoHideDock = 1, NSApplicationPresentationAutoHideMenuBar = 4
+        # Auto-hide lets the user slide them back in by moving the cursor to the edge.
         _msg_uint(
             ns_app,
             libobjc.sel_registerName(b'setPresentationOptions:'),
-            ctypes.c_uint64(2 | 8 if hide else 0),
+            ctypes.c_uint64(1 | 4 if hide else 0),
         )
     except Exception as exc:
         print(f"macOS presentation: {exc}", flush=True)
@@ -115,7 +116,7 @@ def main() -> None:
     # ── Layout ────────────────────────────────────────────────────────────────
     frame_w, frame_h = 1920, 1080
     config.STATS_W = max(screen_w // 2, 800)
-    disp_w         = max(400, screen_w - config.SIDEBAR_W - config.STATS_W) + 50
+    disp_w         = max(400, screen_w - config.SIDEBAR_W - config.STATS_W) - 30
     config.STATS_W = screen_w - config.SIDEBAR_W - disp_w
     disp_h         = screen_h
 
@@ -157,12 +158,19 @@ def main() -> None:
                             np.zeros(config.STATS_W * disp_h * 4, dtype=np.float32),
                             format=dpg.mvFormat_Float_rgba, tag="tex_stats")
 
-    stream_ok = [False]
-    renderer  = [None]
+    stream_ok       = [False]
+    renderer        = [None]
+    _last_click     = [0.0, -1, -1]   # [time, x, y] for double-click detection
+    _DCLICK_S       = 0.40
 
     def _on_click(sender, app_data):
+        now = time.monotonic()
         x, y = dpg.get_mouse_pos(local=False)
         x, y = int(x), int(y)
+        is_double = (now - _last_click[0] < _DCLICK_S and
+                     abs(x - _last_click[1]) < 20 and
+                     abs(y - _last_click[2]) < 20)
+        _last_click[:] = [now, x, y]
         if not stream_ok[0]:
             if not _conn['busy']:
                 br = _btn_rect[0]
@@ -179,6 +187,8 @@ def main() -> None:
         else:
             px  = x - (disp_w + config.SIDEBAR_W)
             COL = config.STATS_W // 2
+            if is_double and px >= COL:
+                handle_payload_double_click(px, y)
             if px >= COL and y >= disp_h - config.OVERLAY_H:
                 _handle_overlay_click(px - COL, y - (disp_h - config.OVERLAY_H))
 

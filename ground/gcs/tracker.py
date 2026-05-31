@@ -331,12 +331,12 @@ class WeedTracker:
         """Return a SIDEBAR_W × h panel listing all named weeds."""
         panel = np.full((h, config.SIDEBAR_W, 3), (35, 35, 35), dtype=np.uint8)
 
-        # Title bar
-        cv2.rectangle(panel, (0, 0), (config.SIDEBAR_W, config.SIDEBAR_HDR_H - 1), (55, 55, 55), -1)
-        cv2.putText(panel, "Named Weeds", (8, 26),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (210, 210, 210), 1, cv2.LINE_AA)
+        # Title bar — same height, background and separator as the FLIGHT COMPUTER header
+        cv2.rectangle(panel, (0, 0), (config.SIDEBAR_W, config.SIDEBAR_HDR_H - 1), (40, 44, 50), -1)
+        cv2.putText(panel, "Named Weeds", (8, 23),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (185, 192, 200), 1, cv2.LINE_AA)
         cv2.line(panel, (0, config.SIDEBAR_HDR_H - 1),
-                 (config.SIDEBAR_W, config.SIDEBAR_HDR_H - 1), (70, 70, 70), 1)
+                 (config.SIDEBAR_W, config.SIDEBAR_HDR_H - 1), (60, 60, 60), 1)
 
         mid = config.SIDEBAR_ROW_H // 2
         for i, wid in enumerate(sorted(self._named.keys())):
