@@ -86,6 +86,7 @@ fn parse_pvt(payload: &[u8; 92]) -> GpsFix {
         vel_d_ms: vd  as f32 * 1e-3,
         hacc_m:   hacc as f32 * 1e-3,
         fix_ok:   (flags & 0x01) != 0 && fix_type >= 3,
+        fix_type,
     }
 }
 

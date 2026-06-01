@@ -20,6 +20,7 @@ TEMPLATE_POOL_SIZE = 3       # rolling window of templates kept per weed
 MAX_LOST_FRAMES    = 90      # frames (~3 s at 30 fps) before a lost named weed is discarded
 CAM_HFOV           = float(os.environ.get('CAM_HFOV',           '62.0'))  # camera horizontal FOV, degrees
 WORLD_REMATCH_DIST = float(os.environ.get('WORLD_REMATCH_DIST',  '0.4'))  # metres radius for position-based re-ID
+CRUISE_ALT         = float(os.environ.get('CRUISE_ALT',          '10.0')) # target cruise altitude above ground, metres
 
 GST_PIPELINE = (
     f"udpsrc port={VIDEO_PORT} "
@@ -44,3 +45,8 @@ PAYLOAD_NAMES = {
 }
 
 OVERLAY_H = 28 + len(PROGRAMS) * 26 + 10 + 30 + 8
+
+# Env defaults — these are also mutated at runtime by the overlay settings panel.
+RECORD_VIDEO    = bool(int(os.environ.get('RECORD_VIDEO',    '0')))
+RECORD_ACTIVE   = RECORD_VIDEO   # runtime toggle; overlay writes this
+VERBOSE_LOGGING = bool(int(os.environ.get('VERBOSE_LOGGING', '0')))

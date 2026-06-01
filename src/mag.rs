@@ -38,6 +38,14 @@ const REG_CHIP_ID: u8 = 0x0D;
 // bits [7:6]=00  [5:4]=01  [3:2]=10  [1:0]=01  → 0b00_01_10_01 = 0x19
 const CR1_VALUE: u8 = 0x19;
 
+// ── Hard-iron calibration offsets ─────────────────────────────────────────────
+// With the drone fully assembled and all electronics powered, rotate it slowly
+// in a figure-8 pattern. Record the min and max raw ADC count on each axis and
+// set each offset to (max + min) / 2.  All zeros = uncalibrated.
+const MAG_OFFSET_X: f32 = 0.0;
+const MAG_OFFSET_Y: f32 = 0.0;
+const MAG_OFFSET_Z: f32 = 0.0;
+
 fn tilt_compensated_heading(bx: f32, by: f32, bz: f32, roll: f32, pitch: f32) -> f32 {
     let (sr, cr) = (libm::sinf(roll),  libm::cosf(roll));
     let (sp, cp) = (libm::sinf(pitch), libm::cosf(pitch));
@@ -99,9 +107,9 @@ pub async fn mag_task(
             continue;
         }
 
-        let x = i16::from_le_bytes([raw[0], raw[1]]) as f32;
-        let y = i16::from_le_bytes([raw[2], raw[3]]) as f32;
-        let z = i16::from_le_bytes([raw[4], raw[5]]) as f32;
+        let x = i16::from_le_bytes([raw[0], raw[1]]) as f32 - MAG_OFFSET_X;
+        let y = i16::from_le_bytes([raw[2], raw[3]]) as f32 - MAG_OFFSET_Y;
+        let z = i16::from_le_bytes([raw[4], raw[5]]) as f32 - MAG_OFFSET_Z;
 
         let q = *STATE.attitude.lock().await;
         let roll  = libm::atan2f(

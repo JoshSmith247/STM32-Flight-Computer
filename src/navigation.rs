@@ -28,6 +28,7 @@ pub const MAX_WAYPOINTS: usize = 32;
 
 const WAYPOINT_RADIUS_M: f32 = 2.0;
 const LAND_DESCENT_MPS:  f32 = 0.5;          // m/s target descent rate
+const BATT_LOW_PCT:      u8  = 20;           // trigger RTH when SoC drops below this
 const CRUISE_SPEED_MPS:  f32 = 5.0;          // nominal cruise (sets error cap)
 const NAV_ERR_CAP_M:     f32 = CRUISE_SPEED_MPS * 4.0; // 20 m — clamps PID input on long legs
 const MAX_TILT_RAD:      f32 = 0.436;         // 25°
@@ -290,6 +291,18 @@ pub async fn navigation_task() {
             } else {
                 warn!("Critical battery — forcing Land");
                 state::set(state::FlightState::Landing);
+                FlightMode::Land
+            }
+        } else if battery.voltage_v > 0.0
+            && battery.pct < BATT_LOW_PCT
+            && !battery.critical
+            && !matches!(mode, FlightMode::Land | FlightMode::ReturnToHome)
+        {
+            if gps.fix_ok && home_set {
+                warn!("Low battery ({}%) — forcing RTH", battery.pct);
+                FlightMode::ReturnToHome
+            } else {
+                warn!("Low battery ({}%) — forcing Land (no GPS)", battery.pct);
                 FlightMode::Land
             }
         } else if last_gps_ok.elapsed() > Duration::from_secs(5)

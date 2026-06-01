@@ -50,6 +50,12 @@ const MAV_RESULT_ACCEPTED:    u8 = 0;
 const MAV_RESULT_UNSUPPORTED: u8 = 3;
 const MAV_MISSION_ACCEPTED:   u8 = 0;
 
+// Current / capacity estimation — tune for your motor and pack combination.
+// EST_MAX_CURRENT_A: estimated draw at 100 % throttle across all motors.
+// PACK_CAPACITY_MAH: nominal pack capacity used for time-remaining calculation.
+const EST_MAX_CURRENT_A:  f32 = 20.0;
+const PACK_CAPACITY_MAH:  f32 = 1500.0;
+
 // ── Frame builder ─────────────────────────────────────────────────────────────
 
 fn write_frame(buf: &mut [u8], seq: u8, msg_id: u32, payload: &[u8], crc_extra: u8) -> usize {
@@ -129,13 +135,14 @@ fn build_heartbeat(flight_state: u8, mode: FlightMode, payload_flags: u32) -> [u
 }
 
 // SYS_STATUS #1 — 31 bytes: 3×u32, 9×u16/i16, 1×i8
-fn build_sys_status(voltage_mv: u16, pct: u8) -> [u8; 31] {
+// health: MAV_SYS_STATUS_SENSOR bitmask of sensors that passed their runtime checks.
+//   gyro=0x01, accel=0x02, baro=0x08, GPS=0x20
+fn build_sys_status(voltage_mv: u16, pct: u8, health: u32) -> [u8; 31] {
     let mut p = [0u8; 31];
-    // MAVLink MAV_SYS_STATUS_SENSOR bits: gyro=0x01, accel=0x02, baro=0x08, GPS=0x20
-    let sensors: u32 = 0x2B;
-    p[0..4].copy_from_slice(&sensors.to_le_bytes());
-    p[4..8].copy_from_slice(&sensors.to_le_bytes());
-    p[8..12].copy_from_slice(&sensors.to_le_bytes());
+    let present: u32 = 0x2B; // sensors fitted and enabled (constant)
+    p[0..4].copy_from_slice(&present.to_le_bytes());
+    p[4..8].copy_from_slice(&present.to_le_bytes());
+    p[8..12].copy_from_slice(&health.to_le_bytes());
     p[14..16].copy_from_slice(&voltage_mv.to_le_bytes());
     p[16..18].copy_from_slice(&(-1i16).to_le_bytes()); // current unknown
     p[30] = pct;
@@ -156,7 +163,7 @@ fn build_gps_raw(gps: &crate::types::GpsFix, time_ms: u32) -> [u8; 30] {
     let spd = libm::sqrtf(gps.vel_n_ms*gps.vel_n_ms + gps.vel_e_ms*gps.vel_e_ms);
     p[24..26].copy_from_slice(&(((spd * 100.0) as u32).min(65535) as u16).to_le_bytes());
     p[26..28].copy_from_slice(&u16::MAX.to_le_bytes());
-    p[28] = if gps.fix_ok { 3 } else { 1 };
+    p[28] = gps.fix_type;
     p[29] = 255;
     p
 }
@@ -222,18 +229,24 @@ fn build_vfr_hud(baro_alt: f32, gnd_spd: f32, yaw_rad: f32, throttle: f32, climb
     p
 }
 
-// BATTERY_STATUS #147 — 36 bytes: 2×i32, i16, 10×u16, i16, 3×u8, i8
-fn build_battery_status(voltage_v: f32, pct: u8) -> [u8; 36] {
-    let mut p = [0u8; 36];
-    p[0..4].copy_from_slice(&(-1i32).to_le_bytes());
-    p[4..8].copy_from_slice(&(-1i32).to_le_bytes());
-    p[8..10].copy_from_slice(&i16::MAX.to_le_bytes()); // temperature unknown
+// BATTERY_STATUS #147 — 40 bytes (36 standard + 4-byte time_remaining extension)
+// current_ca: instantaneous current in centiamperes (10 mA units)
+// mah_consumed: integrated charge drawn since boot in mAh
+// time_remaining_s: estimated seconds to empty at current draw (0 = unknown)
+fn build_battery_status(voltage_v: f32, pct: u8,
+                        current_ca: i16, mah_consumed: i32,
+                        time_remaining_s: i32) -> [u8; 40] {
+    let mut p = [0u8; 40];
+    p[0..4].copy_from_slice(&mah_consumed.to_le_bytes());
+    p[4..8].copy_from_slice(&(-1i32).to_le_bytes());       // energy_consumed unknown
+    p[8..10].copy_from_slice(&i16::MAX.to_le_bytes());     // temperature unknown
     let cell_mv = (voltage_v / 4.0 * 1000.0) as u16;
-    for i in 0..4usize { p[10 + i*2..12 + i*2].copy_from_slice(&cell_mv.to_le_bytes()); }
+    for i in 0..4usize  { p[10 + i*2..12 + i*2].copy_from_slice(&cell_mv.to_le_bytes()); }
     for i in 4..10usize { p[10 + i*2..12 + i*2].copy_from_slice(&u16::MAX.to_le_bytes()); }
-    p[30..32].copy_from_slice(&(-1i16).to_le_bytes());
+    p[30..32].copy_from_slice(&current_ca.to_le_bytes());
     p[34] = 3; // MAV_BATTERY_TYPE_LIPO
     p[35] = pct;
+    p[36..40].copy_from_slice(&time_remaining_s.to_le_bytes()); // MAVLink v2 extension
     p
 }
 
@@ -346,6 +359,12 @@ pub async fn telemetry_task(
         let mut buf = [0u8; 64];
         let mut ticker = Ticker::every(Duration::from_hz(10));
 
+        // Runtime sensor health — updated each tick, used by SYS_STATUS @ 1 Hz.
+        let imu_health:  Cell<bool> = Cell::new(false);
+        let baro_health: Cell<bool> = Cell::new(false);
+        // Throttle-integrated mAh estimate — accumulated at 10 Hz.
+        let est_mah: Cell<f32> = Cell::new(0.0);
+
         loop {
             ticker.next().await;
             time_ms = time_ms.wrapping_add(100);
@@ -363,6 +382,22 @@ pub async fn telemetry_task(
             let imu  = *STATE.imu_data.lock().await;
             let (roll, pitch, yaw) = quat_to_euler(quat);
 
+            // Update IMU health: accel must be finite and magnitude plausible (gravity ± 50 %).
+            {
+                let sq = imu.accel.x * imu.accel.x
+                       + imu.accel.y * imu.accel.y
+                       + imu.accel.z * imu.accel.z;
+                imu_health.set(imu.accel.x.is_finite() && imu.gyro.x.is_finite()
+                               && sq > 21.5 && sq < 216.1); // 4.6–14.7 m/s² (0.47–1.50 g)
+            }
+
+            // Accumulate mAh: 10 Hz tick = 0.1 s = 0.1/3600 h
+            // mAh added = throttle × MAX_CURRENT_A × 1000 mA/A × (0.1 s / 3600 s/h)
+            {
+                let thr = STATE.rc_input.lock().await.throttle;
+                est_mah.set(est_mah.get() + thr * EST_MAX_CURRENT_A * (100.0 / 3600.0));
+            }
+
             // Every tick — ATTITUDE #30 @ 10 Hz
             {
                 let p = build_attitude(time_ms, roll, pitch, yaw,
@@ -375,6 +410,10 @@ pub async fn telemetry_task(
             // Even ticks — VFR_HUD #74 + SERVO_OUTPUT_RAW #36 @ 5 Hz
             if tick % 2 == 0 {
                 let baro   = *STATE.baro_data.lock().await;
+                // Baro healthy if pressure is within the valid ISA operating range.
+                baro_health.set(baro.pressure_pa.is_finite()
+                                && baro.pressure_pa > 50_000.0
+                                && baro.pressure_pa < 110_000.0);
                 let rc     = *STATE.rc_input.lock().await;
                 let gps    = *STATE.gps_fix.lock().await;
                 let motors = *STATE.motor_outputs.lock().await;
@@ -408,7 +447,12 @@ pub async fn telemetry_task(
                 }
                 2 => {
                     let bat = *STATE.battery.lock().await;
-                    let p = build_sys_status((bat.voltage_v * 1000.0) as u16, bat.pct);
+                    let gps = *STATE.gps_fix.lock().await;
+                    let mut health: u32 = 0;
+                    if imu_health.get()    { health |= 0x01 | 0x02; } // gyro + accel
+                    if baro_health.get()   { health |= 0x08; }         // barometer
+                    if gps.fix_type >= 2   { health |= 0x20; }         // GPS communicating
+                    let p = build_sys_status((bat.voltage_v * 1000.0) as u16, bat.pct, health);
                     let n = write_frame(&mut buf, seq, 1, &p, MAGIC_SYS_STATUS);
                     tx.write(&buf[..n]).await.ok();
                     seq = seq.wrapping_add(1);
@@ -421,8 +465,18 @@ pub async fn telemetry_task(
                     seq = seq.wrapping_add(1);
                 }
                 6 => {
-                    let bat = *STATE.battery.lock().await;
-                    let p = build_battery_status(bat.voltage_v, bat.pct);
+                    let bat        = *STATE.battery.lock().await;
+                    let throttle   = STATE.rc_input.lock().await.throttle;
+                    let current_a  = throttle * EST_MAX_CURRENT_A;
+                    let current_ca = (current_a * 100.0).clamp(0.0, i16::MAX as f32) as i16;
+                    let mah        = est_mah.get() as i32;
+                    // Remaining capacity from voltage-based pct; time = capacity / rate.
+                    let remaining  = PACK_CAPACITY_MAH * bat.pct as f32 / 100.0;
+                    let time_s     = if current_a > 0.5 {
+                        (remaining * 3.6 / current_a) as i32 // mAh × 3.6 / A = seconds
+                    } else { 0 };
+                    let p = build_battery_status(bat.voltage_v, bat.pct,
+                                                 current_ca, mah, time_s);
                     let n = write_frame(&mut buf, seq, 147, &p, MAGIC_BATTERY_STATUS);
                     tx.write(&buf[..n]).await.ok();
                     seq = seq.wrapping_add(1);

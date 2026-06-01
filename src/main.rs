@@ -23,8 +23,29 @@ use embassy_stm32::{bind_interrupts, gpio::{Level, Output, Speed}, mode::Async, 
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 use embassy_time::{Duration, Ticker, Timer};
 use state::FlightState;
+use types::FlightMode;
 use defmt::info;
 use {defmt_rtt as _};
+
+// ── Hardware watchdog ─────────────────────────────────────────────────────────
+// IWDG1 base: 0x5802_0000. LSI ≈ 32 kHz, prescaler /256 → ~125 Hz.
+// Reload 250 → timeout 2.0 s. Petted by control_task every 250 ticks (0.5 s).
+// Any hang longer than 2 s triggers a hardware reset.
+fn init_watchdog() {
+    unsafe {
+        let base = 0x5802_0000u32 as *mut u32;
+        base.add(0).write_volatile(0x5555); // KR: unlock PR + RLR write access
+        base.add(1).write_volatile(6);      // PR: /256 prescaler
+        base.add(2).write_volatile(250);    // RLR: 250 / 125 Hz = 2.0 s
+        base.add(0).write_volatile(0xAAAA); // KR: reload counter
+        base.add(0).write_volatile(0xCCCC); // KR: start IWDG
+    }
+}
+
+#[inline(always)]
+pub fn pet_watchdog() {
+    unsafe { (0x5802_0000u32 as *mut u32).write_volatile(0xAAAA); }
+}
 
 pub static STATE: types::SharedState = types::SharedState::new();
 
@@ -58,9 +79,14 @@ async fn control_task() {
     let mut filter = MadgwickFilter::new(0.1, 1.0 / 500.0);
     let mut pids = FlightPids::default();
     let mut ticker = Ticker::every(Duration::from_hz(500));
+    let mut wdg_tick: u32 = 0;
 
     loop {
         ticker.next().await;
+        wdg_tick += 1;
+        if wdg_tick % 250 == 0 {   // every 0.5 s at 500 Hz — well within 2 s timeout
+            crate::pet_watchdog();
+        }
 
         let imu      = *STATE.imu_data.lock().await;
         let mag      = *STATE.mag_data.lock().await;
@@ -132,9 +158,16 @@ async fn arming_task() {
                 state::set(FlightState::Flying);
             }
         } else if rc.arm && rc.throttle < 0.05 && !rc.failsafe {
-            *STATE.armed.lock().await = true;
-            state::set(FlightState::Armed);
-            info!("Armed");
+            // Reject arm in GPS-dependent modes without a 3-D fix.
+            let mode_needs_gps = matches!(rc.mode,
+                FlightMode::PositionHold | FlightMode::Auto | FlightMode::ReturnToHome);
+            if mode_needs_gps && !STATE.gps_fix.lock().await.fix_ok {
+                defmt::warn!("Arm denied: mode requires GPS 3D fix");
+            } else {
+                *STATE.armed.lock().await = true;
+                state::set(FlightState::Armed);
+                info!("Armed");
+            }
         }
     }
 }
@@ -172,6 +205,8 @@ async fn main(spawner: Spawner) {
     config.rcc.apb4_pre = APBPrescaler::Div2;    // APB4   = 100 MHz
     
     let p = embassy_stm32::init(config);
+
+    init_watchdog();
 
     // Initialise shared SPI1 bus before spawning — 12.5 MHz, Mode 0 works for
     // both ICM-42688-P (max 24 MHz) and MS5611 (max 20 MHz).

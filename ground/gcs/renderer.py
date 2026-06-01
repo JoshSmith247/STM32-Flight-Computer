@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 
@@ -9,6 +10,37 @@ from dashboard import draw_stats_panel
 from exg import exg_candidates, exg_mask
 from mavlink import send_weed_target
 from tracker import WeedTracker
+
+_LOGS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
+
+
+class _VideoRecorder:
+    """Thread-safe cv2.VideoWriter wrapper; lazy-opens on the first frame."""
+
+    def __init__(self, logs_dir: str) -> None:
+        self._logs_dir = logs_dir
+        self._writer: cv2.VideoWriter | None = None
+        self._path: str | None = None
+        self._lock = threading.Lock()
+
+    def write(self, frame: np.ndarray) -> None:
+        with self._lock:
+            if self._writer is None:
+                os.makedirs(self._logs_dir, exist_ok=True)
+                h, w = frame.shape[:2]
+                ts = time.strftime('%Y%m%d_%H%M%S')
+                self._path = os.path.join(self._logs_dir, f'record_{ts}.mp4')
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                self._writer = cv2.VideoWriter(self._path, fourcc, 30.0, (w, h))
+                print(f"Recording → {self._path}", flush=True)
+            self._writer.write(frame)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._writer is not None:
+                self._writer.release()
+                self._writer = None
+                print(f"Recording saved: {self._path}", flush=True)
 
 
 def _make_no_stream_frame(w: int, h: int, img) -> tuple:
@@ -126,6 +158,8 @@ class _Renderer:
         self._vid_x_off = 0
         self._vid_y_off = 0
 
+        self._recorder: _VideoRecorder | None = None
+
         threading.Thread(target=self._run, daemon=True).start()
 
     def attach_grabber(self, grabber: FrameGrabber) -> None:
@@ -158,6 +192,8 @@ class _Renderer:
             self.stream_alive = False
         if g is not None:
             g.release()
+        if self._recorder is not None:
+            self._recorder.close()
 
     def _run(self) -> None:
         # Cached panels — rebuilt only when content changes, not every frame.
@@ -224,6 +260,16 @@ class _Renderer:
                 tint = np.zeros_like(display)
                 tint[:, :, 1] = mask
                 display = cv2.addWeighted(display, 1.0, tint, 0.4, 0)
+
+            # Start/stop recorder based on runtime flag
+            want_rec = config.RECORD_ACTIVE
+            if want_rec and self._recorder is None:
+                self._recorder = _VideoRecorder(_LOGS_DIR)
+            elif not want_rec and self._recorder is not None:
+                self._recorder.close()
+                self._recorder = None
+            if self._recorder is not None:
+                self._recorder.write(display)
 
             pr    = config.PR
             pw    = self._disp_w * pr   # physical canvas dimensions

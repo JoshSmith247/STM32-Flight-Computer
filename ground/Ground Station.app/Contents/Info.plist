@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Ground Station</string>
+    <key>CFBundleDisplayName</key>
+    <string>Ground Station</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.stm32flightcomputer.groundstation</string>
+    <key>CFBundleVersion</key>
+    <string>1.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleExecutable</key>
+    <string>Ground Station</string>
+    <key>CFBundleIconFile</key>
+    <string>drone_icon</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>LSUIElement</key>
+    <false/>
+</dict>
+</plist>

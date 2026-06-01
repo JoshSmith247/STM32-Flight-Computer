@@ -1,0 +1,9 @@
+#!/bin/bash
+# Resolve ground/ directory (3 levels up from Contents/MacOS/)
+GROUND="$(cd "$(dirname "$0")/../../.." && pwd)"
+
+PYTHON="$GROUND/.venv/bin/python3"
+[ -x "$PYTHON" ] || PYTHON="$(which python3)"
+
+cd "$GROUND"
+exec "$PYTHON" "./gcs/station.py" "$@"

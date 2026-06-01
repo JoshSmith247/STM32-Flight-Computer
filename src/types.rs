@@ -53,14 +53,15 @@ pub struct GpsFix {
     pub vel_e_ms: f32,
     pub vel_d_ms: f32,
     pub hacc_m:   f32,    // horizontal accuracy estimate
-    pub fix_ok:   bool,
+    pub fix_ok:   bool,   // true = gnssFixOK flag set and fix_type >= 3
+    pub fix_type: u8,     // NAV-PVT fixType: 0=none 1=DR 2=2D 3=3D 4=combined
 }
 
 impl Default for GpsFix {
     fn default() -> Self {
         Self { lat_deg: 0.0, lon_deg: 0.0, alt_m: 0.0,
                vel_n_ms: 0.0, vel_e_ms: 0.0, vel_d_ms: 0.0,
-               hacc_m: 9999.0, fix_ok: false }
+               hacc_m: 9999.0, fix_ok: false, fix_type: 0 }
     }
 }
 
@@ -260,7 +261,7 @@ impl SharedState {
             rc_input:      Mutex::new(RcInput    { throttle:0.0, roll:0.0, pitch:0.0, yaw:0.0, arm:false, mode: FlightMode::Stabilise, failsafe: false }),
             nav_command:   Mutex::new(NavCommand { autonomous: false, attitude_setpoint: AttitudeSetpoint { roll:0.0, pitch:0.0, yaw_rate:0.0, throttle:0.0 }, target: LatLonAlt { lat_deg:0.0, lon_deg:0.0, alt_m:0.0 } }),
             motor_outputs: Mutex::new(MotorOutputs { m1:0.0, m2:0.0, m3:0.0, m4:0.0 }),
-            gps_fix:       Mutex::new(GpsFix { lat_deg:0.0, lon_deg:0.0, alt_m:0.0, vel_n_ms:0.0, vel_e_ms:0.0, vel_d_ms:0.0, hacc_m:9999.0, fix_ok:false }),
+            gps_fix:       Mutex::new(GpsFix { lat_deg:0.0, lon_deg:0.0, alt_m:0.0, vel_n_ms:0.0, vel_e_ms:0.0, vel_d_ms:0.0, hacc_m:9999.0, fix_ok:false, fix_type:0 }),
             battery:       Mutex::new(BatteryData { voltage_v:0.0, pct:0, critical:true }),
             armed:         Mutex::new(false),
             flow:          Mutex::new(FlowData { quality:0, vel_x_mrad_s:0, vel_y_mrad_s:0, height_mm:-1, valid:false }),

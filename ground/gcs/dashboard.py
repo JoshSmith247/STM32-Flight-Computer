@@ -1,5 +1,6 @@
 import math
 import time
+import os
 
 import cv2
 import numpy as np
@@ -41,6 +42,11 @@ _ui_state: dict = {
 
 _payload_disabled: set = set()
 _payload_panel_rect: tuple = (0, 0, 0, 0)   # logical coords for click detection
+_arm_btn_rect: tuple = (0, 0, 0, 0)         # logical stats-panel coords for ARM/DISARM btn
+
+
+def get_arm_btn_rect() -> tuple:
+    return _arm_btn_rect
 
 
 def toggle_payload_override(bit: int) -> None:
@@ -64,6 +70,23 @@ def handle_payload_double_click(px: int, py: int) -> None:
     bits = sorted(PAYLOAD_NAMES.keys())
     if idx < len(bits):
         toggle_payload_override(bits[idx])
+
+
+_horizon_img_cache: dict = {}   # r → {'sky': patch, 'gnd': patch}
+
+
+def _load_horizon_patch(path: str, r: int) -> np.ndarray | None:
+    """Load and centre-crop an RGBA image to a (2r × 2r) patch."""
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None or img.ndim < 3 or img.shape[2] != 4:
+        return None
+    target = 2 * r
+    scale  = max(target / img.shape[1], target / img.shape[0])
+    img    = cv2.resize(img, (int(img.shape[1] * scale), int(img.shape[0] * scale)),
+                        interpolation=cv2.INTER_AREA)
+    yo = (img.shape[0] - target) // 2
+    xo = (img.shape[1] - target) // 2
+    return img[yo:yo + target, xo:xo + target]
 
 
 def _draw_artificial_horizon(panel: np.ndarray, cx: int, cy: int, r: int,
@@ -90,10 +113,51 @@ def _draw_artificial_horizon(panel: np.ndarray, cx: int, cy: int, r: int,
     tr = (int(ri[0] + ext * sky_x), int(ri[1] + ext * sky_y))
 
     cv2.circle(panel, (cx, cy), r, gnd_bgr, -1)
+    
     mask = np.zeros(panel.shape[:2], dtype=np.uint8)
     cv2.circle(mask, (cx, cy), r, 255, -1)
+    
     tmp = panel.copy()
-    cv2.fillPoly(tmp, [np.array([l, ri, tr, tl], np.int32)], sky_bgr)
+    
+    sky_poly_mask = np.zeros(tmp.shape[:2], dtype=np.uint8)
+    poly_points = np.array([l, ri, tr, tl], np.int32)
+    cv2.fillPoly(sky_poly_mask, [poly_points], 255)
+    
+    # Fill the sky color onto 'tmp' using the polygon mask
+    tmp[sky_poly_mask == 255] = sky_bgr
+
+    # Populate cache for this radius on first use (or if r changed).
+    if r not in _horizon_img_cache:
+        _assets = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'assets')
+        _horizon_img_cache[r] = {
+            'sky': _load_horizon_patch(os.path.join(_assets, 'trees.png'), r),
+            'gnd': _load_horizon_patch(os.path.join(_assets, 'path.png'),  r),
+        }
+
+    _sky_patch = _horizon_img_cache[r]['sky']
+    _gnd_patch = _horizon_img_cache[r]['gnd']
+
+    if _sky_patch is not None or _gnd_patch is not None:
+        y1, y2 = cy - r, cy + r
+        x1, x2 = cx - r, cx + r
+        sky_poly_roi = sky_poly_mask[y1:y2, x1:x2]
+
+        if _sky_patch is not None:
+            sky_alpha = _sky_patch[:, :, 3].astype(float) / 255.0
+            sky_alpha[sky_poly_roi == 0] = 0.0
+            sky_alpha = np.expand_dims(sky_alpha, axis=2)
+            tmp_roi = tmp[y1:y2, x1:x2]
+            tmp[y1:y2, x1:x2] = (_sky_patch[:, :, :3] * sky_alpha
+                                  + tmp_roi * (1.0 - sky_alpha)).astype(np.uint8)
+
+        if _gnd_patch is not None:
+            gnd_alpha = _gnd_patch[:, :, 3].astype(float) / 255.0
+            gnd_alpha[sky_poly_roi != 0] = 0.0
+            gnd_alpha = np.expand_dims(gnd_alpha, axis=2)
+            tmp_roi = tmp[y1:y2, x1:x2]
+            tmp[y1:y2, x1:x2] = (_gnd_patch[:, :, :3] * gnd_alpha
+                                  + tmp_roi * (1.0 - gnd_alpha)).astype(np.uint8)
+        
     panel[mask == 255] = tmp[mask == 255]
 
     for deg in [-20, -10, 10, 20]:
@@ -294,6 +358,11 @@ def _draw_distance_home(panel: np.ndarray, x: int, y: int, w: int,
     gfx.put_text(panel,
                  f"LON  {lon:.5f}" if lon is not None else "LON  --",
                  (x + P, cy), 0.34 * s, (128, 128, 128))
+    cy += 20 * s
+    cruise_s = f"{config.CRUISE_ALT:.1f} m"
+    gfx.put_text(panel, 'CRUISE ALT', (x + P, cy), 0.34 * s, (95, 95, 95))
+    (caw, _), _ = gfx.size(cruise_s, 0.44 * s)
+    gfx.put_text(panel, cruise_s, (x + w - caw - P, cy), 0.44 * s, (140, 175, 210))
 
 
 _DOT_COLORS = {
@@ -499,11 +568,33 @@ def _draw_weed_map(panel: np.ndarray, x: int, y: int, w: int, h: int,
     cv2.circle(panel, (mcx, mcy), 3 * s, (0, 220, 255), -1)
 
 
-def _draw_program_panel(panel: np.ndarray, x: int, y: int, w: int) -> None:
+def _draw_program_panel(panel: np.ndarray, x: int, y: int, w: int,
+                        armed: bool = False) -> None:
+    global _arm_btn_rect
     s = config.PR
     P = 10 * s
     cv2.line(panel, (x, y), (x + w, y), (48, 48, 48), max(1, s))
     gfx.put_text(panel, 'PROGRAMS', (x + P, y + 18 * s), 0.40 * s, (95, 95, 95))
+
+    # ARM / DISARM button in the header
+    btn_lw, btn_lh = 62, 20
+    bx0 = x + w - (btn_lw + 8) * s
+    by0 = y + 2 * s
+    bx1 = bx0 + btn_lw * s
+    by1 = by0 + btn_lh * s
+    if armed:
+        bg, bd, fg, lbl = (18, 18, 90), (40, 40, 180), (80, 80, 225), 'DISARM'
+    else:
+        bg, bd, fg, lbl = (22, 62, 24), (48, 120, 52), (90, 195, 95), 'ARM'
+    cv2.rectangle(panel, (bx0, by0), (bx1, by1), bg, -1)
+    cv2.rectangle(panel, (bx0, by0), (bx1, by1), bd, max(1, s))
+    (lw, lh), _ = gfx.size(lbl, 0.30 * s)
+    gfx.put_text(panel, lbl,
+                 (bx0 + (btn_lw * s - lw) // 2, by0 + (btn_lh * s + lh) // 2),
+                 0.30 * s, fg)
+    # Store in logical stats-panel-local coords (÷ s converts physical → logical)
+    _arm_btn_rect = (bx0 // s, by0 // s, btn_lw, btn_lh)
+
     cv2.line(panel, (x, y + 24 * s), (x + w, y + 24 * s), (48, 48, 48), max(1, s))
 
     sel = _ui_state['selected_prog']
@@ -780,7 +871,7 @@ def draw_stats_panel(h: int, tracker=None) -> np.ndarray:
     global _payload_panel_rect
     _payload_panel_rect = (R // s, (map_y + map_h) // s, COL // s, payloads_h // s)
     _draw_payloads(panel, R, map_y + map_h, COL, payload_flags, linked)
-    _draw_program_panel(panel, R, H - OVERLAY_H * s, COL)
+    _draw_program_panel(panel, R, H - OVERLAY_H * s, COL, armed)
 
     gfx.flush(panel)   # render all queued text in one PIL pass
     return panel

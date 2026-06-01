@@ -14,6 +14,7 @@ Tune EXG_THRESH and EXG_MIN_AREA in .env for your surface:
 """
 
 import os
+import pathlib
 import threading
 import time
 
@@ -22,8 +23,10 @@ import dearpygui.dearpygui as dpg
 import numpy as np
 
 import config
-from dashboard import _handle_overlay_click, handle_payload_double_click
-from mavlink import _HAVE_MAVLINK, _mav_listener, _target_sock, start_logging
+import overlay as _overlay
+from dashboard import _handle_overlay_click, handle_payload_double_click, get_arm_btn_rect
+from mavlink import (_HAVE_MAVLINK, _mav_listener, _mav_lock, _mav_state,
+                     _target_sock, send_mavlink_command, start_logging)
 from renderer import FrameGrabber, _Renderer
 from tracker import WeedTracker
 
@@ -67,6 +70,133 @@ def _macos_set_presentation(hide: bool) -> None:
         )
     except Exception as exc:
         print(f"macOS presentation: {exc}", flush=True)
+
+
+def _macos_set_dock_icon(icon_path: str) -> None:
+    try:
+        import ctypes, ctypes.util
+        lib = ctypes.cdll.LoadLibrary(ctypes.util.find_library('objc'))
+        lib.objc_getClass.restype     = ctypes.c_void_p
+        lib.objc_getClass.argtypes    = [ctypes.c_char_p]
+        lib.sel_registerName.restype  = ctypes.c_void_p
+        lib.sel_registerName.argtypes = [ctypes.c_char_p]
+
+        def _msg(obj, sel):
+            f = lib.objc_msgSend
+            f.restype  = ctypes.c_void_p
+            f.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            return f(obj, sel)
+
+        def _msg1(obj, sel, arg):
+            f = lib.objc_msgSend
+            f.restype  = ctypes.c_void_p
+            f.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+            return f(obj, sel, arg)
+
+        def _msg1_str(obj, sel, cstr):
+            f = lib.objc_msgSend
+            f.restype  = ctypes.c_void_p
+            f.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p]
+            return f(obj, sel, cstr)
+
+        ns_str = _msg1_str(
+            lib.objc_getClass(b'NSString'),
+            lib.sel_registerName(b'stringWithUTF8String:'),
+            icon_path.encode(),
+        )
+        ns_img = _msg1(
+            _msg(lib.objc_getClass(b'NSImage'), lib.sel_registerName(b'alloc')),
+            lib.sel_registerName(b'initWithContentsOfFile:'),
+            ns_str,
+        )
+        ns_app = _msg(
+            lib.objc_getClass(b'NSApplication'),
+            lib.sel_registerName(b'sharedApplication'),
+        )
+        _msg1(ns_app, lib.sel_registerName(b'setApplicationIconImage:'), ns_img)
+    except Exception as exc:
+        print(f"macOS dock icon: {exc}", flush=True)
+
+
+def _macos_activate() -> None:
+    """Set activation policy to Regular (shows in Dock) and bring window to front."""
+    try:
+        import ctypes, ctypes.util
+        lib = ctypes.cdll.LoadLibrary(ctypes.util.find_library('objc'))
+        lib.objc_getClass.restype     = ctypes.c_void_p
+        lib.objc_getClass.argtypes    = [ctypes.c_char_p]
+        lib.sel_registerName.restype  = ctypes.c_void_p
+        lib.sel_registerName.argtypes = [ctypes.c_char_p]
+
+        def _msg0(obj, sel):
+            f = lib.objc_msgSend
+            f.restype  = ctypes.c_void_p
+            f.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            return f(obj, sel)
+
+        def _msg_long(obj, sel, val):
+            f = lib.objc_msgSend
+            f.restype  = ctypes.c_bool
+            f.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long]
+            return f(obj, sel, val)
+
+        def _msg_bool(obj, sel, val):
+            f = lib.objc_msgSend
+            f.restype  = None
+            f.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool]
+            f(obj, sel, val)
+
+        ns_app = _msg0(
+            lib.objc_getClass(b'NSApplication'),
+            lib.sel_registerName(b'sharedApplication'),
+        )
+        # NSApplicationActivationPolicyRegular = 0 → shows in Dock + menu bar
+        _msg_long(ns_app, lib.sel_registerName(b'setActivationPolicy:'), 0)
+        _msg_bool(ns_app, lib.sel_registerName(b'activateIgnoringOtherApps:'), True)
+    except Exception as exc:
+        print(f"macOS activate: {exc}", flush=True)
+
+
+def _macos_set_app_name(name: str) -> None:
+    # NSProcessInfo.setProcessName: does NOT affect the Dock — the Dock reads
+    # from Launch Services. We must use the private _LSSetApplicationInformationItem
+    # API to override CFBundleName/CFBundleDisplayName for the running process.
+    try:
+        import ctypes
+
+        cf = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+        cf.CFStringCreateWithCString.restype  = ctypes.c_void_p
+        cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+        cf.CFRelease.restype  = None
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+        kUTF8 = 0x08000100
+
+        cf_name  = cf.CFStringCreateWithCString(None, name.encode(), kUTF8)
+        cf_bname = cf.CFStringCreateWithCString(None, b'CFBundleName', kUTF8)
+        cf_dname = cf.CFStringCreateWithCString(None, b'CFBundleDisplayName', kUTF8)
+
+        app_svc = ctypes.CDLL(
+            '/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices'
+        )
+        app_svc._LSGetCurrentApplicationASN.restype  = ctypes.c_uint64
+        app_svc._LSGetCurrentApplicationASN.argtypes = []
+        asn = app_svc._LSGetCurrentApplicationASN()
+
+        app_svc._LSSetApplicationInformationItem.restype  = ctypes.c_int32
+        app_svc._LSSetApplicationInformationItem.argtypes = [
+            ctypes.c_int32,   # kLSDefaultSessionID = -2
+            ctypes.c_uint64,  # ASN
+            ctypes.c_void_p,  # key   (CFStringRef)
+            ctypes.c_void_p,  # value (CFTypeRef)
+            ctypes.c_void_p,  # outDict — NULL
+        ]
+        app_svc._LSSetApplicationInformationItem(-2, asn, cf_bname, cf_name, None)
+        app_svc._LSSetApplicationInformationItem(-2, asn, cf_dname, cf_name, None)
+
+        for obj in (cf_name, cf_bname, cf_dname):
+            cf.CFRelease(obj)
+    except Exception as exc:
+        print(f"macOS app name: {exc}", flush=True)
 
 
 def main() -> None:
@@ -165,6 +295,7 @@ def main() -> None:
 
     # ── Dear PyGui setup ──────────────────────────────────────────────────────
     dpg.create_context()
+    _icon_path = str(pathlib.Path(__file__).parent.parent / "assets" / "drone_icon.png")
 
     pr = pixel_ratio   # short alias used throughout texture setup
     with dpg.texture_registry():
@@ -177,6 +308,9 @@ def main() -> None:
         dpg.add_raw_texture(config.STATS_W * pr, disp_h * pr,
                             np.zeros(config.STATS_W * pr * disp_h * pr * 4, dtype=np.float32),
                             format=dpg.mvFormat_Float_rgba, tag="tex_stats")
+        dpg.add_raw_texture(screen_w * pr, screen_h * pr,
+                            np.zeros(screen_w * pr * screen_h * pr * 4, dtype=np.float32),
+                            format=dpg.mvFormat_Float_rgba, tag="tex_overlay")
 
     stream_ok       = [False]
     renderer        = [None]
@@ -191,6 +325,11 @@ def main() -> None:
                      abs(x - _last_click[1]) < 20 and
                      abs(y - _last_click[2]) < 20)
         _last_click[:] = [now, x, y]
+
+        # Overlay intercepts all clicks when active
+        if _overlay.handle_click(x, y):
+            return
+
         if not stream_ok[0]:
             if not _conn['busy']:
                 br = _btn_rect[0]
@@ -207,6 +346,20 @@ def main() -> None:
         else:
             px  = x - (disp_w + config.SIDEBAR_W)
             COL = config.STATS_W // 2
+
+            # ARM / DISARM button in the program panel header
+            arect = get_arm_btn_rect()
+            if (arect[2] > 0
+                    and arect[0] <= px <= arect[0] + arect[2]
+                    and arect[1] <= y  <= arect[1] + arect[3]):
+                with _mav_lock:
+                    armed_now = _mav_state['armed']
+                if armed_now:
+                    send_mavlink_command(400, 0.0, 0.0)   # DISARM
+                else:
+                    _overlay.open_overlay()
+                return
+
             if is_double and px >= COL:
                 handle_payload_double_click(px, y)
             if px >= COL and y >= disp_h - config.OVERLAY_H:
@@ -223,11 +376,20 @@ def main() -> None:
             r.show_exg = not r.show_exg
             print(f"ExG overlay {'on' if r.show_exg else 'off'}", flush=True)
 
+    def _on_key_a(*_):
+        with _mav_lock:
+            armed_now = _mav_state['armed']
+        if armed_now:
+            send_mavlink_command(400, 0.0, 0.0)   # DISARM
+        elif not _overlay.is_active():
+            _overlay.open_overlay()
+
     with dpg.handler_registry():
         dpg.add_mouse_click_handler(button=dpg.mvMouseButton_Left, callback=_on_click)
         dpg.add_key_press_handler(key=dpg.mvKey_Q, callback=_on_key_interrupt)
         dpg.add_key_press_handler(key=dpg.mvKey_Escape, callback=_on_key_interrupt)
         dpg.add_key_press_handler(key=dpg.mvKey_E, callback=_on_key_e)
+        dpg.add_key_press_handler(key=dpg.mvKey_A, callback=_on_key_a)
 
     sid_x   = disp_w
     stats_x = disp_w + config.SIDEBAR_W
@@ -235,16 +397,21 @@ def main() -> None:
     # viewport_drawlist renders directly onto the viewport surface — no window
     # chrome, no padding, and it always fills the viewport exactly.
     with dpg.viewport_drawlist(front=False, tag="canvas"):
-        dpg.draw_image("tex_vid",   (0,       0), (disp_w,   screen_h))
-        dpg.draw_image("tex_side",  (sid_x,   0), (stats_x,  screen_h))
-        dpg.draw_image("tex_stats", (stats_x, 0), (screen_w, screen_h))
+        dpg.draw_image("tex_vid",     (0,       0), (disp_w,   screen_h))
+        dpg.draw_image("tex_side",    (sid_x,   0), (stats_x,  screen_h))
+        dpg.draw_image("tex_stats",   (stats_x, 0), (screen_w, screen_h))
+        dpg.draw_image("tex_overlay", (0,       0), (screen_w, screen_h))
 
     dpg.create_viewport(title="Ground Control Station",
                         width=screen_w, height=screen_h,
                         x_pos=0, y_pos=0, decorated=False, resizable=False)
     dpg.setup_dearpygui()
     dpg.show_viewport()
+    _macos_set_app_name("Ground Station")  # must be set before Dock tile is created
+    _macos_activate()               # set policy=Regular + bring to foreground
+    _macos_set_dock_icon(_icon_path)
     _macos_set_presentation(True)   # hide menu bar + Dock
+    _overlay.open_overlay()
 
     # BGR uint8 → flat RGBA float32 for DPG texture upload.
     # Panels are pre-rendered at physical pixel resolution (config.PR applied by each
@@ -259,8 +426,9 @@ def main() -> None:
         return out.ravel()
 
     renderer[0] = _Renderer(tracker, disp_w, disp_h, _no_stream_img, _btn_rect)
-    cap         = None
-    _seen       = [-1, -1, -1]   # last uploaded [vid_seq, sidebar_seq, stats_seq]
+    cap              = None
+    _seen            = [-1, -1, -1]   # last uploaded [vid_seq, sidebar_seq, stats_seq]
+    _overlay_was_active = False
 
     while dpg.is_dearpygui_running() and not _quit[0]:
         r = renderer[0]
@@ -297,12 +465,23 @@ def main() -> None:
                 dpg.set_value("tex_stats", _to_tex(stats))
                 _seen[2] = sts
 
+        # ── Overlay tick + upload ──────────────────────────────────────────────
+        now_active = _overlay.is_active()
+        if now_active or _overlay_was_active:
+            with _mav_lock:
+                armed_now = _mav_state['armed']
+            _overlay.tick(armed_now)
+            dpg.set_value("tex_overlay",
+                          _overlay.draw_overlay(screen_w, screen_h))
+        _overlay_was_active = now_active
+
         dpg.render_dearpygui_frame()
 
     r = renderer[0]
     r.release()
-    _macos_set_presentation(False)  # restore menu bar + Dock
-    dpg.destroy_context()
+    dpg.stop_dearpygui()    # signal DPG to stop before tearing down context
+    dpg.destroy_context()   # closes viewport window + GPU resources
+    _macos_set_presentation(False)  # restore menu bar + Dock after window is gone
     _target_sock.close()
     print(f"\nDone. {r.frame_count} frames processed.", flush=True)
 

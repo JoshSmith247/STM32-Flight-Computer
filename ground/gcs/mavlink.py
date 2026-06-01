@@ -59,13 +59,52 @@ def send_mavlink_command(cmd: int, param1: float = 0.0, param2: float = 0.0) -> 
         print(f"send_mavlink_command: {exc}", flush=True)
 
 
+def send_set_home() -> None:
+    """Set home to the current GPS position.
+
+    Sends MAV_CMD_DO_SET_HOME (179, param1=1) to the STM32 and snapshots the
+    current lat/lon as the weed-map origin and the current altitude as ground_alt.
+    """
+    with _mav_lock:
+        lat = _mav_state['lat']
+        lon = _mav_state['lon']
+        alt = _mav_state['alt']
+    if lat is None:
+        print("set_home: no GPS fix — ignoring", flush=True)
+        return
+    send_mavlink_command(179, 1.0)   # MAV_CMD_DO_SET_HOME, param1=1 = use current position
+    with _mav_lock:
+        _mav_state['origin']     = (lat, lon)
+        _mav_state['ground_alt'] = alt
+        _mav_state['home_set']   = True
+    print(f"Home set: {lat:.6f}, {lon:.6f}  ground_alt={alt:.1f} m", flush=True)
+
+
 def send_weed_target(wid: int, east_m: float, north_m: float) -> None:
-    """Send selected weed's world position to the Pi over UDP."""
-    msg = json.dumps({'wid': wid, 'east_m': round(east_m, 3),
-                      'north_m': round(north_m, 3)}).encode()
+    """Send selected weed's position to the Pi as NED offsets from the drone's current GPS.
+
+    pixel_to_world() returns absolute ENU from the GPS origin, but the STM32 interprets
+    SET_POSITION_TARGET_LOCAL_NED as an offset from the drone's current position.
+    Subtract the drone's current ENU position so the Pi forwards correct relative offsets.
+    """
+    with _mav_lock:
+        orig = _mav_state['origin']
+        lat  = _mav_state['lat']
+        lon  = _mav_state['lon']
+    if lat is None or orig is None:
+        print(f"W{wid} target not sent: no GPS fix", flush=True)
+        return
+    R = 6_371_000.0
+    drone_e = math.radians(lon - orig[1]) * R * math.cos(math.radians(orig[0]))
+    drone_n = math.radians(lat - orig[0]) * R
+    rel_e = east_m - drone_e
+    rel_n = north_m - drone_n
+    msg = json.dumps({'wid': wid, 'east_m': round(rel_e, 3),
+                      'north_m': round(rel_n, 3)}).encode()
     try:
         _target_sock.sendto(msg, (config.PI_IP, config.WEED_TARGET_PORT))
-        print(f"Sent W{wid} → Pi: {east_m:.2f}m E, {north_m:.2f}m N", flush=True)
+        print(f"Sent W{wid} → Pi: {rel_e:+.2f}m E, {rel_n:+.2f}m N  "
+              f"(abs {east_m:.2f}E {north_m:.2f}N)", flush=True)
     except OSError as exc:
         print(f"UDP send failed: {exc}", flush=True)
 
@@ -80,6 +119,7 @@ def send_weed_target(wid: int, east_m: float, north_m: float) -> None:
 _mav_lock  = threading.Lock()
 _mav_state: dict = {
     'lat': None, 'lon': None, 'alt': 1.0, 'yaw': 0.0, 'origin': None,
+    'home_set': False, 'ground_alt': 0.0,
     'vx': 0.0, 'vy': 0.0, 'vz': 0.0, 'last_msg_t': None,
     'roll': 0.0, 'pitch': 0.0, 'battery_pct': -1,
     'armed': False, 'mode': '',
@@ -167,6 +207,29 @@ def _mav_listener() -> None:
                 if msg.result != 0:
                     print(f"COMMAND_ACK cmd={msg.command} "
                           f"result={_RESULT.get(msg.result, msg.result)}", flush=True)
+
+            if config.VERBOSE_LOGGING:
+                mt = msg.get_type()
+                if mt == 'HEARTBEAT':
+                    print(f"[MAV] HB  armed={_mav_state['armed']}"
+                          f"  state={_mav_state['flight_state']}"
+                          f"  mode={_mav_state['flight_mode_id']}", flush=True)
+                elif mt == 'GPS_RAW_INT':
+                    print(f"[MAV] GPS fix={_mav_state['gps_fix_type']}", flush=True)
+                elif mt == 'SYS_STATUS':
+                    print(f"[MAV] SYS health=0x{_mav_state['sensors_health']:04X}"
+                          f"  batt={_mav_state['battery_pct']}%", flush=True)
+                elif mt == 'BATTERY_STATUS':
+                    v = _mav_state['voltage_mv']
+                    print(f"[MAV] BAT  {v/1000:.2f}V"
+                          f"  {_mav_state['current_ca']/100:.1f}A"
+                          f"  {_mav_state['battery_pct']}%"
+                          f"  mah={_mav_state['mah_consumed']}", flush=True)
+                elif mt == 'SERVO_OUTPUT_RAW':
+                    print(f"[MAV] MOTORS {_mav_state['motor_pwm']}", flush=True)
+                elif mt == 'COMMAND_ACK':
+                    print(f"[MAV] ACK  cmd={msg.command}"
+                          f"  {_RESULT.get(msg.result, msg.result)}", flush=True)
 
 
 def pixel_to_world(px: float, py: float,
