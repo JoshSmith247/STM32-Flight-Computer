@@ -14,6 +14,19 @@ Tune EXG_THRESH and EXG_MIN_AREA in .env for your surface:
 """
 
 import os
+
+# ── Must be set before ANY torch/ultralytics import ──────────────────────────
+# On macOS ARM-64, PyTorch uses Apple's Accelerate/vecLib for CPU BLAS.
+# Accelerate internally dispatches to Metal for certain ops, which conflicts
+# with DearPyGUI's Metal render thread and causes SIGSEGV after ~30 s.
+# Limiting all threading backends to 1 thread keeps computation on the calling
+# thread only — no background BLAS threads fighting over the Metal context.
+os.environ.setdefault('OMP_NUM_THREADS',         '1')
+os.environ.setdefault('VECLIB_MAXIMUM_THREADS',  '1')   # Apple Accelerate / vecLib
+os.environ.setdefault('MKL_NUM_THREADS',         '1')
+os.environ.setdefault('OPENBLAS_NUM_THREADS',    '1')
+os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
+
 import pathlib
 import threading
 import time
@@ -24,7 +37,8 @@ import numpy as np
 
 import config
 import overlay as _overlay
-from dashboard import _handle_overlay_click, handle_payload_double_click, get_arm_btn_rect
+from dashboard import _handle_overlay_click, _ui_state, handle_payload_double_click
+from follow import PersonTracker
 from mavlink import (_HAVE_MAVLINK, _mav_listener, _mav_lock, _mav_state,
                      _target_sock, send_mavlink_command, start_logging)
 from renderer import FrameGrabber, _Renderer
@@ -274,20 +288,58 @@ def main() -> None:
     if os.path.exists(_nsi_path):
         _no_stream_img = cv2.imread(_nsi_path, cv2.IMREAD_UNCHANGED)
 
-    tracker   = WeedTracker()
+    tracker        = WeedTracker()
+    person_tracker = PersonTracker()
     tracker.set_frame_size(frame_w, frame_h)
+    person_tracker.set_frame_size(frame_w, frame_h)
+    # Preload YOLO weights in the background so Follow Me activates without a
+    # first-frame hang.  The worker runs as a subprocess so it is safe to start
+    # at any time — no Metal contention with DPG.
+    person_tracker.preload()
     _btn_rect = [None]
-    _conn     = {'cap': None, 'ok': False, 'busy': False}
+    _conn     = {'cap': None, 'ok': False, 'busy': False, 'loop': False}
 
     def _open_stream():
-        for backend, url in [(cv2.CAP_GSTREAMER, config.GST_PIPELINE),
-                              (cv2.CAP_FFMPEG, config.FFMPEG_URL)]:
-            c = cv2.VideoCapture(url, backend)
+        src = config.VIDEO_SOURCE
+        if src:
+            # Local source — webcam index or video file
+            cap_arg = int(src) if src.isdigit() else src
+            c = cv2.VideoCapture(cap_arg)
             if c.isOpened():
-                _conn['cap'] = c
-                _conn['ok']  = True
-                break
-            c.release()
+                _conn['cap']  = c
+                _conn['ok']   = True
+                _conn['loop'] = not src.isdigit()  # loop video files, not webcams
+                print(f"Video source: {src!r}", flush=True)
+            else:
+                c.release()
+                print(f"Could not open VIDEO_SOURCE={src!r}", flush=True)
+        else:
+            # UDP stream from Pi (or demo_cam.py running locally)
+            for label, backend, url in [
+                ('GStreamer', cv2.CAP_GSTREAMER, config.GST_PIPELINE),
+                ('ffmpeg',    cv2.CAP_FFMPEG,    config.FFMPEG_URL),
+            ]:
+                if label == 'ffmpeg':
+                    print(f"Waiting up to 5 s for UDP stream on port {config.VIDEO_PORT}…",
+                          flush=True)
+                c = cv2.VideoCapture(url, backend)
+                if c.isOpened():
+                    _conn['cap']  = c
+                    _conn['ok']   = True
+                    _conn['loop'] = False
+                    print(f"Stream connected via {label}", flush=True)
+                    break
+                c.release()
+                print(f"{label}: no stream", flush=True)
+            else:
+                print(
+                    "\nNo camera feed received.\n"
+                    "  → To test locally:  python pi/demo_cam.py 127.0.0.1\n"
+                    "  → To use a webcam:  add VIDEO_SOURCE=0 to ground/.env\n"
+                    "  → With real Pi:     ensure camera.service is running and IP is correct\n"
+                    "Click 'Connect Device' in the GCS window to retry.",
+                    flush=True,
+                )
         _conn['busy'] = False
 
     _conn['busy'] = True
@@ -340,25 +392,17 @@ def main() -> None:
         if x < disp_w:
             fc = renderer[0].display_to_frame(x, y) if renderer[0] else None
             if fc is not None:
-                tracker.queue_click(*fc)
+                _running = _ui_state.get('running_prog')
+                if _running == config.PROG_FOLLOW_ME:
+                    person_tracker.queue_click(*fc)
+                elif _running == config.PROG_WEED_PICK:
+                    tracker.queue_click(*fc)
         elif x < disp_w + config.SIDEBAR_W:
-            tracker.sidebar_click(y)
+            if _ui_state.get('running_prog') == config.PROG_WEED_PICK:
+                tracker.sidebar_click(y)
         else:
             px  = x - (disp_w + config.SIDEBAR_W)
             COL = config.STATS_W // 2
-
-            # ARM / DISARM button in the program panel header
-            arect = get_arm_btn_rect()
-            if (arect[2] > 0
-                    and arect[0] <= px <= arect[0] + arect[2]
-                    and arect[1] <= y  <= arect[1] + arect[3]):
-                with _mav_lock:
-                    armed_now = _mav_state['armed']
-                if armed_now:
-                    send_mavlink_command(400, 0.0, 0.0)   # DISARM
-                else:
-                    _overlay.open_overlay()
-                return
 
             if is_double and px >= COL:
                 handle_payload_double_click(px, y)
@@ -376,20 +420,11 @@ def main() -> None:
             r.show_exg = not r.show_exg
             print(f"ExG overlay {'on' if r.show_exg else 'off'}", flush=True)
 
-    def _on_key_a(*_):
-        with _mav_lock:
-            armed_now = _mav_state['armed']
-        if armed_now:
-            send_mavlink_command(400, 0.0, 0.0)   # DISARM
-        elif not _overlay.is_active():
-            _overlay.open_overlay()
-
     with dpg.handler_registry():
         dpg.add_mouse_click_handler(button=dpg.mvMouseButton_Left, callback=_on_click)
         dpg.add_key_press_handler(key=dpg.mvKey_Q, callback=_on_key_interrupt)
         dpg.add_key_press_handler(key=dpg.mvKey_Escape, callback=_on_key_interrupt)
         dpg.add_key_press_handler(key=dpg.mvKey_E, callback=_on_key_e)
-        dpg.add_key_press_handler(key=dpg.mvKey_A, callback=_on_key_a)
 
     sid_x   = disp_w
     stats_x = disp_w + config.SIDEBAR_W
@@ -425,7 +460,7 @@ def main() -> None:
         out[:, :, 3] = 1.0
         return out.ravel()
 
-    renderer[0] = _Renderer(tracker, disp_w, disp_h, _no_stream_img, _btn_rect)
+    renderer[0] = _Renderer(tracker, person_tracker, disp_w, disp_h, _no_stream_img, _btn_rect)
     cap              = None
     _seen            = [-1, -1, -1]   # last uploaded [vid_seq, sidebar_seq, stats_seq]
     _overlay_was_active = False
@@ -439,8 +474,9 @@ def main() -> None:
             _fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             _fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             if _fw > 0 and _fh > 0:
-                tracker.set_frame_size(_fh, _fw)  # swapped: camera rotated 90°
-            r.attach_grabber(FrameGrabber(cap))
+                tracker.set_frame_size(_fh, _fw)        # swapped: camera rotated 90°
+                person_tracker.set_frame_size(_fh, _fw)
+            r.attach_grabber(FrameGrabber(cap, loop=_conn.get('loop', False)))
             stream_ok[0] = True
             print(f"Stream connected: {_fw}×{_fh}", flush=True)
 
@@ -477,9 +513,21 @@ def main() -> None:
 
         dpg.render_dearpygui_frame()
 
+    # Halt DPG's internal Metal command-dispatch thread immediately.
+    # When the user clicks the OS close button, DPG begins its own partial
+    # teardown while its render thread keeps running.  Every second we spend
+    # in join() or shutdown() below is a second that thread can hit a freed
+    # Metal object (KERN_INVALID_ADDRESS, Thread 12).  Calling stop first
+    # drains DPG before we do anything else.
+    dpg.stop_dearpygui()
+
     r = renderer[0]
     r.release()
-    dpg.stop_dearpygui()    # signal DPG to stop before tearing down context
+    r._thread.join(timeout=5.0)
+
+    # Stop the YOLO subprocess cleanly before DPG tears down its Metal context.
+    person_tracker.shutdown()
+
     dpg.destroy_context()   # closes viewport window + GPU resources
     _macos_set_presentation(False)  # restore menu bar + Dock after window is gone
     _target_sock.close()

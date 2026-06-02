@@ -69,3 +69,9 @@ Check they're running:
 ```bash
 sudo systemctl status mavlink camera
 ```
+
+To find the LAN IP address of the ground:
+
+```bash
+ipconfig getifaddr en0
+```

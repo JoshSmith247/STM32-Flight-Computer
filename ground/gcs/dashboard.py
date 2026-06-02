@@ -11,7 +11,7 @@ from config import PROGRAMS, PAYLOAD_NAMES, OVERLAY_H
 from mavlink import _mav_lock, _mav_state, send_mavlink_command
 
 _FLIGHT_MODES = {
-    0: 'STAB', 1: 'ALTH', 2: 'POSH', 3: 'AUTO', 4: 'RTH', 5: 'LAND',
+    0: 'STAB', 1: 'ALTH', 2: 'POSH', 3: 'AUTO', 4: 'RTH', 5: 'LAND', 6: 'FOLW',
 }
 _FLIGHT_STATES = {
     0: 'IDLE', 1: 'ARMING', 2: 'ARMED', 3: 'FLYING', 4: 'LANDING', 5: 'FAULT',
@@ -28,7 +28,7 @@ _STATE_COLORS = {
 # Maps PROGRAMS index → (cmd, param1, param2) sent on SEND
 _PROG_COMMANDS = {
     0: (176, 0.0, 0.0),   # MANUAL      → DO_SET_MODE, Stabilise
-    1: (176, 0.0, 2.0),   # FOLLOW ME   → DO_SET_MODE, PositionHold
+    1: (176, 0.0, 4.0),   # FOLLOW ME   → DO_SET_MODE, FollowMe
     2: (176, 0.0, 3.0),   # WEED PICKER → DO_SET_MODE, Auto
     3: (20,  0.0, 0.0),   # RETURN HOME → NAV_RETURN_TO_LAUNCH
 }
@@ -571,30 +571,11 @@ def _draw_weed_map(panel: np.ndarray, x: int, y: int, w: int, h: int,
 def _draw_program_panel(panel: np.ndarray, x: int, y: int, w: int,
                         armed: bool = False) -> None:
     global _arm_btn_rect
+    _arm_btn_rect = (0, 0, 0, 0)   # no ARM button — arming is via pre-flight overlay only
     s = config.PR
     P = 10 * s
     cv2.line(panel, (x, y), (x + w, y), (48, 48, 48), max(1, s))
     gfx.put_text(panel, 'PROGRAMS', (x + P, y + 18 * s), 0.40 * s, (95, 95, 95))
-
-    # ARM / DISARM button in the header
-    btn_lw, btn_lh = 62, 20
-    bx0 = x + w - (btn_lw + 8) * s
-    by0 = y + 2 * s
-    bx1 = bx0 + btn_lw * s
-    by1 = by0 + btn_lh * s
-    if armed:
-        bg, bd, fg, lbl = (18, 18, 90), (40, 40, 180), (80, 80, 225), 'DISARM'
-    else:
-        bg, bd, fg, lbl = (22, 62, 24), (48, 120, 52), (90, 195, 95), 'ARM'
-    cv2.rectangle(panel, (bx0, by0), (bx1, by1), bg, -1)
-    cv2.rectangle(panel, (bx0, by0), (bx1, by1), bd, max(1, s))
-    (lw, lh), _ = gfx.size(lbl, 0.30 * s)
-    gfx.put_text(panel, lbl,
-                 (bx0 + (btn_lw * s - lw) // 2, by0 + (btn_lh * s + lh) // 2),
-                 0.30 * s, fg)
-    # Store in logical stats-panel-local coords (÷ s converts physical → logical)
-    _arm_btn_rect = (bx0 // s, by0 // s, btn_lw, btn_lh)
-
     cv2.line(panel, (x, y + 24 * s), (x + w, y + 24 * s), (48, 48, 48), max(1, s))
 
     sel = _ui_state['selected_prog']

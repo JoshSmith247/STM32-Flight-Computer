@@ -80,6 +80,11 @@ def send_set_home() -> None:
     print(f"Home set: {lat:.6f}, {lon:.6f}  ground_alt={alt:.1f} m", flush=True)
 
 
+def send_follow_target(east_m: float, north_m: float) -> None:
+    """Send tracked person's ground position to the Pi as a continuous position setpoint."""
+    send_weed_target(0, east_m, north_m)
+
+
 def send_weed_target(wid: int, east_m: float, north_m: float) -> None:
     """Send selected weed's position to the Pi as NED offsets from the drone's current GPS.
 
@@ -207,7 +212,6 @@ def _mav_listener() -> None:
                 if msg.result != 0:
                     print(f"COMMAND_ACK cmd={msg.command} "
                           f"result={_RESULT.get(msg.result, msg.result)}", flush=True)
-
             if config.VERBOSE_LOGGING:
                 mt = msg.get_type()
                 if mt == 'HEARTBEAT':
@@ -300,7 +304,7 @@ def pixel_to_world(px: float, py: float,
 _LOG_INTERVAL = 0.5   # seconds between rows (2 Hz)
 
 _STATE_LOG_LABELS = {0: 'IDLE', 1: 'ARMING', 2: 'ARMED', 3: 'FLYING', 4: 'LANDING', 5: 'FAULT'}
-_MODE_LOG_LABELS  = {0: 'STAB', 1: 'ALTH',   2: 'POSH',  3: 'AUTO',   4: 'RTH',     5: 'LAND'}
+_MODE_LOG_LABELS  = {0: 'STAB', 1: 'ALTH',   2: 'POSH',  3: 'AUTO',   4: 'RTH',     5: 'LAND', 6: 'FOLW'}
 
 _LOG_HEADER = (
     'time,state,mode,armed,lat,lon,alt_m,roll_deg,pitch_deg,hdg_deg,'

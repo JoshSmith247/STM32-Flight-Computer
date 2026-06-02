@@ -6,10 +6,14 @@ import cv2
 import numpy as np
 
 import config
-from dashboard import draw_stats_panel
+from dashboard import draw_stats_panel, _ui_state
 from exg import exg_candidates, exg_mask
-from mavlink import send_weed_target
+from follow import PersonTracker
+from mavlink import _mav_lock, _mav_state, send_follow_target, send_weed_target
 from tracker import WeedTracker
+
+_FOLLOW_MODE_ID = 6   # FlightMode::FollowMe discriminant in STM32 heartbeat
+_WEED_MODE_ID   = 3   # FlightMode::Auto — only mode that runs ExG detection
 
 _LOGS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
 
@@ -95,10 +99,13 @@ class FrameGrabber:
 
     The thread runs as fast as the decoder allows, always keeping only the
     latest decoded frame.  Main loop calls read() to get it without waiting.
+    Pass loop=True for local video files so the stream restarts at end-of-file
+    instead of terminating (mimics a live camera feed for development).
     """
 
-    def __init__(self, cap: cv2.VideoCapture) -> None:
+    def __init__(self, cap: cv2.VideoCapture, loop: bool = False) -> None:
         self._cap   = cap
+        self._loop  = loop
         self._frame: np.ndarray | None = None
         self._ok    = True
         self._lock  = threading.Lock()
@@ -108,6 +115,9 @@ class FrameGrabber:
         while True:
             ok, frame = self._cap.read()
             if not ok:
+                if self._loop:
+                    self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    continue
                 with self._lock:
                     self._ok = False
                 break
@@ -133,9 +143,11 @@ class _Renderer:
     ~8 ms regardless of how long a frame takes to process.
     """
 
-    def __init__(self, tracker: WeedTracker, disp_w: int, disp_h: int,
+    def __init__(self, tracker: WeedTracker, person: PersonTracker,
+                 disp_w: int, disp_h: int,
                  no_stream_img, btn_rect_out: list) -> None:
         self._tracker  = tracker
+        self._person   = person
         self._disp_w   = disp_w
         self._disp_h   = disp_h
         self._nsi      = no_stream_img
@@ -159,8 +171,9 @@ class _Renderer:
         self._vid_y_off = 0
 
         self._recorder: _VideoRecorder | None = None
-
-        threading.Thread(target=self._run, daemon=True).start()
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
 
     def attach_grabber(self, grabber: FrameGrabber) -> None:
         with self._lock:
@@ -186,6 +199,7 @@ class _Renderer:
                     self._vid_seq, self._sidebar_seq, self._stats_seq)
 
     def release(self) -> None:
+        self._stop = True   # signal _run to exit its loop
         with self._lock:
             g = self._grabber
             self._grabber     = None
@@ -198,20 +212,30 @@ class _Renderer:
     def _run(self) -> None:
         # Cached panels — rebuilt only when content changes, not every frame.
         _sidebar:       np.ndarray | None = None
-        _sidebar_key    = (-1, None)          # (n_weeds, selected_wid)
+        _sidebar_key    = (-1, None)
         _stats:         np.ndarray | None = None
-        _stats_next_t   = 0.0                 # next time to redraw stats (10 fps cap)
-        _STATS_INTERVAL = 0.10                # seconds between stats redraws
+        _stats_next_t   = 0.0
+        _STATS_INTERVAL = 0.10
+        _last_follow_t  = 0.0   # time of last send_follow_target call
+        _last_detections: list = []
 
-        while True:
+        while not self._stop:
             with self._lock:
                 grabber = self._grabber
                 alive   = self.stream_alive
 
+            _running    = _ui_state.get('running_prog')
+            follow_mode = (_running == config.PROG_FOLLOW_ME)
+            weed_mode   = (_running == config.PROG_WEED_PICK)
+
             # ── Rebuild cached panels only when needed ────────────────────────
-            sidebar_key = (len(self._tracker._named), self._tracker._selected_wid)
+            if follow_mode:
+                sidebar_key = ('follow', self._person._tracked, self._person._lost_frames)
+            else:
+                sidebar_key = (len(self._tracker._named), self._tracker._selected_wid)
             if _sidebar is None or sidebar_key != _sidebar_key:
-                _sidebar     = self._tracker.draw_sidebar(self._disp_h)
+                _sidebar = (self._person.draw_sidebar(self._disp_h) if follow_mode
+                            else self._tracker.draw_sidebar(self._disp_h))
                 _sidebar_key = sidebar_key
                 with self._lock:
                     self._sidebar_arr = _sidebar
@@ -249,17 +273,43 @@ class _Renderer:
 
             frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
 
-            mask  = exg_mask(frame)
-            blobs = exg_candidates(mask)
-            self._tracker.process_click(frame)
-            self._tracker.propagate_named(frame, blobs)
-            self._tracker.update_exg(blobs)
-            display = self._tracker.draw(frame, blobs)
+            if follow_mode:
+                # ── Follow Me: YOLO person detection + IoU tracking ───────────
+                # process_frame() is non-blocking: it queues the frame for the
+                # background inference thread and immediately returns the last
+                # available detections, so this thread is never stalled.
+                detections = self._person.process_frame(frame)
+                if detections != _last_detections:
+                    self._person.process_click(detections)
+                    self._person.update(detections)
+                    _last_detections = detections
 
-            if self.show_exg:
-                tint = np.zeros_like(display)
-                tint[:, :, 1] = mask
-                display = cv2.addWeighted(display, 1.0, tint, 0.4, 0)
+                now = time.monotonic()
+                if (now - _last_follow_t >= 1.0 / config.FOLLOW_SEND_HZ
+                        and self._person._tracked is not None
+                        and self._person._lost_frames == 0):
+                    wp = self._person.get_follow_target(1.0 / config.FOLLOW_SEND_HZ)
+                    if wp is not None:
+                        send_follow_target(wp[0], wp[1])
+                    _last_follow_t = now
+
+                display = self._person.draw(frame, detections)
+            elif weed_mode:
+                # ── Weed Picker: Excess Green detection + optical-flow tracking
+                mask  = exg_mask(frame)
+                blobs = exg_candidates(mask)
+                self._tracker.process_click(frame)
+                self._tracker.propagate_named(frame, blobs)
+                self._tracker.update_exg(blobs)
+                display = self._tracker.draw(frame, blobs)
+
+                if self.show_exg:
+                    tint = np.zeros_like(display)
+                    tint[:, :, 1] = mask
+                    display = cv2.addWeighted(display, 1.0, tint, 0.4, 0)
+            else:
+                # ── No detection (manual, altitude hold, RTH, etc.) ───────────
+                display = frame.copy()
 
             # Start/stop recorder based on runtime flag
             want_rec = config.RECORD_ACTIVE
@@ -288,31 +338,45 @@ class _Renderer:
             self._vid_x_off = x_off   # physical px
             self._vid_y_off = y_off
 
-            n_active = sum(1 for w in self._tracker._named.values()
-                           if w['lost_frames'] == 0)
-            n_lost   = len(self._tracker._named) - n_active
-            hud = f"ExG blobs: {len(blobs)}"
-            if n_active:
-                hud += f"  |  named: {n_active}"
-            if n_lost:
-                hud += f"  |  searching: {n_lost}"
-            cv2.putText(display, hud, (9 * pr, 23 * pr),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5 * pr, (0, 0, 0),
-                        max(1, pr), cv2.LINE_AA)
-            cv2.putText(display, hud, (8 * pr, 22 * pr),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5 * pr, (220, 220, 220),
-                        max(1, pr), cv2.LINE_AA)
-
-            sel = self._tracker._selected_wid
-            if sel != self._prev_sel:
-                self._prev_sel = sel
-                if sel is not None:
-                    wp = self._tracker._named.get(sel, {}).get('world_pos')
-                    if wp is not None:
-                        send_weed_target(sel, wp[0], wp[1])
+            if follow_mode:
+                n   = len(detections)
+                hud = f"Persons: {n}"
+                if self._person._tracked is not None:
+                    if self._person._lost_frames == 0:
+                        spd = self._person.ground_speed_ms
+                        hud += f"  |  FOLLOWING  {spd:.1f}m/s" if spd > 0.15 else "  |  FOLLOWING"
                     else:
-                        print(f"W{sel} selected — no GPS fix yet, target not sent",
-                              flush=True)
+                        hud += "  |  SEARCHING"
+            elif weed_mode:
+                n_active = sum(1 for w in self._tracker._named.values()
+                               if w['lost_frames'] == 0)
+                n_lost   = len(self._tracker._named) - n_active
+                hud = f"ExG blobs: {len(blobs)}"
+                if n_active:
+                    hud += f"  |  named: {n_active}"
+                if n_lost:
+                    hud += f"  |  searching: {n_lost}"
+            else:
+                hud = ""
+            if hud:
+                cv2.putText(display, hud, (9 * pr, 23 * pr),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5 * pr, (0, 0, 0),
+                            max(1, pr), cv2.LINE_AA)
+                cv2.putText(display, hud, (8 * pr, 22 * pr),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5 * pr, (220, 220, 220),
+                            max(1, pr), cv2.LINE_AA)
+
+            if weed_mode:
+                sel = self._tracker._selected_wid
+                if sel != self._prev_sel:
+                    self._prev_sel = sel
+                    if sel is not None:
+                        wp = self._tracker._named.get(sel, {}).get('world_pos')
+                        if wp is not None:
+                            send_weed_target(sel, wp[0], wp[1])
+                        else:
+                            print(f"W{sel} selected — no GPS fix yet, target not sent",
+                                  flush=True)
 
             with self._lock:
                 self._vid_arr = display

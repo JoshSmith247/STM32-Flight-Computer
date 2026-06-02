@@ -265,6 +265,14 @@ pub async fn navigation_task() {
             info!("Home set: lat={=f64} lon={=f64}", gps.lat_deg, gps.lon_deg);
         }
 
+        // Apply a DO_SET_HOME override from the GCS (MAV_CMD_DO_SET_HOME / cmd 179).
+        // Overwrites the auto-captured home, allowing the operator to reset RTH origin mid-flight.
+        if let Some(new_home) = STATE.home_override.lock().await.take() {
+            mission.home = new_home;
+            home_set = true;
+            info!("Home overridden by GCS: lat={=f64} lon={=f64}", new_home.lat_deg, new_home.lon_deg);
+        }
+
         // Fault state: force Land; auto-disarm at touch-down
         if state::get() == state::FlightState::Fault {
             let agl = if flow.valid && flow.height_mm > 0 && flow.height_mm <= FLOW_MAX_HEIGHT_MM {
@@ -306,7 +314,8 @@ pub async fn navigation_task() {
                 FlightMode::Land
             }
         } else if last_gps_ok.elapsed() > Duration::from_secs(5)
-            && matches!(mode, FlightMode::PositionHold | FlightMode::Auto | FlightMode::ReturnToHome)
+            && matches!(mode, FlightMode::PositionHold | FlightMode::Auto
+                             | FlightMode::ReturnToHome | FlightMode::FollowMe)
         {
             warn!("GPS fix lost >5s — forcing AltitudeHold");
             FlightMode::AltitudeHold
@@ -322,6 +331,11 @@ pub async fn navigation_task() {
             wp_arrived_at = None;
             if weed_pull_timer.take().is_some() {
                 STATE.servo_outputs.lock().await.s1 = 0.0;
+                STATE.weed_target.lock().await.valid = false;
+            }
+            // Clear any stale follow/weed target when leaving Follow Me so Auto
+            // mode doesn't immediately fly to the last person position.
+            if prev_mode == FlightMode::FollowMe {
                 STATE.weed_target.lock().await.valid = false;
             }
 
@@ -343,6 +357,12 @@ pub async fn navigation_task() {
                 }
                 FlightMode::Land => {
                     land_target = baro.altitude_m;
+                }
+                FlightMode::FollowMe => {
+                    hold_alt = baro.altitude_m;
+                    hold_pos = pos;
+                    STATE.weed_target.lock().await.valid = false;
+                    info!("FollowMe: holding {=f32}m, fly to desired height first", hold_alt);
                 }
                 _ => {}
             }
@@ -476,6 +496,29 @@ pub async fn navigation_task() {
                         // Unreachable: !is_complete() guarantees current < count.
                         NavCommand { autonomous: false, ..Default::default() }
                     }
+                }
+            }
+
+            // ── FollowMe: continuously track GCS person position at fixed alt ──
+            FlightMode::FollowMe => {
+                if !gps.fix_ok {
+                    warn!("FollowMe: no GPS fix");
+                    NavCommand { autonomous: false, ..Default::default() }
+                } else {
+                    // Consume the latest position target from the Pi.
+                    // hold_alt (baro, captured at mode entry) is used for altitude
+                    // so the drone stays at the operator's chosen height regardless
+                    // of the GPS MSL value in the target message.
+                    {
+                        let mut wt = STATE.weed_target.lock().await;
+                        if wt.valid {
+                            hold_pos.lat_deg = wt.position.lat_deg;
+                            hold_pos.lon_deg = wt.position.lon_deg;
+                            wt.valid = false;
+                        }
+                    }
+                    guide_to(hold_pos, pos, hold_alt, baro.altitude_m,
+                             yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
                 }
             }
 

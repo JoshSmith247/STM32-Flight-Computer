@@ -308,10 +308,28 @@ async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
         }
         20  => { STATE.rc_input.lock().await.mode = FlightMode::ReturnToHome; MAV_RESULT_ACCEPTED }
         21  => { STATE.rc_input.lock().await.mode = FlightMode::Land;         MAV_RESULT_ACCEPTED }
+        179 => {
+            // MAV_CMD_DO_SET_HOME — param1=1 means use current GPS position.
+            // param1=0 (explicit lat/lon) is not supported via this handler.
+            if param1 >= 0.5 {
+                let gps = *STATE.gps_fix.lock().await;
+                if gps.fix_ok {
+                    *STATE.home_override.lock().await = Some(gps.pos());
+                    info!("MAVLink: home set lat={=f64} lon={=f64}", gps.lat_deg, gps.lon_deg);
+                    MAV_RESULT_ACCEPTED
+                } else {
+                    warn!("MAVLink: DO_SET_HOME rejected — no GPS fix");
+                    MAV_RESULT_UNSUPPORTED
+                }
+            } else {
+                MAV_RESULT_UNSUPPORTED
+            }
+        }
         176 => {
             let mode = match param2 as u8 {
                 0 => FlightMode::Stabilise, 1 => FlightMode::AltitudeHold,
                 2 => FlightMode::PositionHold, 3 => FlightMode::Auto,
+                4 => FlightMode::FollowMe,
                 _ => return MAV_RESULT_UNSUPPORTED,
             };
             STATE.rc_input.lock().await.mode = mode;

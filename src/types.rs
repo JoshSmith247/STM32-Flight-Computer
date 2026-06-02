@@ -143,9 +143,10 @@ pub enum FlightMode {
     Stabilise,
     AltitudeHold,
     PositionHold,
-    Auto,           // Follow waypoint mission
+    Auto,           // Follow waypoint mission / weed picking
     ReturnToHome,
     Land,
+    FollowMe,       // Continuous person tracking via GCS YOLOv8; discriminant = 6
 }
 
 // ---------------------------------------------------------------------------
@@ -248,8 +249,11 @@ pub struct SharedState {
     pub flow:          Mutex<CriticalSectionRawMutex, FlowData>,
     pub servo_outputs: Mutex<CriticalSectionRawMutex, ServoOutputs>,
     pub mag_data:      Mutex<CriticalSectionRawMutex, MagData>,
-    pub payload_flags: Mutex<CriticalSectionRawMutex, u32>,
-    pub weed_target:   Mutex<CriticalSectionRawMutex, WeedTarget>,
+    pub payload_flags:  Mutex<CriticalSectionRawMutex, u32>,
+    pub weed_target:    Mutex<CriticalSectionRawMutex, WeedTarget>,
+    /// Written by telemetry_task when MAV_CMD_DO_SET_HOME (179) arrives.
+    /// Consumed (take()) by navigation_task to update mission.home.
+    pub home_override:  Mutex<CriticalSectionRawMutex, Option<LatLonAlt>>,
 }
 
 impl SharedState {
@@ -267,8 +271,9 @@ impl SharedState {
             flow:          Mutex::new(FlowData { quality:0, vel_x_mrad_s:0, vel_y_mrad_s:0, height_mm:-1, valid:false }),
             servo_outputs: Mutex::new(ServoOutputs { s1:0.0, s2:0.0, s3:0.0, s4:0.0 }),
             mag_data:      Mutex::new(MagData { x:0.0, y:0.0, z:0.0, heading_rad:0.0, valid:false }),
-            payload_flags: Mutex::new(0u32),
-            weed_target:   Mutex::new(WeedTarget { position: LatLonAlt { lat_deg:0.0, lon_deg:0.0, alt_m:0.0 }, valid: false }),
+            payload_flags:  Mutex::new(0u32),
+            weed_target:    Mutex::new(WeedTarget { position: LatLonAlt { lat_deg:0.0, lon_deg:0.0, alt_m:0.0 }, valid: false }),
+            home_override:  Mutex::new(None),
         }
     }
 }
