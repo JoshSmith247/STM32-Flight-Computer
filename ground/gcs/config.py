@@ -31,6 +31,7 @@ MAX_LOST_FRAMES    = 90      # frames (~3 s at 30 fps) before a lost named weed 
 CAM_HFOV           = float(os.environ.get('CAM_HFOV',           '62.0'))  # camera horizontal FOV, degrees
 WORLD_REMATCH_DIST = float(os.environ.get('WORLD_REMATCH_DIST',  '0.4'))  # metres radius for position-based re-ID
 CRUISE_ALT         = float(os.environ.get('CRUISE_ALT',          '10.0')) # target cruise altitude above ground, metres
+EXTRACT_ALT_AGL_M  = float(os.environ.get('EXTRACT_ALT_AGL',      '0.4'))  # AGL to descend to for weed extraction
 
 GST_PIPELINE = (
     f"udpsrc port={VIDEO_PORT} "

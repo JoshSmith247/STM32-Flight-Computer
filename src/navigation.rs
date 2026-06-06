@@ -22,6 +22,27 @@ use crate::{
     STATE,
 };
 
+// ── Weed extraction phases ────────────────────────────────────────────────────
+
+/// Seven-phase sequence executed each time a weed target is received in Auto mode.
+#[derive(Clone, Copy, PartialEq)]
+enum WeedPhase {
+    /// Fly to the weed lat/lon at cruise altitude before descending.
+    Approach,
+    /// Drone is overhead; descend to extract_alt_m using rangefinder when available.
+    Descend,
+    /// Hold at extraction altitude for WEED_STABILIZE_MS before actuating.
+    Stabilize,
+    /// Servo deployed — hold position and altitude for WEED_PULL_MS.
+    Extract,
+    /// Servo still gripping — climb back to cruise altitude with weed.
+    Ascend,
+    /// At cruise altitude — fly to home (bin) position.
+    Dispose,
+    /// Over the bin — descend to BIN_DROP_ALT_M and release.
+    DisposeDescend,
+}
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 pub const MAX_WAYPOINTS: usize = 32;
@@ -35,9 +56,17 @@ const MAX_TILT_RAD:      f32 = 0.436;         // 25°
 const RTH_MIN_ALT_M:     f32 = 15.0;         // RTH cruise altitude floor
 const HOME_ARRIVE_M:     f32 = 5.0;          // switch RTH → descend within this radius
 const YAW_TRACK_KP:      f32 = 0.8;          // rad/s per rad heading error
-const FLOW_DAMP_KP:      f32 = 0.3;          // rad/(m/s) — velocity damping gain in PositionHold
-const FLOW_MAX_HEIGHT_MM: i32 = 5_000;       // MTF-02P reliable range ceiling (5 m)
-const DT:                f32 = 1.0 / 100.0;
+const FLOW_DAMP_KP:       f32 = 0.3;          // rad/(m/s) — velocity damping gain in PositionHold
+const FLOW_MAX_HEIGHT_MM: i32 = 5_000;        // MTF-02P reliable range ceiling (5 m)
+const DT:                 f32 = 1.0 / 100.0;
+
+// Weed extraction sequence
+const WEED_ARRIVE_M:      f32  = 1.5;         // horizontal arrival radius (GPS-realistic)
+const WEED_ALT_BAND_M:    f32  = 0.15;        // "at extraction altitude" tolerance
+const WEED_STABILIZE_MS:  u64  = 1_000;       // hover at extraction alt before actuating
+const WEED_PULL_MS:       u64  = 500;         // servo hold duration
+const WEED_ASCEND_NEAR_M: f32  = 1.0;         // within this of approach alt → ascent complete
+const BIN_DROP_ALT_M:     f32  = 0.5;         // AGL to descend to over bin before releasing
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -220,16 +249,18 @@ pub async fn navigation_task() {
     let mut nav_pid_n = PosPid::new();
     let mut nav_pid_e = PosPid::new();
 
-    let mut hold_alt:        f32             = 0.0;
-    let mut hold_pos:        LatLonAlt       = Default::default();
-    let mut rth_cruise_alt:  f32             = 0.0;
-    let mut land_target:     f32             = 0.0;
-    let mut rth_landing:     bool            = false;
-    let mut wp_arrived_at:   Option<Instant> = None;
-    let mut weed_pull_timer: Option<Instant> = None;
-    let mut prev_mode:       FlightMode      = FlightMode::Stabilise;
-    let mut home_set:        bool            = false;
-    let mut last_gps_ok:     Instant         = Instant::now();
+    let mut hold_alt:         f32                  = 0.0;
+    let mut hold_pos:         LatLonAlt            = Default::default();
+    let mut rth_cruise_alt:   f32                  = 0.0;
+    let mut land_target:      f32                  = 0.0;
+    let mut rth_landing:      bool                 = false;
+    let mut wp_arrived_at:    Option<Instant>      = None;
+    let mut weed_phase:       Option<WeedPhase>    = None;
+    let mut weed_approach_alt: f32                 = 0.0;
+    let mut weed_phase_timer: Option<Instant>      = None;
+    let mut prev_mode:        FlightMode           = FlightMode::Stabilise;
+    let mut home_set:         bool                 = false;
+    let mut last_gps_ok:      Instant              = Instant::now();
 
     info!("Navigation task started (100 Hz)");
     let mut ticker = Ticker::every(Duration::from_hz(100));
@@ -327,9 +358,10 @@ pub async fn navigation_task() {
         if effective_mode != prev_mode {
             alt_pid.reset();
             nav_pid_n.reset(); nav_pid_e.reset();
-            rth_landing   = false;
-            wp_arrived_at = None;
-            if weed_pull_timer.take().is_some() {
+            rth_landing      = false;
+            wp_arrived_at    = None;
+            weed_phase_timer = None;
+            if weed_phase.take().is_some() {
                 STATE.servo_outputs.lock().await.s1 = 0.0;
                 STATE.weed_target.lock().await.valid = false;
             }
@@ -443,30 +475,118 @@ pub async fn navigation_task() {
                     NavCommand { autonomous: false, ..Default::default() }
                 } else {
                     let weed = *STATE.weed_target.lock().await;
-                    let mut weed_valid = weed.valid;
 
-                    // Expire the pull timer: release servo and clear target
-                    if let Some(t) = weed_pull_timer {
-                        if t.elapsed() >= Duration::from_millis(500) {
-                            STATE.servo_outputs.lock().await.s1 = 0.0;
-                            STATE.weed_target.lock().await.valid = false;
-                            weed_pull_timer = None;
-                            weed_valid = false;
-                            info!("Weed pull complete — target cleared");
-                        }
+                    // Use rangefinder AGL when within reliable range; fall back to baro.
+                    let agl = if flow.valid && flow.height_mm > 0
+                                && flow.height_mm <= FLOW_MAX_HEIGHT_MM {
+                        flow.height_mm as f32 / 1000.0
+                    } else {
+                        baro.altitude_m
+                    };
+
+                    // Transition: new target arrived → start Approach phase.
+                    if weed.valid && weed_phase.is_none() {
+                        weed_approach_alt = baro.altitude_m;
+                        weed_phase        = Some(WeedPhase::Approach);
+                        weed_phase_timer  = None;
+                        info!("Weed sequence start — approach alt {=f32}m", weed_approach_alt);
                     }
 
-                    if weed_valid || weed_pull_timer.is_some() {
-                        // Fly to weed; actuate servo on arrival
-                        let dist = haversine_m(pos, weed.position);
-                        if weed_valid && weed_pull_timer.is_none() && dist < 0.5 {
-                            STATE.servo_outputs.lock().await.s1 = 1.0;
-                            weed_pull_timer = Some(Instant::now());
-                            info!("Weed reached (dist={=f32}m) — servo actuated", dist);
-                        }
-                        // Hold the weed target's altitude (set when the target was received).
-                        guide_to(weed.position, pos, weed.position.alt_m, baro.altitude_m,
-                                 yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
+                    if let Some(phase) = weed_phase {
+                        let cmd = match phase {
+                            // ── Phase 1: fly to weed lat/lon at cruise altitude ──
+                            WeedPhase::Approach => {
+                                let dist = haversine_m(pos, weed.position);
+                                if dist < WEED_ARRIVE_M {
+                                    weed_phase       = Some(WeedPhase::Descend);
+                                    weed_phase_timer = None;
+                                    info!("Weed overhead (dist={=f32}m) — descending to {=f32}m AGL",
+                                          dist, weed.extract_alt_m);
+                                }
+                                guide_to(weed.position, pos, weed_approach_alt, baro.altitude_m,
+                                         yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
+                            }
+
+                            // ── Phase 2: descend to extraction altitude ──────────
+                            WeedPhase::Descend => {
+                                if agl < weed.extract_alt_m + WEED_ALT_BAND_M {
+                                    weed_phase       = Some(WeedPhase::Stabilize);
+                                    weed_phase_timer = Some(Instant::now());
+                                    info!("Extraction altitude reached ({=f32}m) — stabilising",
+                                          agl);
+                                }
+                                guide_to(weed.position, pos, weed.extract_alt_m, agl,
+                                         yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
+                            }
+
+                            // ── Phase 3: hold for oscillations to damp out ───────
+                            WeedPhase::Stabilize => {
+                                let elapsed = weed_phase_timer
+                                    .map_or(0, |t| t.elapsed().as_millis() as u64);
+                                if elapsed >= WEED_STABILIZE_MS {
+                                    STATE.servo_outputs.lock().await.s1 = 1.0;
+                                    weed_phase       = Some(WeedPhase::Extract);
+                                    weed_phase_timer = Some(Instant::now());
+                                    info!("Stabilised — servo deployed");
+                                }
+                                guide_to(weed.position, pos, weed.extract_alt_m, agl,
+                                         yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
+                            }
+
+                            // ── Phase 4: servo deployed, hold for pull duration ──
+                            WeedPhase::Extract => {
+                                let elapsed = weed_phase_timer
+                                    .map_or(0, |t| t.elapsed().as_millis() as u64);
+                                if elapsed >= WEED_PULL_MS {
+                                    // Keep s1 = 1.0 — maintain grip while ascending.
+                                    weed_phase       = Some(WeedPhase::Ascend);
+                                    weed_phase_timer = None;
+                                    info!("Weed grabbed — ascending to {=f32}m with payload",
+                                          weed_approach_alt);
+                                }
+                                guide_to(weed.position, pos, weed.extract_alt_m, agl,
+                                         yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
+                            }
+
+                            // ── Phase 5: climb to cruise alt, still gripping ─────
+                            WeedPhase::Ascend => {
+                                if agl > weed_approach_alt - WEED_ASCEND_NEAR_M {
+                                    nav_pid_n.reset(); nav_pid_e.reset();
+                                    weed_phase       = Some(WeedPhase::Dispose);
+                                    weed_phase_timer = None;
+                                    info!("At cruise alt — flying home to drop weed");
+                                }
+                                guide_to(weed.position, pos, weed_approach_alt, agl,
+                                         yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
+                            }
+
+                            // ── Phase 6: fly to home (bin) at cruise altitude ────
+                            WeedPhase::Dispose => {
+                                let dist_home = haversine_m(pos, mission.home);
+                                if dist_home < WEED_ARRIVE_M {
+                                    nav_pid_n.reset(); nav_pid_e.reset();
+                                    weed_phase = Some(WeedPhase::DisposeDescend);
+                                    info!("Over bin — descending to {=f32}m to drop",
+                                          BIN_DROP_ALT_M);
+                                }
+                                guide_to(mission.home, pos, weed_approach_alt, agl,
+                                         yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
+                            }
+
+                            // ── Phase 7: descend over bin, release, done ──────────
+                            WeedPhase::DisposeDescend => {
+                                if agl < BIN_DROP_ALT_M + WEED_ALT_BAND_M {
+                                    STATE.servo_outputs.lock().await.s1 = 0.0;
+                                    STATE.weed_target.lock().await.valid = false;
+                                    weed_phase       = None;
+                                    weed_phase_timer = None;
+                                    info!("Weed released into bin — resuming mission");
+                                }
+                                guide_to(mission.home, pos, BIN_DROP_ALT_M, agl,
+                                         yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
+                            }
+                        };
+                        cmd
                     } else if mission.is_complete() {
                         // Hold current position once mission is done
                         guide_to(pos, pos, baro.altitude_m, baro.altitude_m,

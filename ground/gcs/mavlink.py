@@ -91,11 +91,15 @@ def send_weed_target(wid: int, east_m: float, north_m: float) -> None:
     pixel_to_world() returns absolute ENU from the GPS origin, but the STM32 interprets
     SET_POSITION_TARGET_LOCAL_NED as an offset from the drone's current position.
     Subtract the drone's current ENU position so the Pi forwards correct relative offsets.
+
+    ned_d (down) = drone_agl - EXTRACT_ALT_AGL_M so the STM32 descends to extraction
+    altitude.  Clamped to ≥ 0 so we never command an upward jump on a low-flying drone.
     """
     with _mav_lock:
-        orig = _mav_state['origin']
-        lat  = _mav_state['lat']
-        lon  = _mav_state['lon']
+        orig      = _mav_state['origin']
+        lat       = _mav_state['lat']
+        lon       = _mav_state['lon']
+        drone_agl = _mav_state['alt']
     if lat is None or orig is None:
         print(f"W{wid} target not sent: no GPS fix", flush=True)
         return
@@ -104,12 +108,13 @@ def send_weed_target(wid: int, east_m: float, north_m: float) -> None:
     drone_n = math.radians(lat - orig[0]) * R
     rel_e = east_m - drone_e
     rel_n = north_m - drone_n
+    ned_d = max(0.0, round(drone_agl - config.EXTRACT_ALT_AGL_M, 3))
     msg = json.dumps({'wid': wid, 'east_m': round(rel_e, 3),
-                      'north_m': round(rel_n, 3)}).encode()
+                      'north_m': round(rel_n, 3), 'ned_d': ned_d}).encode()
     try:
         _target_sock.sendto(msg, (config.PI_IP, config.WEED_TARGET_PORT))
-        print(f"Sent W{wid} → Pi: {rel_e:+.2f}m E, {rel_n:+.2f}m N  "
-              f"(abs {east_m:.2f}E {north_m:.2f}N)", flush=True)
+        print(f"Sent W{wid} → Pi: {rel_e:+.2f}m E, {rel_n:+.2f}m N, "
+              f"ned_d={ned_d:.2f}m  (extract at {config.EXTRACT_ALT_AGL_M}m AGL)", flush=True)
     except OSError as exc:
         print(f"UDP send failed: {exc}", flush=True)
 

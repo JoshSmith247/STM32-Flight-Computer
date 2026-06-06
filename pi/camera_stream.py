@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-H.264 camera stream: Arducam OV9782 (USB/UVC) → RTP/UDP to GCS laptop.
+H.264 camera stream: Arducam OV9782 (USB/UVC) → MPEG-TS/UDP to GCS laptop.
 
 The OV9782 is a USB UVC camera — it appears as /dev/video0 (or similar).
 Uses ffmpeg v4l2 capture + libx264 encoding in a single process.
@@ -9,11 +9,10 @@ Install on Pi:
     sudo apt install ffmpeg
 
 Receive on laptop:
-    ffplay rtp://0.0.0.0:5600
+    ffplay udp://@0.0.0.0:5600
     # or GStreamer:
     gst-launch-1.0 udpsrc port=5600 \
-      caps="application/x-rtp,media=video,encoding-name=H264,payload=96" \
-      ! rtph264depay ! avdec_h264 ! autovideosink
+      ! tsdemux ! h264parse ! avdec_h264 ! autovideosink
 
 Usage:
     python3 camera_stream.py [LAPTOP_IP]

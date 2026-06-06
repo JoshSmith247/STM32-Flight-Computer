@@ -729,21 +729,28 @@ pub async fn telemetry_task(
                                 continue;
                             }
 
-                            let gps = *STATE.gps_fix.lock().await;
+                            let gps  = *STATE.gps_fix.lock().await;
+                            let baro = *STATE.baro_data.lock().await;
                             if gps.fix_ok {
                                 let lat_rad   = (gps.lat_deg as f32).to_radians();
                                 let target_lat = gps.lat_deg + (ned_n as f64) / 111_320.0;
                                 let target_lon = gps.lon_deg
                                     + (ned_e as f64) / (111_320.0 * libm::cosf(lat_rad) as f64);
                                 let target_alt = gps.alt_m - ned_d;
+                                // Extraction altitude in baro AGL: current AGL minus the
+                                // requested downward offset. Clamped to 0.1 m so the drone
+                                // can never be commanded into the ground by a bad ned_d.
+                                let extract_alt_m = (baro.altitude_m - ned_d).max(0.1);
                                 let mut wt = STATE.weed_target.lock().await;
                                 wt.position = LatLonAlt {
                                     lat_deg: target_lat,
                                     lon_deg: target_lon,
                                     alt_m:   target_alt,
                                 };
+                                wt.extract_alt_m = extract_alt_m;
                                 wt.valid = true;
-                                info!("Weed target set: {=f32}m N, {=f32}m E", ned_n, ned_e);
+                                info!("Weed target set: {=f32}m N, {=f32}m E, extract at {=f32}m AGL",
+                                      ned_n, ned_e, extract_alt_m);
                             } else {
                                 warn!("Weed target dropped: no GPS fix");
                             }

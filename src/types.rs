@@ -220,13 +220,16 @@ pub struct ServoOutputs {
 /// message arrives from the Pi. Cleared by navigation_task after servo actuation.
 #[derive(Clone, Copy, defmt::Format)]
 pub struct WeedTarget {
-    pub position: LatLonAlt,
-    pub valid:    bool,
+    pub position:     LatLonAlt,
+    /// Barometer AGL altitude (metres) to descend to for extraction.
+    /// Computed in telemetry_task as baro.altitude_m − ned_d at receive time.
+    pub extract_alt_m: f32,
+    pub valid:        bool,
 }
 
 impl Default for WeedTarget {
     fn default() -> Self {
-        Self { position: LatLonAlt::default(), valid: false }
+        Self { position: LatLonAlt::default(), extract_alt_m: 0.4, valid: false }
     }
 }
 
@@ -272,7 +275,7 @@ impl SharedState {
             servo_outputs: Mutex::new(ServoOutputs { s1:0.0, s2:0.0, s3:0.0, s4:0.0 }),
             mag_data:      Mutex::new(MagData { x:0.0, y:0.0, z:0.0, heading_rad:0.0, valid:false }),
             payload_flags:  Mutex::new(0u32),
-            weed_target:    Mutex::new(WeedTarget { position: LatLonAlt { lat_deg:0.0, lon_deg:0.0, alt_m:0.0 }, valid: false }),
+            weed_target:    Mutex::new(WeedTarget { position: LatLonAlt { lat_deg:0.0, lon_deg:0.0, alt_m:0.0 }, extract_alt_m: 0.4, valid: false }),
             home_override:  Mutex::new(None),
         }
     }

@@ -2,21 +2,15 @@
 #![no_main]
 
 mod ahrs;
-mod baro;
-mod battery;
-mod flow;
-mod gps;
-mod imu;
-mod led;
-mod mag;
-mod motor;
 mod navigation;
 mod pid;
-mod rc;
-mod payloads;
 mod state;
 mod telemetry;
 mod types;
+
+mod sensors;    // baro, battery, flow, gps, imu, mag, rc
+mod actuators;  // motor, servo
+mod status;     // led
 
 use embassy_executor::Spawner;
 use embassy_stm32::{bind_interrupts, gpio::{Level, Output, Speed}, mode::Async, spi::{self, Spi}, time::Hertz};
@@ -221,20 +215,20 @@ async fn main(spawner: Spawner) {
 
     let led = Output::new(p.PG7, Level::High, Speed::Low); // active-low: start HIGH = off
 
-    spawner.spawn(led::led_task(led).unwrap());
-    spawner.spawn(imu::imu_task(p.PA4).unwrap());
-    spawner.spawn(motor::motor_task(p.TIM3, p.PB4, p.PB5, p.PB0, p.PB1).unwrap());
-    spawner.spawn(rc::rc_task(p.USART2, p.PA2, p.PA3, p.DMA1_CH5, Irqs).unwrap());
+    spawner.spawn(status::led::led_task(led).unwrap());
+    spawner.spawn(sensors::imu::imu_task(p.PA4).unwrap());
+    spawner.spawn(actuators::motor::motor_task(p.TIM3, p.PB4, p.PB5, p.PB0, p.PB1).unwrap());
+    spawner.spawn(sensors::rc::rc_task(p.USART2, p.PA2, p.PA3, p.DMA1_CH5, Irqs).unwrap());
     spawner.spawn(telemetry::telemetry_task(p.USART3, p.PB11, p.PB10, p.DMA1_CH3, p.DMA1_CH1, Irqs).unwrap());
-    spawner.spawn(baro::baro_task(p.PA8).unwrap());
-    spawner.spawn(gps::gps_task(p.USART1, p.PA10, p.PA9, p.DMA2_CH6, p.DMA2_CH5, Irqs).unwrap());
-    spawner.spawn(battery::battery_task(p.ADC3, p.PC0).unwrap());
+    spawner.spawn(sensors::baro::baro_task(p.PA8).unwrap());
+    spawner.spawn(sensors::gps::gps_task(p.USART1, p.PA10, p.PA9, p.DMA2_CH6, p.DMA2_CH5, Irqs).unwrap());
+    spawner.spawn(sensors::battery::battery_task(p.ADC3, p.PC0).unwrap());
     spawner.spawn(navigation::navigation_task().unwrap());
     spawner.spawn(control_task().unwrap());
     spawner.spawn(arming_task().unwrap());
-    spawner.spawn(flow::flow_task(p.UART4, p.PC11, p.DMA1_CH2, Irqs).unwrap());
-    spawner.spawn(payloads::servo::servo_task(p.TIM4, p.PD12, p.PD13, p.PD14, p.PD15).unwrap());
-    spawner.spawn(mag::mag_task(p.I2C1, p.PB8, p.PB9).unwrap());
+    spawner.spawn(sensors::flow::flow_task(p.UART4, p.PC11, p.DMA1_CH2, Irqs).unwrap());
+    spawner.spawn(actuators::payloads::servo::servo_task(p.TIM4, p.PD12, p.PD13, p.PD14, p.PD15).unwrap());
+    spawner.spawn(sensors::mag::mag_task(p.I2C1, p.PB8, p.PB9).unwrap());
 
     state::set(FlightState::Idle);
 
@@ -249,7 +243,7 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     unsafe {
         // Send a zero DSHOT frame before halting so ESCs receive an explicit stop.
         // Spins ≤30 µs for any in-flight DMA to drain, then fires once and halts.
-        motor::emergency_stop();
+        actuators::motor::emergency_stop();
         // Turn off status LED (PG7, active-low: set ODR bit to drive HIGH = off)
         let gpiog = 0x40021800 as *mut u32;
         *gpiog.offset(5) = 1 << 7;

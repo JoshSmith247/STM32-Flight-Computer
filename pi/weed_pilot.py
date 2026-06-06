@@ -84,25 +84,26 @@ def _mavlink_crc(data: bytes, extra: int) -> int:
     return crc
 
 
-def _build_set_position_target_local_ned(seq: int, north_m: float, east_m: float) -> bytes:
+def _build_set_position_target_local_ned(seq: int, north_m: float, east_m: float,
+                                         down_m: float = 0.0) -> bytes:
     """Build a MAVLink v2 SET_POSITION_TARGET_LOCAL_NED frame (msg_id=84, CRC_EXTRA=143).
 
     Sends a position-only command (type_mask=0x0FF8) in MAV_FRAME_LOCAL_NED.
-    The drone will fly to (north_m, east_m) offset from its current position
-    while holding its current altitude (z=0.0, down=0 → no altitude change).
+    The drone will fly to (north_m, east_m, down_m) offset from its current position.
+    down_m > 0 commands a descent; 0.0 holds current altitude.
     """
     # MAVLink v2 wire format: fields sorted largest-first (all floats before u16/u8)
     payload = struct.pack(
         '<IfffffffffffHBBB',
-        _time_boot_ms(),                        # time_boot_ms          @0
-        float(north_m), float(east_m), 0.0,    # x(N), y(E), z(D=0)   @4,8,12
-        0.0, 0.0, 0.0,                          # vx, vy, vz (ignored)  @16,20,24
-        0.0, 0.0, 0.0,                          # afx, afy, afz         @28,32,36
-        0.0, 0.0,                               # yaw, yaw_rate         @40,44
-        0x0FF8,                                 # type_mask: pos only   @48
-        1,                                      # target_system         @50
-        1,                                      # target_component      @51
-        1,                                      # MAV_FRAME_LOCAL_NED   @52
+        _time_boot_ms(),                                    # time_boot_ms          @0
+        float(north_m), float(east_m), float(down_m),      # x(N), y(E), z(D)     @4,8,12
+        0.0, 0.0, 0.0,                                      # vx, vy, vz (ignored)  @16,20,24
+        0.0, 0.0, 0.0,                                      # afx, afy, afz         @28,32,36
+        0.0, 0.0,                                           # yaw, yaw_rate         @40,44
+        0x0FF8,                                             # type_mask: pos only   @48
+        1,                                                  # target_system         @50
+        1,                                                  # target_component      @51
+        1,                                                  # MAV_FRAME_LOCAL_NED   @52
     )
     n = len(payload)  # 53
     header = bytes([n, 0, 0, seq & 0xFF, PI_SYS_ID, PI_COMP_ID,
@@ -213,16 +214,18 @@ def _weed_target_listener(ser, ser_lock: threading.Lock) -> None:
             wid     = target['wid']
             east_m  = float(target['east_m'])
             north_m = float(target['north_m'])
-            print(f"Target W{wid}: {east_m:.2f}m E, {north_m:.2f}m N  (from {addr[0]})",
-                  flush=True)
+            down_m  = float(target.get('ned_d', 0.0))
+            print(f"Target W{wid}: {east_m:.2f}m E, {north_m:.2f}m N, "
+                  f"ned_d={down_m:.2f}m  (from {addr[0]})", flush=True)
             _log_event(event='target_received', wid=wid, east_m=east_m, north_m=north_m,
-                       from_ip=addr[0])
-            frame = _build_set_position_target_local_ned(_next_seq(), north_m, east_m)
+                       ned_d=down_m, from_ip=addr[0])
+            frame = _build_set_position_target_local_ned(_next_seq(), north_m, east_m, down_m)
             with ser_lock:
                 ser.write(frame)
             print(f"  → forwarded W{wid} to STM32 as SET_POSITION_TARGET_LOCAL_NED",
                   flush=True)
-            _log_event(event='target_forwarded', wid=wid, east_m=east_m, north_m=north_m)
+            _log_event(event='target_forwarded', wid=wid, east_m=east_m, north_m=north_m,
+                       ned_d=down_m)
         except socket.timeout:
             pass
         except (json.JSONDecodeError, KeyError) as exc:

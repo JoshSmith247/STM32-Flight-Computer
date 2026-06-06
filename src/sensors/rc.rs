@@ -3,6 +3,9 @@
 //! SBUS: 100 kbaud, 8E2, inverted logic (requires hardware inverter or
 //! STM32 USART inversion feature).
 //! Frame: 25 bytes — start 0x0F, 22 bytes channel data (16 × 11-bit), flags, end 0x00.
+//!
+//! Compatible receivers: any SBUS-output receiver, including BETAFPV ExpressLRS Lite
+//! (verify it is configured for SBUS output, not CRSF, before wiring).
 
 use embassy_stm32::{
     peripherals, Peri,
