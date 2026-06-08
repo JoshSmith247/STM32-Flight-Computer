@@ -136,6 +136,7 @@ _mav_state: dict = {
     'voltage_mv': -1, 'current_ca': -1,
     'mah_consumed': -1, 'time_remaining_s': 0,
     'motor_pwm': [0, 0, 0, 0],
+    'mag_x': 0, 'mag_y': 0, 'mag_z': 0,
     # Decoded from HEARTBEAT custom_mode (see telemetry.rs build_heartbeat)
     'flight_mode_id': 0,   # FlightMode enum value [7:0]
     'flight_state':   0,   # FlightState enum value [15:8]
@@ -164,7 +165,7 @@ def _mav_listener() -> None:
         msg = conn.recv_match(
             type=['GLOBAL_POSITION_INT', 'ATTITUDE', 'SYS_STATUS',
                   'HEARTBEAT', 'BATTERY_STATUS', 'SERVO_OUTPUT_RAW', 'COMMAND_ACK',
-                  'GPS_RAW_INT', 'VFR_HUD'],
+                  'GPS_RAW_INT', 'VFR_HUD', 'SCALED_IMU'],
             blocking=True, timeout=1.0)
         if msg is None:
             continue
@@ -210,6 +211,10 @@ def _mav_listener() -> None:
                     msg.servo1_raw, msg.servo2_raw,
                     msg.servo3_raw, msg.servo4_raw,
                 ]
+            elif msg.get_type() == 'SCALED_IMU':
+                _mav_state['mag_x'] = msg.xmag
+                _mav_state['mag_y'] = msg.ymag
+                _mav_state['mag_z'] = msg.zmag
             elif msg.get_type() == 'COMMAND_ACK':
                 _RESULT = {0: 'ACCEPTED', 1: 'DENIED', 2: 'UNSUPPORTED',
                            3: 'FAILED', 4: 'IN_PROGRESS'}
@@ -313,7 +318,8 @@ _MODE_LOG_LABELS  = {0: 'STAB', 1: 'ALTH',   2: 'POSH',  3: 'AUTO',   4: 'RTH', 
 
 _LOG_HEADER = (
     'time,state,mode,armed,lat,lon,alt_m,roll_deg,pitch_deg,hdg_deg,'
-    'spd_ms,climb_ms,batt_pct,volt_v,curr_a,thr_pct,m1_us,m2_us,m3_us,m4_us\n'
+    'spd_ms,climb_ms,batt_pct,volt_v,curr_a,thr_pct,m1_us,m2_us,m3_us,m4_us,'
+    'mag_x,mag_y,mag_z\n'
 )
 
 
@@ -357,6 +363,7 @@ def _log_writer(path: str) -> None:
                    f"{s['battery_pct']},{volt_v},{curr_a},"
                    f"{s['throttle_pct']},"
                    f"{s['motor_pwm'][0]},{s['motor_pwm'][1]},"
-                   f"{s['motor_pwm'][2]},{s['motor_pwm'][3]}\n")
+                   f"{s['motor_pwm'][2]},{s['motor_pwm'][3]},"
+                   f"{s['mag_x']},{s['mag_y']},{s['mag_z']}\n")
             f.write(row)
             f.flush()
