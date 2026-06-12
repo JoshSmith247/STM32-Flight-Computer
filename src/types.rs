@@ -172,8 +172,11 @@ pub struct NavCommand {
 // Motor outputs (DSHOT / PWM normalised 0.0 – 1.0)
 // ---------------------------------------------------------------------------
 
-/// Motor mixer output for a quad in X configuration.
-/// Motor order: front-right (CW), back-left (CW), front-left (CCW), back-right (CCW).
+/// Motor mixer output for a quad in X configuration. Fields map to:
+///   m1 front-right (CW)    m2 front-left (CCW)
+///   m3 back-right  (CCW)   m4 back-left  (CW)
+/// Diagonal pairs share rotation direction: {m1,m4} CW, {m2,m3} CCW.
+/// Spin direction must still be verified on the bench before first spin-up.
 #[derive(Clone, Copy, Default, defmt::Format)]
 pub struct MotorOutputs {
     pub m1: f32,

@@ -117,10 +117,14 @@ pub async fn baro_task(cs_pin: Peri<'static, peripherals::PA8>) {
 
     info!("Baro: MS5611 ready — C1={} C2={} C3={} C4={} C5={} C6={}", c1, c2, c3, c4, c5, c6);
 
-    // Approximate sea-level pressure (Pa). A real implementation would accept
-    // a QNH value from the GCS via MAVLink; this is sufficient for relative
-    // altitude tracking during a single flight.
-    let sea_level_pa: f32 = 101_325.0;
+    // Ground-level pressure reference, averaged from the first valid samples
+    // after boot. altitude_m is reported as height above this power-on
+    // location (AGL) rather than absolute MSL, so the relative-altitude hold
+    // logic and the rangefinder-less land/fault touchdown thresholds (which
+    // test altitude against ~0 m) work regardless of field elevation.
+    const GROUND_AVG_SAMPLES: u32 = 10;
+    let mut ground_pa:      f32 = 0.0;
+    let mut ground_samples: u32 = 0;
 
     // 25 Hz — each cycle spends ~20 ms awaiting conversions, fitting neatly
     // inside the 40 ms tick. The SPI bus is free (mutex released) during waits.
@@ -168,8 +172,21 @@ pub async fn baro_task(cs_pin: Peri<'static, peripherals::PA8>) {
 
         let pressure_pa = ((d1 as i64 * sens / 2_097_152 - off) / 32_768) as f32;
         let temp_c      = temp as f32 / 100.0;
-        let altitude_m  = pressure_to_altitude_m(pressure_pa, sea_level_pa);
 
+        // Build the ground reference from the first GROUND_AVG_SAMPLES valid
+        // readings; report 0 m AGL until it is established.
+        if ground_samples < GROUND_AVG_SAMPLES {
+            ground_pa      += pressure_pa;
+            ground_samples += 1;
+            if ground_samples == GROUND_AVG_SAMPLES {
+                ground_pa /= GROUND_AVG_SAMPLES as f32;
+                info!("Baro: ground reference {} Pa", ground_pa as u32);
+            }
+            *STATE.baro_data.lock().await = BaroData { pressure_pa, temp_c, altitude_m: 0.0 };
+            continue;
+        }
+
+        let altitude_m = pressure_to_altitude_m(pressure_pa, ground_pa);
         *STATE.baro_data.lock().await = BaroData { pressure_pa, temp_c, altitude_m };
     }
 }

@@ -35,9 +35,9 @@ enum WeedPhase {
     Stabilize,
     /// Servo deployed — hold position and altitude for WEED_PULL_MS.
     Extract,
-    /// Servo still gripping — climb back to cruise altitude with weed.
+    /// Servo gripping — climb back to cruise altitude with weed.
     Ascend,
-    /// At cruise altitude — fly to home (bin) position.
+    /// At cruise altitude — fly to home (bin receptacle) position.
     Dispose,
     /// Over the bin — descend to BIN_DROP_ALT_M and release.
     DisposeDescend,

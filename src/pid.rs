@@ -178,7 +178,7 @@ impl PosPid {
 //
 //   Front
 //  2(CCW) 1(CW)
-//  3(CW)  4(CCW)
+//  4(CW)  3(CCW)
 //   Back
 //
 //   Motor  Roll  Pitch  Yaw
