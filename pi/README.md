@@ -54,7 +54,7 @@ nano ~/pi/.env
 ```
 
 Update these values:
-- `LAPTOP_IP` — your Mac's IP on the hotspot (e.g. `172.20.10.2`)
+- `LAPTOP_IP` — your Mac's IP on the hotspot (e.g. `172.20.10.2`), find with `ipconfig getifaddr en0`.
 - `STM32_PORT` — leave as `/dev/serial0` if the STM32 is connected via UART
 - Everything else can stay as defaults
 

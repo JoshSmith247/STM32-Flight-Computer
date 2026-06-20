@@ -382,6 +382,15 @@ def main() -> None:
         if _overlay.handle_click(x, y):
             return
 
+        # Program / motor-test panel (bottom-right of the stats column) drives
+        # MAVLink, not the camera — so it must stay clickable with no video feed.
+        if x >= disp_w + config.SIDEBAR_W:
+            px  = x - (disp_w + config.SIDEBAR_W)
+            COL = config.STATS_W // 2
+            if px >= COL and y >= disp_h - config.OVERLAY_H:
+                _handle_overlay_click(px - COL, y - (disp_h - config.OVERLAY_H))
+                return
+
         if not stream_ok[0]:
             if not _conn['busy']:
                 br = _btn_rect[0]
@@ -404,10 +413,10 @@ def main() -> None:
             px  = x - (disp_w + config.SIDEBAR_W)
             COL = config.STATS_W // 2
 
+            # The program/motor-test region is handled above the stream gate so it
+            # works without video; only payload double-click remains here.
             if is_double and px >= COL:
                 handle_payload_double_click(px, y)
-            if px >= COL and y >= disp_h - config.OVERLAY_H:
-                _handle_overlay_click(px - COL, y - (disp_h - config.OVERLAY_H))
 
     _quit = [False]
 

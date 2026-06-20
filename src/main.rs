@@ -22,12 +22,12 @@ use defmt::info;
 use {defmt_rtt as _};
 
 // ── Hardware watchdog ─────────────────────────────────────────────────────────
-// IWDG1 base: 0x5802_0000. LSI ≈ 32 kHz, prescaler /256 → ~125 Hz.
+// IWDG1 base: 0x5800_4800. LSI ≈ 32 kHz, prescaler /256 → ~125 Hz.
 // Reload 250 → timeout 2.0 s. Petted by control_task every 250 ticks (0.5 s).
 // Any hang longer than 2 s triggers a hardware reset.
 fn init_watchdog() {
     unsafe {
-        let base = 0x5802_0000u32 as *mut u32;
+        let base = 0x5800_4800u32 as *mut u32;
         base.add(0).write_volatile(0x5555); // KR: unlock PR + RLR write access
         base.add(1).write_volatile(6);      // PR: /256 prescaler
         base.add(2).write_volatile(250);    // RLR: 250 / 125 Hz = 2.0 s
@@ -38,7 +38,7 @@ fn init_watchdog() {
 
 #[inline(always)]
 pub fn pet_watchdog() {
-    unsafe { (0x5802_0000u32 as *mut u32).write_volatile(0xAAAA); }
+    unsafe { (0x5800_4800u32 as *mut u32).write_volatile(0xAAAA); }
 }
 
 pub static STATE: types::SharedState = types::SharedState::new();
@@ -222,7 +222,12 @@ async fn main(spawner: Spawner) {
     spawner.spawn(telemetry::telemetry_task(p.USART3, p.PB11, p.PB10, p.DMA1_CH3, p.DMA1_CH1, Irqs).unwrap());
     spawner.spawn(sensors::baro::baro_task(p.PA8).unwrap());
     spawner.spawn(sensors::gps::gps_task(p.USART1, p.PA10, p.PA9, p.DMA2_CH6, p.DMA2_CH5, Irqs).unwrap());
-    spawner.spawn(sensors::battery::battery_task(p.ADC3, p.PC0).unwrap());
+    // DISABLED: battery_task's `adc.blocking_read()` busy-spins forever because the
+    // ADC3 kernel clock is not configured in the RCC setup above — wedging the
+    // single-threaded executor (board appears dead). Re-enable once the ADC clock
+    // is set (e.g. config.rcc.mux.adcsel) or the read is moved to async DMA.
+    // Not needed for bench motor testing. See sensors/battery.rs:66.
+    // spawner.spawn(sensors::battery::battery_task(p.ADC3, p.PC0).unwrap());
     spawner.spawn(navigation::navigation_task().unwrap());
     spawner.spawn(control_task().unwrap());
     spawner.spawn(arming_task().unwrap());

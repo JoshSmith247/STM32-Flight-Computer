@@ -40,6 +40,32 @@ _ui_state: dict = {
     'denied_until':     0.0,
 }
 
+# ── Bench motor test (MAV_CMD_DO_MOTOR_TEST, 209) ────────────────────────────
+# A row of M1..M4 buttons under the SEND/STOP buttons. The firmware spins one
+# motor for 2 s, ONLY while disarmed and on the ground (Idle), and clamps the
+# throttle to 0.20. PROPS OFF — this exists to verify per-corner wiring + spin
+# direction during bring-up.
+MOTOR_TEST_THROTTLE = 0.08   # 8 % — clear spin, well under the firmware's 0.20 clamp
+# Logical-pixel geometry of the program panel's button rows, relative to the panel
+# top. Shared by _draw_program_panel (× config.PR when drawing) and
+# _handle_overlay_click (× 1 when hit-testing) so buttons and hit-boxes stay aligned.
+_PROG_SEP_Y  = 28 + len(PROGRAMS) * 26 + 4   # separator under the program rows (136)
+_PROG_BTN_Y0 = _PROG_SEP_Y + 6               # SEND/STOP/LAND/RESUME button top  (142)
+_PROG_BTN_Y1 = _PROG_SEP_Y + 30              # ...and bottom                      (166)
+_MT_BTN_Y0   = _PROG_BTN_Y1 + 18             # motor-test M1..M4 button top       (184)
+_MT_BTN_Y1   = _MT_BTN_Y0 + 26               # ...and bottom                      (210)
+
+
+def _motor_test_btn_xranges(w: int, unit: float):
+    """X-ranges (x0, x1) of the four M1..M4 buttons, from the panel's left edge.
+    Pass unit=config.PR with the physical width when drawing, or unit=1 with the
+    logical width when hit-testing — the shared ratio keeps the two aligned."""
+    margin = 8 * unit
+    gap    = 4 * unit
+    cell   = (w - 2 * margin - 3 * gap) / 4
+    return [(int(round(margin + i * (cell + gap))),
+             int(round(margin + i * (cell + gap) + cell))) for i in range(4)]
+
 _payload_disabled: set = set()
 _payload_panel_rect: tuple = (0, 0, 0, 0)   # logical coords for click detection
 _arm_btn_rect: tuple = (0, 0, 0, 0)         # logical stats-panel coords for ARM/DISARM btn
@@ -625,6 +651,23 @@ def _draw_program_panel(panel: np.ndarray, x: int, y: int, w: int,
         _btn(x + 8 * s,        x + 88 * s,      (18, 18, 120), (40, 40, 190),  'STOP',   (80, 80, 230))
         _btn(x + w - 88 * s,   x + w - 8 * s,   (34, 54, 90),  (72, 108, 160), 'SEND',   (172, 210, 255))
 
+    # ── Motor test (bench bring-up — PROPS OFF) ────────────────────────────────
+    # One M1..M4 button row. Each sends MAV_CMD_DO_MOTOR_TEST; the firmware spins
+    # that motor for 2 s and only while disarmed + Idle, so it is safe on the bench.
+    mt_y0 = y + _MT_BTN_Y0 * s
+    mt_y1 = y + _MT_BTN_Y1 * s
+    gfx.put_text(panel, 'MOTOR TEST', (x + 8 * s, mt_y0 - 5 * s), 0.32 * s, (120, 110, 70))
+    (pw, _), _ = gfx.size('PROPS OFF', 0.32 * s)
+    gfx.put_text(panel, 'PROPS OFF', (x + w - pw - 8 * s, mt_y0 - 5 * s), 0.32 * s, (90, 120, 175))
+    for i, (bx0, bx1) in enumerate(_motor_test_btn_xranges(w, s)):
+        cv2.rectangle(panel, (x + bx0, mt_y0), (x + bx1, mt_y1), (40, 36, 20), -1)
+        cv2.rectangle(panel, (x + bx0, mt_y0), (x + bx1, mt_y1), (95, 80, 38), max(1, s))
+        lbl = f'M{i + 1}'
+        (lw2, lh2), _ = gfx.size(lbl, 0.40 * s)
+        gfx.put_text(panel, lbl,
+                     (x + bx0 + (bx1 - bx0 - lw2) // 2, mt_y0 + (mt_y1 - mt_y0 + lh2) // 2),
+                     0.40 * s, (210, 175, 95))
+
 
 def _handle_overlay_click(lx: int, ly: int) -> None:
     """Dispatch a click at local overlay coords (logical pixels)."""
@@ -635,21 +678,35 @@ def _handle_overlay_click(lx: int, ly: int) -> None:
     if row_i < len(PROGRAMS):
         _ui_state['selected_prog'] = row_i
         return
-    sep_y = title_h + len(PROGRAMS) * 26 + 4
-    if ly < sep_y + 6:
+    # Motor-test buttons (M1..M4), below the SEND/STOP row. PROPS OFF — the
+    # firmware only honours this while disarmed and on the ground (Idle).
+    if _MT_BTN_Y0 <= ly <= _MT_BTN_Y1:
+        for i, (bx0, bx1) in enumerate(_motor_test_btn_xranges(config.STATS_W // 2, 1)):
+            if bx0 <= lx <= bx1:
+                send_mavlink_command(209, float(i + 1), MOTOR_TEST_THROTTLE)
+                print(f"Motor test: M{i + 1} @ {int(MOTOR_TEST_THROTTLE * 100)}% for 2 s "
+                      f"— PROPS OFF (firmware requires disarmed + Idle)", flush=True)
+                return
         return
+    # SEND / STOP / LAND / RESUME button row. Tight hit-boxes matching the drawn
+    # buttons (see _draw_program_panel) so clicks in the surrounding padding do
+    # nothing instead of firing a command.
+    if not (_PROG_BTN_Y0 <= ly <= _PROG_BTN_Y1):
+        return
+    panel_w      = config.STATS_W // 2
+    on_stop_land = 8 <= lx <= 88                       # STOP, or LAND when stopped
+    on_resume    = 92 <= lx <= 172                     # RESUME (only when stopped)
+    on_send      = panel_w - 88 <= lx <= panel_w - 8   # SEND
     if _ui_state['landing']:
-        _ui_state['landing'] = False
-        _ui_state['stopped'] = False
-        send_mavlink_command(20)
-        print("Landing aborted — RTH commanded", flush=True)
+        # Single full-width ABORT LAND button.
+        if 8 <= lx <= panel_w - 8:
+            _ui_state['landing'] = False
+            _ui_state['stopped'] = False
+            send_mavlink_command(20)
+            print("Landing aborted — RTH commanded", flush=True)
         return
-    panel_w   = config.STATS_W // 2
-    on_left   = lx <= 88
-    on_resume = 88 < lx <= 172
-    on_right  = lx >= panel_w - 88
     if _ui_state['stopped']:
-        if on_left:
+        if on_stop_land:
             _ui_state['landing'] = True
             _ui_state['running_prog'] = None
             send_mavlink_command(21)
@@ -657,10 +714,10 @@ def _handle_overlay_click(lx: int, ly: int) -> None:
             _ui_state['stopped'] = False
             print("Resumed", flush=True)
     else:
-        if on_left:
+        if on_stop_land:
             _ui_state['stopped'] = True
             print("STOP — choose LAND or RESUME", flush=True)
-        elif on_right:
+        elif on_send:
             _ui_state['running_prog'] = _ui_state['selected_prog']
             prog = _ui_state['running_prog']
             cmd, p1, p2 = _PROG_COMMANDS.get(prog, (0, 0.0, 0.0))

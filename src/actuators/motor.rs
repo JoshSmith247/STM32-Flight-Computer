@@ -23,8 +23,9 @@ use core::sync::atomic::{compiler_fence, Ordering};
 
 use defmt::info;
 use embassy_stm32::{pac, peripherals, Peri};
-use embassy_time::{Duration, Ticker, Timer};
+use embassy_time::{Duration, Instant, Ticker, Timer};
 
+use crate::state::{self, FlightState};
 use crate::STATE;
 
 // ── DSHOT600 constants ───────────────────────────────────────────────────────
@@ -141,7 +142,14 @@ unsafe fn dshot_init() {
     // Configure DMA1 stream 4
     let s = pac::DMA1.st(4);
     s.cr().modify(|w| w.set_en(false));
-    while s.cr().read().en() {}
+    // Bounded: never hard-spin forever — a stuck DMA must not wedge the (single-
+    // threaded) executor and take the whole flight computer down with it.
+    let mut guard = 0u32;
+    while s.cr().read().en() {
+        core::hint::spin_loop();
+        guard += 1;
+        if guard > 1_000_000 { break; }
+    }
 
     // Clear all stream-4 flags via the high-register IFCR (streams 4-7 are in ifcr(1))
     // Stream 4 is at local index 0 within that register.
@@ -168,9 +176,14 @@ unsafe fn dshot_init() {
 unsafe fn dshot_send() {
     let s = pac::DMA1.st(4);
 
-    // Frame takes 18 × 1.667 µs ≈ 30 µs; at 500 Hz ticks (2 ms apart) the
-    // previous transfer is always done.  Spin just in case of a missed tick.
-    while s.cr().read().en() { core::hint::spin_loop(); }
+    // The previous frame (≈30 µs) is always finished by the next 500 Hz tick
+    // (2 ms later). If the DMA is somehow still enabled, SKIP this frame rather
+    // than busy-spin: a stuck DMA (e.g. a wrong DMAMUX request) must never hog
+    // the single-threaded executor — that starves the watchdog pet and resets
+    // the board. Once the DMA actually completes each frame, this never trips.
+    if s.cr().read().en() {
+        return;
+    }
 
     pac::DMA1.ifcr(1).write(|w| {
         w.set_tcif(0, true); w.set_htif(0, true);
@@ -225,9 +238,23 @@ pub async fn motor_task(
         let is_armed = *STATE.armed.lock().await;
 
         let motors = if is_armed {
+            // Arming voids any pending bench test so it can never carry into flight.
+            *STATE.motor_test.lock().await = None;
             [outputs.m1, outputs.m2, outputs.m3, outputs.m4]
         } else {
-            [0.0f32; MOTORS]
+            // Disarmed: all motors zero, unless a MAV_CMD_DO_MOTOR_TEST override is
+            // active. It only runs on the ground (Idle) and self-expires by time,
+            // so it cannot spin a motor in any other state.
+            let mut m = [0.0f32; MOTORS];
+            let mut test = STATE.motor_test.lock().await;
+            if let Some(t) = *test {
+                if Instant::now() >= t.until || state::get() != FlightState::Idle {
+                    *test = None; // expired, or no longer on the ground → clear
+                } else if (1..=MOTORS as u8).contains(&t.idx) {
+                    m[(t.idx - 1) as usize] = t.throttle;
+                }
+            }
+            m
         };
 
         unsafe {

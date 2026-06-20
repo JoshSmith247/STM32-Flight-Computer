@@ -19,7 +19,7 @@ use embassy_time::{Duration, Instant, Ticker};
 use crate::{
     navigation::{self, Waypoint, MAX_WAYPOINTS},
     state::{self, FlightState},
-    types::{FlightMode, LatLonAlt},
+    types::{FlightMode, LatLonAlt, MotorTest},
     STATE,
 };
 
@@ -348,6 +348,26 @@ async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
                 _ => return MAV_RESULT_UNSUPPORTED,
             }
             *STATE.servo_outputs.lock().await = s;
+            MAV_RESULT_ACCEPTED
+        }
+        209 => {
+            // MAV_CMD_DO_MOTOR_TEST — bench bring-up only. ⚠ PROPS OFF.
+            //   param1 = motor index 1..4 (firmware M1..M4 per the pid.rs mixer)
+            //   param2 = throttle 0.0..1.0 (clamped to 0.20 here)
+            // Spins ONE motor for 2 s, then motor_task auto-stops it. Refused
+            // unless disarmed and on the ground, so it can never fire in flight.
+            let idx = param1 as u8;
+            if !(1..=4).contains(&idx) {
+                return MAV_RESULT_UNSUPPORTED;
+            }
+            if *STATE.armed.lock().await || state::get() != FlightState::Idle {
+                warn!("MOTOR_TEST rejected: must be disarmed and Idle (on ground)");
+                return MAV_RESULT_TEMPORARILY_REJECTED;
+            }
+            let throttle = param2.clamp(0.0, 0.20);
+            let until = Instant::now() + Duration::from_secs(2);
+            *STATE.motor_test.lock().await = Some(MotorTest { idx, throttle, until });
+            info!("MOTOR_TEST: M{} @ {} for 2 s", idx, throttle);
             MAV_RESULT_ACCEPTED
         }
         20  => { STATE.rc_input.lock().await.mode = FlightMode::ReturnToHome; MAV_RESULT_ACCEPTED }

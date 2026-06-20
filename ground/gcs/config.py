@@ -59,7 +59,8 @@ PAYLOAD_NAMES = {
     0: 'Servo Bus (4ch)',
 }
 
-OVERLAY_H = 28 + len(PROGRAMS) * 26 + 10 + 30 + 8
+# title + program rows + separator + SEND/STOP buttons + motor-test row (label + M1..M4)
+OVERLAY_H = 28 + len(PROGRAMS) * 26 + 10 + 30 + 8 + 56
 
 # Env defaults — these are also mutated at runtime by the overlay settings panel.
 RECORD_VIDEO    = bool(int(os.environ.get('RECORD_VIDEO',    '0')))

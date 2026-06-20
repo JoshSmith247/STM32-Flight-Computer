@@ -1,6 +1,7 @@
 //! Shared data types and inter-task state.
 
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
+use embassy_time::Instant;
 
 // ---------------------------------------------------------------------------
 // Basic geometric types
@@ -185,6 +186,17 @@ pub struct MotorOutputs {
     pub m4: f32,
 }
 
+/// Bench bring-up motor test, set by MAV_CMD_DO_MOTOR_TEST (209). Honoured ONLY
+/// by motor_task while disarmed and on the ground (FlightState::Idle), and auto-
+/// expired at `until` — so a stale override can never spin a motor in flight.
+/// Use with PROPS OFF to verify per-corner wiring and spin direction.
+#[derive(Clone, Copy)]
+pub struct MotorTest {
+    pub idx:      u8,       // 1..=4 → firmware M1..M4
+    pub throttle: f32,      // 0.0..=1.0, clamped low at the command site
+    pub until:    Instant,  // spin stops once Instant::now() >= until
+}
+
 // ---------------------------------------------------------------------------
 // Global shared state (Embassy async mutexes, ISR-safe)
 // ---------------------------------------------------------------------------
@@ -260,6 +272,8 @@ pub struct SharedState {
     /// Written by telemetry_task when MAV_CMD_DO_SET_HOME (179) arrives.
     /// Consumed (take()) by navigation_task to update mission.home.
     pub home_override:  Mutex<CriticalSectionRawMutex, Option<LatLonAlt>>,
+    /// Bench motor-test override (MAV_CMD_DO_MOTOR_TEST). None = no test active.
+    pub motor_test:     Mutex<CriticalSectionRawMutex, Option<MotorTest>>,
 }
 
 impl SharedState {
@@ -280,6 +294,7 @@ impl SharedState {
             payload_flags:  Mutex::new(0u32),
             weed_target:    Mutex::new(WeedTarget { position: LatLonAlt { lat_deg:0.0, lon_deg:0.0, alt_m:0.0 }, extract_alt_m: 0.4, valid: false }),
             home_override:  Mutex::new(None),
+            motor_test:     Mutex::new(None),
         }
     }
 }
