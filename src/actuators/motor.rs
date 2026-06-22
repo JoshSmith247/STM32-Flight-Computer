@@ -42,8 +42,9 @@ const BUF_LEN: usize = SLOTS * MOTORS; // 72 u16 words
 const TIM3_DMAR: u32 = 0x4000_404C;
 
 // DMAMUX1 request ID for TIM3_UP on STM32H723.
-// Verify against RM0468 Table 105 before first run.
-const DMAMUX_TIM3_UP: u8 = 22;
+// Verified = 27 (RM0468 Table 105 / embassy stm32h723zg DMA bindings:
+// `dma_trait_impl!(UpDma, TIM3, DMA1_CH4, 27u8)`). Was 22 — wrong, DMA never fired.
+const DMAMUX_TIM3_UP: u8 = 27;
 
 // ── DSHOT frame encoding ─────────────────────────────────────────────────────
 

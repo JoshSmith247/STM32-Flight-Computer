@@ -10,6 +10,15 @@ EnvironmentFile=/home/pi/drone/.env
 ExecStart=/usr/bin/python3 /home/pi/drone/camera_stream.py
 Restart=always
 RestartSec=3
+# Lower ffmpeg's priority and cap it to 2 of the 4 cores. NOTE: this is defensive
+# (matters only if the hw encoder falls back to software) — the SSH-hang on this
+# Pi is WiFi *airtime*, not CPU, so the real fix is lowering CAM_BITRATE or moving
+# the shell off the video radio. See README "SSH hangs while the camera streams".
+# Log spam to journald is also capped (ffmpeg is quieted via -nostats in the script).
+Nice=10
+CPUQuota=200%
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=200
 
 [Install]
 WantedBy=multi-user.target

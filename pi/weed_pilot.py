@@ -42,8 +42,10 @@ SERIAL_BAUD      = int(os.environ.get('STM32_BAUD',    '57600'))
 LAPTOP_IP        = sys.argv[1] if len(sys.argv) > 1 else os.environ.get('LAPTOP_IP', '192.168.4.2')
 GCS_PORT         = int(os.environ.get('GCS_PORT',        '14550'))
 WEED_TARGET_PORT = int(os.environ.get('WEED_TARGET_PORT', '5700'))
-WEED_LOG_PATH    = os.environ.get('WEED_LOG',
-                       f"weed_events_{time.strftime('%Y%m%d_%H%M%S')}.jsonl")
+# Event log lives in /tmp with a FIXED name, so it can't fill the SD card and a
+# crash-loop won't spawn a new file every 3 s. /tmp is cleared on reboot.
+# Override with WEED_LOG=/dev/shm/... for guaranteed RAM-backing.
+WEED_LOG_PATH    = os.environ.get('WEED_LOG', '/tmp/weed_events.jsonl')
 
 # MAVLink v2 constants for the Pi GCS component
 PI_SYS_ID        = 10   # distinct from drone's sys_id=1
@@ -246,7 +248,14 @@ def main() -> None:
         print("pyserial not installed — run: pip install pyserial", flush=True)
         sys.exit(1)
 
-    ser = _serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=0.05, write_timeout=0.5)
+    try:
+        ser = _serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=0.05, write_timeout=0.5)
+    except _serial.SerialException as exc:
+        print(f"Could not open serial {SERIAL_PORT}: {exc}", flush=True)
+        print("  Is the UART enabled? Needs enable_uart=1 + dtoverlay=disable-bt in "
+              "/boot/firmware/config.txt, then a reboot.", flush=True)
+        time.sleep(10)   # back off so systemd doesn't tight-loop on a config error
+        sys.exit(1)
 
     # UDP socket for forwarding STM32 telemetry to the ground station
     gcs_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

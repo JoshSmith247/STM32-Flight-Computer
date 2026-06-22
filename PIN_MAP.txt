@@ -1,0 +1,221 @@
+================================================================================
+ STM32H723ZGT6 FLIGHT COMPUTER  —  PIN & SENSOR WIRING MAP
+================================================================================
+ Generated from firmware source (src/main.rs + per-task drivers).
+ MCU:    STM32H723ZGT6   SYSCLK 400 MHz / HCLK 200 MHz / APBx 100 MHz
+ Logic:  3.3 V  (all signal pins are 3.3 V — do NOT feed 5 V into any GPIO)
+ Status LED: PG7 (active-low)  slow 1 Hz = Idle/healthy, rapid strobe = Fault
+--------------------------------------------------------------------------------
+ IMPORTANT: this is the LOGICAL map (MCU pin -> function). Confirm the physical
+ header/connector location of each Pxx pin against your board's reference card.
+================================================================================
+
+
++------------------------------------------------------------------------------+
+|  1. QUICK SENSOR -> MCU INDEX                                                 |
++------------------------------------------------------------------------------+
+
+  SENSOR / DEVICE                  BUS        MCU PINS                  STATUS
+  -------------------------------  ---------  ------------------------  --------
+  IMU   ICM-42688-P (6-axis)       SPI1       PA5 PA6 PA7 + PA4 (CS)    have it
+  Baro  MS5611                     SPI1       PA5 PA6 PA7 + PA8 (CS)    REFUNDED*
+  Mag   QMC5883L                   I2C1       PB8(SCL) PB9(SDA)         on FC
+  GPS   SEQURE M10-18              USART1     PA10(RX) PA9(TX)          have it
+  RC    BETAFPV ELRS (SBUS)        USART2     PA3(RX, inverted)        have it
+  Flow  MTF-02P (flow+range)       UART4      PC11(RX only)            have it
+  Telem Raspberry Pi (MAVLink)     USART3     PB10(TX) PB11(RX)        on craft
+  Batt  LiPo divider               ADC3       PC0                       wire it
+  Motors DYS X2807 x4 (DSHOT600)   TIM3       PB4 PB5 PB0 PB1           have it
+  Servos payload x4 (PWM)          TIM4       PD12 PD13 PD14 PD15       optional
+  LED   status                     GPIO       PG7                       on FC
+
+  * Baro line shows a refund/return in the order history — if the MS5611 is going
+    back you'll have no barometer; baro_task simply no-ops (no Fault), but you
+    lose altitude hold until replaced.
+
+
++------------------------------------------------------------------------------+
+|  2. PER-PORT PIN LISTING (every pin the firmware claims)                      |
++------------------------------------------------------------------------------+
+
+  --- PORT A ---------------------------------------------------------------
+  PA2   USART2_TX     RC / SBUS      UNUSED (driver names it _tx_pin)
+  PA3   USART2_RX     RC / SBUS  <-- receiver SBUS signal  (invert_rx = true)
+  PA4   GPIO out      IMU            ICM-42688-P  chip select (active-low)
+  PA5   SPI1_SCK      IMU + Baro     shared SPI clock          (AF5)
+  PA6   SPI1_MISO     IMU + Baro     shared, sensor -> MCU     (AF5)
+  PA7   SPI1_MOSI     IMU + Baro     shared, MCU -> sensor     (AF5)
+  PA8   GPIO out      Baro           MS5611       chip select (active-low)
+  PA9   USART1_TX     GPS        --> GPS module RX             (AF7)
+  PA10  USART1_RX     GPS        <-- GPS module TX             (AF7)
+
+  --- PORT B ---------------------------------------------------------------
+  PB0   TIM3_CH3      Motor M3       DSHOT600                  (AF2)
+  PB1   TIM3_CH4      Motor M4       DSHOT600                  (AF2)
+  PB4   TIM3_CH1      Motor M1       DSHOT600                  (AF2)
+  PB5   TIM3_CH2      Motor M2       DSHOT600                  (AF2)
+  PB8   I2C1_SCL      Mag            QMC5883L clock            (AF4)
+  PB9   I2C1_SDA      Mag            QMC5883L data             (AF4)
+  PB10  USART3_TX     Telemetry  --> Raspberry Pi RX           (AF7)
+  PB11  USART3_RX     Telemetry  <-- Raspberry Pi TX           (AF7)
+
+  --- PORT C ---------------------------------------------------------------
+  PC0   ADC3_INPx     Battery        voltage-divider midpoint (analog)
+  PC11  UART4_RX      Flow       <-- MTF-02P TX                (AF8)
+
+  --- PORT D ---------------------------------------------------------------
+  PD12  TIM4_CH1      Servo S1       50 Hz PWM                 (AF2)
+  PD13  TIM4_CH2      Servo S2       50 Hz PWM                 (AF2)
+  PD14  TIM4_CH3      Servo S3       50 Hz PWM                 (AF2)
+  PD15  TIM4_CH4      Servo S4       50 Hz PWM                 (AF2)
+
+  --- PORT G ---------------------------------------------------------------
+  PG7   GPIO out      Status LED     active-low (set HIGH = off)
+
+  NOTE: led.rs header comment still says "PC7" but main.rs drives PG7. PG7 is
+        authoritative — fix the comment when convenient.
+
+
++------------------------------------------------------------------------------+
+|  3. DETAILED WIRING BY DEVICE                                                 |
++------------------------------------------------------------------------------+
+
+------------------------------------------------------------------------------
+ IMU  —  ICM-42688-P  (purple breakout)            BUS: SPI1, Mode 0, 12.5 MHz
+------------------------------------------------------------------------------
+   Breakout pin        ->  MCU pin    Notes
+   VCC / 3V3           ->  3.3 V      power at 3.3 V (not 5 V)
+   GND                 ->  GND
+   SCL / SCLK / SCK    ->  PA5        SPI1 clock
+   SDA / SDI / MOSI    ->  PA7        MCU -> sensor
+   SDO / ADO / MISO    ->  PA6        sensor -> MCU
+   NCS / CS            ->  PA4        dedicated wire (do NOT tie to GND)
+   INT / FSYNC         ->  (n/c)      polled at 500 Hz, no interrupt used
+   Firmware check:     WHO_AM_I must read 0x47, else -> Fault (LED strobe)
+
+------------------------------------------------------------------------------
+ BARO  —  MS5611  (GY-63)                           BUS: SPI1 (shared w/ IMU)
+------------------------------------------------------------------------------
+   Module pin          ->  MCU pin    Notes
+   VCC                 ->  3.3 V
+   GND                 ->  GND
+   SCLK / SCL          ->  PA5        shared SPI clock
+   SDI / MOSI          ->  PA7        shared MOSI
+   SDO / MISO          ->  PA6        shared MISO
+   CSB / CS            ->  PA8        baro-only chip select (active-low)
+   PS  (protocol sel)  ->  GND        tie LOW to force SPI mode on GY-63
+   *** Verify this device is actually staying (refund in order history). ***
+
+------------------------------------------------------------------------------
+ MAG  —  QMC5883L                                   BUS: I2C1, addr 0x0D, 100Hz
+------------------------------------------------------------------------------
+   Module pin          ->  MCU pin    Notes
+   VCC                 ->  3.3 V
+   GND                 ->  GND
+   SCL                 ->  PB8        needs pull-up (4.7k to 3.3V if not on board)
+   SDA                 ->  PB9        needs pull-up (4.7k to 3.3V if not on board)
+   Tilt-compensated using live AHRS quaternion. *** Still uncalibrated. ***
+
+------------------------------------------------------------------------------
+ GPS  —  SEQURE M10-18                              BUS: USART1, 38400 baud
+------------------------------------------------------------------------------
+   Module pin          ->  MCU pin    Notes
+   VCC                 ->  (per module: 3.3 V or 5 V — check its regulator)
+   GND                 ->  GND
+   TX                  ->  PA10       module TX  -> MCU RX
+   RX                  ->  PA9        module RX  <- MCU TX (for UBX-CFG-VALSET)
+   Firmware enables UBX NAV-PVT @1Hz. If silent, some M10s ship at 115200.
+
+------------------------------------------------------------------------------
+ RC  —  BETAFPV ExpressLRS Lite (SBUS out)          BUS: USART2, 100k 8E2 inv.
+------------------------------------------------------------------------------
+   Receiver pin        ->  MCU pin    Notes
+   VCC                 ->  5 V or 3.3 V (per RX spec)
+   GND                 ->  GND
+   SBUS / signal       ->  PA3        invert_rx = true in firmware (no ext.
+                                      inverter needed)
+   PA2 (USART2_TX)     ->  (n/c)      reserved but unused
+   *** Configure the ELRS RX for SBUS output, NOT CRSF, before wiring. ***
+
+------------------------------------------------------------------------------
+ FLOW  —  MTF-02P optical flow + rangefinder        BUS: UART4, 19200, RX-only
+------------------------------------------------------------------------------
+   Sensor pin          ->  MCU pin    Notes
+   VCC                 ->  5 V (typical for MTF-02P — check its label)
+   GND                 ->  GND
+   TX                  ->  PC11       sensor TX -> MCU RX (only line needed)
+   RX                  ->  (n/c)      MCU does not transmit to it
+
+------------------------------------------------------------------------------
+ TELEMETRY  —  Raspberry Pi (MAVLink v2)            BUS: USART3, 57600, duplex
+------------------------------------------------------------------------------
+   Pi pin              ->  MCU pin    Notes
+   Pi UART TX          ->  PB11       Pi -> MCU
+   Pi UART RX          ->  PB10       MCU -> Pi
+   GND                 ->  GND        common ground required
+   Carries the Pi heartbeat watchdog (5 s timeout -> Fault+Land).
+
+------------------------------------------------------------------------------
+ BATTERY  —  LiPo voltage sense                     BUS: ADC3 on PC0, 2 Hz
+------------------------------------------------------------------------------
+   Pack (+) --[ R1 ]--+--[ R2 ]-- GND
+                      |
+                      +--> PC0  (divider midpoint, must stay <= 3.3 V)
+   Example R1=4.7k (pack side), R2=1.0k (GND side) -> V_DIVIDER = 5.7
+   *** Set CELL_COUNT and V_DIVIDER in battery.rs for your pack/resistors. ***
+   *** V_DIVIDER must be verified against a meter before trusting readings. ***
+   Critical-voltage logic -> RTH/Land then disarm+Fault on the ground.
+
+------------------------------------------------------------------------------
+ MOTORS  —  DYS X2807 x4, via 4-in-1 ESC            BUS: TIM3 DSHOT600 (AF2)
+------------------------------------------------------------------------------
+   ESC signal pad      ->  MCU pin    Quad-X position
+   M1                  ->  PB4        TIM3_CH1   front-right (X layout)
+   M2                  ->  PB5        TIM3_CH2   rear-left
+   M3                  ->  PB0        TIM3_CH3   front-left
+   M4                  ->  PB1        TIM3_CH4   rear-right
+   ESC GND             ->  GND        share ground with FC
+   Uses DMA1 stream 4 (reserved). Verify spin direction/order on the bench
+   with props OFF.
+   *** PRE-SPIN CHECK: confirm DMAMUX_TIM3_UP = 22 vs RM0468 Table 105. ***
+       (wrong value = DMA never fires = motors silent — a safe failure)
+
+------------------------------------------------------------------------------
+ SERVOS / PAYLOAD  —  optional 4ch                  BUS: TIM4 50 Hz PWM (AF2)
+------------------------------------------------------------------------------
+   Servo signal        ->  MCU pin    Notes
+   S1                  ->  PD12       TIM4_CH1   0.0=1000us .. 1.0=2000us
+   S2                  ->  PD13       TIM4_CH2
+   S3                  ->  PD14       TIM4_CH3
+   S4                  ->  PD15       TIM4_CH4
+   Commanded via MAVLink DO_SET_SERVO (cmd 183). Servo V+ from BEC, not MCU.
+
+
++------------------------------------------------------------------------------+
+|  4. DMA / TIMER / PERIPHERAL RESERVATIONS (for future expansion)             |
++------------------------------------------------------------------------------+
+
+   PERIPH    USE                 DMA CHANNELS
+   --------  ------------------  ----------------------------------------
+   SPI1      IMU + Baro          DMA2_CH3 (TX), DMA2_CH0 (RX)
+   USART1    GPS                 DMA2_CH6 (TX), DMA2_CH5 (RX)
+   USART2    RC / SBUS           DMA1_CH5 (RX)
+   USART3    Telemetry           DMA1_CH3 (TX), DMA1_CH1 (RX)
+   UART4     Flow                DMA1_CH2 (RX)
+   TIM3      Motors (DSHOT)      DMA1 stream 4  (DMAMUX req 22 = TIM3_UP)
+   TIM4      Servos (PWM)        none (no DMA)
+   ADC3      Battery             none (blocking read)
+   I2C1      Mag                 none (blocking)
+   IWDG1     Watchdog            2.0 s timeout, petted by control_task
+
+   Do not reassign DMA1_CH4/stream-4 or the listed channels to new peripherals.
+
+
+================================================================================
+ OUTSTANDING BEFORE FIRST ARMED FLIGHT:
+   [ ] Compass (QMC5883L) calibration
+   [ ] V_DIVIDER verified against a multimeter
+   [ ] DMAMUX_TIM3_UP confirmed (= 22) vs RM0468 Table 105
+   [ ] Motor order + spin direction verified, props OFF
+   [ ] Decide MS5611 keep-vs-return (altitude hold depends on it)
+================================================================================

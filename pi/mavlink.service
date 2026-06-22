@@ -10,6 +10,9 @@ EnvironmentFile=/home/pi/drone/.env
 ExecStart=/usr/bin/python3 /home/pi/drone/weed_pilot.py
 Restart=always
 RestartSec=3
+# Cap log spam to journald (avoids SD/RAM thrash if a loop ever gets chatty).
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=200
 
 [Install]
 WantedBy=multi-user.target

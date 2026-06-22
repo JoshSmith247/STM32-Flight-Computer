@@ -1,5 +1,8 @@
 [target.thumbv7em-none-eabihf]
-runner = "sh flash.sh"
+# NUCLEO-H723ZG: flash + run over the onboard ST-LINK via probe-rs, which also
+# streams defmt/RTT logs to the terminal (`cargo run`).
+# Requires: cargo install probe-rs-tools
+runner = "probe-rs run --chip STM32H723ZGTx"
 
 rustflags = [
   "-C", "link-arg=-Tlink.x",

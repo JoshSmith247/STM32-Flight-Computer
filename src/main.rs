@@ -249,8 +249,13 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
         // Send a zero DSHOT frame before halting so ESCs receive an explicit stop.
         // Spins ≤30 µs for any in-flight DMA to drain, then fires once and halts.
         actuators::motor::emergency_stop();
-        // Turn off status LED (PG7, active-low: set ODR bit to drive HIGH = off)
-        let gpiog = 0x40021800 as *mut u32;
+        // Turn off status LED (PG7, active-low: set ODR bit to drive HIGH = off).
+        // GPIOG base on the STM32H7 is 0x5802_1800 (AHB4). NOTE: this was previously
+        // 0x4002_1800 — that's the STM32F4 GPIO base, so on the H723 the write landed
+        // in the APB1 region and the LED-off silently did nothing. ODR is at +0x14
+        // (offset(5) on a u32 ptr). If the status LED is moved off PG7 (e.g. to an
+        // onboard Nucleo LED), update this base/bit to the new port.
+        let gpiog = 0x5802_1800 as *mut u32;
         *gpiog.offset(5) = 1 << 7;
     }
     loop {}
