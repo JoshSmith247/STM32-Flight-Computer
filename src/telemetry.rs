@@ -405,11 +405,23 @@ async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
 
 // ── Embassy task ──────────────────────────────────────────────────────────────
 
+// MAVLink USART3 pins. Default = Pi header (PB10/PB11). The `nucleo-vcp` feature
+// swaps to the Nucleo ST-Link VCP pins (PD8/PD9) for prop-off bench testing over
+// USB with no Pi attached — both are valid USART3 RX/TX alternate functions.
+#[cfg(not(feature = "nucleo-vcp"))]
+type MavRxPin = peripherals::PB11;
+#[cfg(not(feature = "nucleo-vcp"))]
+type MavTxPin = peripherals::PB10;
+#[cfg(feature = "nucleo-vcp")]
+type MavRxPin = peripherals::PD9;
+#[cfg(feature = "nucleo-vcp")]
+type MavTxPin = peripherals::PD8;
+
 #[embassy_executor::task]
 pub async fn telemetry_task(
     uart_peri: Peri<'static, peripherals::USART3>,
-    rx_pin:    Peri<'static, peripherals::PB11>,
-    tx_pin:    Peri<'static, peripherals::PB10>,
+    rx_pin:    Peri<'static, MavRxPin>,
+    tx_pin:    Peri<'static, MavTxPin>,
     tx_dma:    Peri<'static, peripherals::DMA1_CH3>,
     rx_dma:    Peri<'static, peripherals::DMA1_CH1>,
     irqs:      crate::Irqs,

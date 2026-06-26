@@ -219,7 +219,12 @@ async fn main(spawner: Spawner) {
     spawner.spawn(sensors::imu::imu_task(p.PA4).unwrap());
     spawner.spawn(actuators::motor::motor_task(p.TIM3, p.PB4, p.PB5, p.PB0, p.PB1).unwrap());
     spawner.spawn(sensors::rc::rc_task(p.USART2, p.PA2, p.PA3, p.DMA1_CH5, Irqs).unwrap());
+    // MAVLink on USART3. Default = Pi header pins (PB11/PB10); `nucleo-vcp`
+    // routes it to the ST-Link VCP (PD9/PD8) for prop-off bench testing over USB.
+    #[cfg(not(feature = "nucleo-vcp"))]
     spawner.spawn(telemetry::telemetry_task(p.USART3, p.PB11, p.PB10, p.DMA1_CH3, p.DMA1_CH1, Irqs).unwrap());
+    #[cfg(feature = "nucleo-vcp")]
+    spawner.spawn(telemetry::telemetry_task(p.USART3, p.PD9, p.PD8, p.DMA1_CH3, p.DMA1_CH1, Irqs).unwrap());
     spawner.spawn(sensors::baro::baro_task(p.PA8).unwrap());
     spawner.spawn(sensors::gps::gps_task(p.USART1, p.PA10, p.PA9, p.DMA2_CH6, p.DMA2_CH5, Irqs).unwrap());
     // DISABLED: battery_task's `adc.blocking_read()` busy-spins forever because the

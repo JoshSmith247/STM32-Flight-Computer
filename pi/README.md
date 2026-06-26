@@ -34,6 +34,47 @@ Then run from the repo root on your laptop:
 rsync -avz --exclude='demo*' /Users/jsmith/Documents/GitHub/STM32-Flight-Computer/pi/ jsmith@raspberrypi.local:~/pi/
 ```
 
+## First-time setup (run after every reflash)
+
+A fresh OS image has none of these. Run them once on the Pi before installing the
+services, or `mavlink`/`camera` will crash-loop.
+
+### 1. System packages
+
+The systemd services run the **system** `/usr/bin/python3` (not the `.venv`), so
+`pyserial` must be installed system-wide. `ffmpeg` provides the camera encoder.
+
+```bash
+sudo apt update
+sudo apt install -y python3-serial ffmpeg rsync
+```
+
+### 2. Enable the UART (`/dev/serial0`)
+
+Without this the STM32 serial port doesn't exist and `mavlink.service` fails with
+`could not open port /dev/serial0`. `disable-bt` hands the stable PL011 (`ttyAMA0`)
+to the GPIO header — needed for reliable 57600-baud MAVLink — and disabling the
+serial getty stops the login console from holding the port open.
+
+```bash
+# Enable UART + free the PL011 from Bluetooth (idempotent)
+sudo sed -i '/^enable_uart=/d; /^dtoverlay=disable-bt$/d' /boot/firmware/config.txt
+printf 'enable_uart=1\ndtoverlay=disable-bt\n' | sudo tee -a /boot/firmware/config.txt
+
+# Stop the serial login console from squatting on the port
+sudo systemctl disable --now serial-getty@ttyAMA0.service 2>/dev/null
+sudo systemctl disable --now serial-getty@serial0.service  2>/dev/null
+
+# Reboot for the overlay to take effect
+sudo reboot
+```
+
+After it reboots, confirm the port exists before continuing:
+
+```bash
+ls -l /dev/serial0      # should symlink → ttyAMA0
+```
+
 ## Installing and starting services
 
 Run once on the Pi after syncing (fixes hardcoded paths, then installs and enables the systemd services):
@@ -81,6 +122,22 @@ To find the LAN IP address of the ground:
 ```bash
 ipconfig getifaddr en0
 ```
+
+## Post-reflash tuning (recommended)
+
+Two known-good tweaks for this hardware. Apply them up front rather than waiting to
+debug the symptoms (see Troubleshooting below for the full rationale).
+
+- **Cap the camera bitrate** so the video stream doesn't saturate the Zero 2 W's
+  single 2.4 GHz radio and lock up your SSH shell. `.env.example` already ships
+  `CAM_BITRATE=800k`; confirm it's in your `~/pi/.env` (drop to `500k` if `ping`
+  to the Pi still spikes while streaming), then `sudo systemctl restart camera`.
+- **Disable WiFi power-save**, which parks the radio and causes random drops. This
+  does **not** persist across reboot, so re-run it after every boot (or add it to
+  `/etc/rc.local` / a systemd unit):
+  ```bash
+  sudo iw dev wlan0 set power_save off
+  ```
 
 ## Troubleshooting: is the Pi overloaded?
 

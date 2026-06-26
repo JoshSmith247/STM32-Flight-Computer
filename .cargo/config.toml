@@ -12,3 +12,9 @@ rustflags = [
 
 [build]
 target = "thumbv7em-none-eabihf"
+
+[env]
+# defmt compile-time log filter. "info" surfaces the per-task init banners
+# (Motors:, Telemetry:, …) alongside warn/error during bring-up. Bump to
+# "trace" when chasing something; drop to "warn"/"error" to quiet the link.
+DEFMT_LOG = "info"
