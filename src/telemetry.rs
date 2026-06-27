@@ -430,7 +430,14 @@ pub async fn telemetry_task(
     config.baudrate = 57600;
     let uart = Uart::new(uart_peri, rx_pin, tx_pin, tx_dma, rx_dma, irqs, config)
         .expect("USART3 init failed");
-    let (mut tx, mut rx) = uart.split();
+    let (mut tx, rx) = uart.split();
+
+    // Ring-buffered DMA RX: the DMA fills this buffer continuously in the background,
+    // so no incoming bytes are lost while the executor is busy elsewhere. The previous
+    // one-shot, byte-at-a-time read dropped bytes between reads → corrupted frames →
+    // CRC failures on inbound HEARTBEAT/COMMAND_LONG. 512 B ≈ 89 ms of slack @57600.
+    let mut rx_ring = [0u8; 512];
+    let mut rx = rx.into_ring_buffered(&mut rx_ring);
 
     info!("Telemetry: MAVLink v2 @ 57600 baud, 7-msg TX, mission protocol RX");
 

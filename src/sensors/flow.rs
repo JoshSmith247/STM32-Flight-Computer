@@ -41,8 +41,13 @@ pub async fn flow_task(
     let mut cfg = Config::default();
     cfg.baudrate = 19200;
 
-    let mut rx = UartRx::new(uart, rx, dma, irqs, cfg)
+    let rx = UartRx::new(uart, rx, dma, irqs, cfg)
         .expect("UART4 (optical flow) init failed");
+
+    // Ring-buffered DMA RX so 13-byte frames aren't dropped between reads (one-shot
+    // byte reads lose bytes under load). 128 B ≈ 53 ms of slack @ 19200 baud.
+    let mut rx_ring = [0u8; 128];
+    let mut rx = rx.into_ring_buffered(&mut rx_ring);
 
     info!("Flow: MTF-02P on UART4 @ 19200 baud");
 
@@ -51,24 +56,24 @@ pub async fn flow_task(
 
     loop {
         // ── sync byte 1 ─────────────────────────────────────────────────────
-        match with_timeout(Duration::from_millis(500), rx.read(&mut byte)).await {
+        match with_timeout(Duration::from_millis(500), super::read_exact_ring(&mut rx, &mut byte)).await {
             Ok(Ok(())) if byte[0] == SYNC1 => {}
             _ => continue,
         }
 
         // ── sync byte 2 ─────────────────────────────────────────────────────
-        match with_timeout(Duration::from_millis(50), rx.read(&mut byte)).await {
+        match with_timeout(Duration::from_millis(50), super::read_exact_ring(&mut rx, &mut byte)).await {
             Ok(Ok(())) if byte[0] == SYNC2 => {}
             _ => continue,
         }
 
         // ── 10 data bytes ───────────────────────────────────────────────────
-        if with_timeout(Duration::from_millis(50), rx.read(&mut data)).await != Ok(Ok(())) {
+        if with_timeout(Duration::from_millis(50), super::read_exact_ring(&mut rx, &mut data)).await != Ok(Ok(())) {
             continue;
         }
 
         // ── checksum ────────────────────────────────────────────────────────
-        if with_timeout(Duration::from_millis(10), rx.read(&mut byte)).await != Ok(Ok(())) {
+        if with_timeout(Duration::from_millis(10), super::read_exact_ring(&mut rx, &mut byte)).await != Ok(Ok(())) {
             continue;
         }
         let expected: u8 = data.iter().fold(0u8, |acc, &b| acc ^ b);

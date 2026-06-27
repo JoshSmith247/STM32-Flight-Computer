@@ -2,6 +2,7 @@
 #![no_main]
 
 mod ahrs;
+mod estimator;
 mod navigation;
 mod pid;
 mod state;
@@ -104,6 +105,16 @@ async fn control_task() {
         };
         *STATE.attitude.lock().await = quat;
         let euler = filter.euler();
+
+        // Bench IMU bring-up: ~2 Hz attitude readout (degrees) so you can tilt the
+        // board and watch roll/pitch/yaw track — confirms IMU axes + Madgwick fusion.
+        // Bench build only; keeps flight logs clean. Runs while disarmed too.
+        #[cfg(feature = "nucleo-vcp")]
+        if wdg_tick % 250 == 0 {
+            const R2D: f32 = 180.0 / core::f32::consts::PI;
+            info!("ATT  roll={=f32}deg  pitch={=f32}deg  yaw={=f32}deg",
+                  euler.roll * R2D, euler.pitch * R2D, euler.yaw * R2D);
+        }
 
         if !is_armed || rc.failsafe {
             pids.reset_all();
@@ -234,6 +245,7 @@ async fn main(spawner: Spawner) {
     // Not needed for bench motor testing. See sensors/battery.rs:66.
     // spawner.spawn(sensors::battery::battery_task(p.ADC3, p.PC0).unwrap());
     spawner.spawn(navigation::navigation_task().unwrap());
+    spawner.spawn(estimator::estimator_task().unwrap());
     spawner.spawn(control_task().unwrap());
     spawner.spawn(arming_task().unwrap());
     spawner.spawn(sensors::flow::flow_task(p.UART4, p.PC11, p.DMA1_CH2, Irqs).unwrap());

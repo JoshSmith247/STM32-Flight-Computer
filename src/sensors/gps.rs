@@ -106,11 +106,17 @@ pub async fn gps_task(
 
     let uart = Uart::new(uart_peri, rx_pin, tx_pin, tx_dma, rx_dma, irqs, cfg)
         .expect("USART1 (GPS) init failed");
-    let (mut tx, mut rx) = uart.split();
+    let (mut tx, rx) = uart.split();
 
     // Give the module time to boot, then enable NAV-PVT via CFG-VALSET (M10 API)
     Timer::after(Duration::from_millis(200)).await;
     tx.write(CFG_VALSET_NAV_PVT).await.ok();
+
+    // Ring-buffered DMA RX so the interleaved NMEA/UBX stream isn't dropped between
+    // reads — one-shot byte reads lose bytes under load and corrupt UBX frames.
+    // 512 B ≈ 130 ms of slack @ 38400 baud.
+    let mut rx_ring = [0u8; 512];
+    let mut rx = rx.into_ring_buffered(&mut rx_ring);
 
     info!("GPS task started — UBX NAV-PVT @ 38400 baud on USART1 (M10)");
 
@@ -121,32 +127,38 @@ pub async fn gps_task(
 
     loop {
         // ── sync char 1 ────────────────────────────────────────────────────
-        if rx.read(&mut byte).await.is_err() { continue; }
+        if super::read_exact_ring(&mut rx, &mut byte).await.is_err() { continue; }
         if byte[0] != 0xB5 { continue; }
 
         // ── sync char 2 ────────────────────────────────────────────────────
-        if rx.read(&mut byte).await.is_err() { continue; }
+        if super::read_exact_ring(&mut rx, &mut byte).await.is_err() { continue; }
         if byte[0] != 0x62 { continue; }
 
         // ── class / id / length (4 bytes) ──────────────────────────────────
-        if rx.read(&mut hdr).await.is_err() { continue; }
+        if super::read_exact_ring(&mut rx, &mut hdr).await.is_err() { continue; }
         let class = hdr[0];
         let id    = hdr[1];
         let len   = u16::from_le_bytes([hdr[2], hdr[3]]) as usize;
 
+        // Guard against a false 0xB5 0x62 sync match yielding a bogus length: real UBX
+        // messages here are small (NAV-PVT = 92). A huge len would make the drain below
+        // block for thousands of bytes, stalling parsing — treat it as noise and resync.
+        const MAX_UBX_LEN: usize = 512;
+        if len > MAX_UBX_LEN { continue; }
+
         // Drain and discard any message that isn't NAV-PVT (92 bytes)
         if class != 0x01 || id != 0x07 || len != 92 {
             for _ in 0..len.saturating_add(2) {
-                if rx.read(&mut byte).await.is_err() { break; }
+                if super::read_exact_ring(&mut rx, &mut byte).await.is_err() { break; }
             }
             continue;
         }
 
         // ── payload ────────────────────────────────────────────────────────
-        if rx.read(&mut payload).await.is_err() { continue; }
+        if super::read_exact_ring(&mut rx, &mut payload).await.is_err() { continue; }
 
         // ── checksum ───────────────────────────────────────────────────────
-        if rx.read(&mut ckbuf).await.is_err() { continue; }
+        if super::read_exact_ring(&mut rx, &mut ckbuf).await.is_err() { continue; }
         let (ck_a, ck_b) = ubx_cksum_parts(&hdr, &payload);
         if ck_a != ckbuf[0] || ck_b != ckbuf[1] {
             warn!("GPS: checksum mismatch — dropped frame");

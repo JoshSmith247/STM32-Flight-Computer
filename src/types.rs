@@ -211,6 +211,20 @@ pub struct FlowData {
     pub valid:        bool,  // quality > 50 and recent frame received
 }
 
+/// Fused NED position/velocity estimate, updated by estimator_task (~150 Hz).
+/// Position is metres relative to the NED origin (first valid GPS fix / home);
+/// velocity is m/s in NED. `valid` becomes true once the origin is captured.
+#[derive(Clone, Copy, Default, defmt::Format)]
+pub struct PosEstimate {
+    pub pos_n: f32,    // North position (m, relative to origin)
+    pub pos_e: f32,    // East  position (m)
+    pub pos_d: f32,    // Down  position (m, +down)
+    pub vel_n: f32,    // North velocity (m/s)
+    pub vel_e: f32,    // East  velocity (m/s)
+    pub vel_d: f32,    // Down  velocity (m/s)
+    pub valid: bool,   // true once the NED origin has been set from GPS
+}
+
 /// Magnetometer data from QMC5883L, updated by mag_task at 25 Hz.
 #[derive(Clone, Copy, Default, defmt::Format)]
 pub struct MagData {
@@ -267,6 +281,7 @@ pub struct SharedState {
     pub flow:          Mutex<CriticalSectionRawMutex, FlowData>,
     pub servo_outputs: Mutex<CriticalSectionRawMutex, ServoOutputs>,
     pub mag_data:      Mutex<CriticalSectionRawMutex, MagData>,
+    pub pos_estimate:  Mutex<CriticalSectionRawMutex, PosEstimate>,
     pub payload_flags:  Mutex<CriticalSectionRawMutex, u32>,
     pub weed_target:    Mutex<CriticalSectionRawMutex, WeedTarget>,
     /// Written by telemetry_task when MAV_CMD_DO_SET_HOME (179) arrives.
@@ -291,6 +306,7 @@ impl SharedState {
             flow:          Mutex::new(FlowData { quality:0, vel_x_mrad_s:0, vel_y_mrad_s:0, height_mm:-1, valid:false }),
             servo_outputs: Mutex::new(ServoOutputs { s1:0.0, s2:0.0, s3:0.0, s4:0.0 }),
             mag_data:      Mutex::new(MagData { x:0.0, y:0.0, z:0.0, heading_rad:0.0, valid:false }),
+            pos_estimate:  Mutex::new(PosEstimate { pos_n:0.0, pos_e:0.0, pos_d:0.0, vel_n:0.0, vel_e:0.0, vel_d:0.0, valid:false }),
             payload_flags:  Mutex::new(0u32),
             weed_target:    Mutex::new(WeedTarget { position: LatLonAlt { lat_deg:0.0, lon_deg:0.0, alt_m:0.0 }, extract_alt_m: 0.4, valid: false }),
             home_override:  Mutex::new(None),

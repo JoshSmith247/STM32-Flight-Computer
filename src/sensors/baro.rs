@@ -79,9 +79,13 @@ async fn adc_read(cs: &mut Output<'_>) -> u32 {
 // ---------------------------------------------------------------------------
 // Altitude from pressure — ISA troposphere model (valid 0–11 km, < 0.1 % err)
 // ---------------------------------------------------------------------------
-
-fn pressure_to_altitude_m(pressure_pa: f32, sea_level_pa: f32) -> f32 {
-    44330.0 * (1.0 - libm::powf(pressure_pa / sea_level_pa, 0.190_294))
+//
+// `ref_pa` is the pressure at the desired zero-altitude datum. Passing the
+// captured ground pressure (see baro_task) yields height above the launch
+// point (relative-to-launch / AGL), NOT MSL: the result is exactly 0 m when
+// pressure_pa == ref_pa and grows positive as pressure drops with altitude.
+fn pressure_to_altitude_m(pressure_pa: f32, ref_pa: f32) -> f32 {
+    44330.0 * (1.0 - libm::powf(pressure_pa / ref_pa, 0.190_294))
 }
 
 // ---------------------------------------------------------------------------
@@ -119,10 +123,23 @@ pub async fn baro_task(cs_pin: Peri<'static, peripherals::PA8>) {
 
     // Ground-level pressure reference, averaged from the first valid samples
     // after boot. altitude_m is reported as height above this power-on
-    // location (AGL) rather than absolute MSL, so the relative-altitude hold
-    // logic and the rangefinder-less land/fault touchdown thresholds (which
-    // test altitude against ~0 m) work regardless of field elevation.
-    const GROUND_AVG_SAMPLES: u32 = 10;
+    // location (AGL / relative-to-launch) rather than absolute MSL, so the
+    // relative-altitude hold logic and the rangefinder-less land/fault
+    // touchdown thresholds (which test altitude against ~0 m) work regardless
+    // of field elevation.
+    //
+    // DATUM NOTE: the published BaroData.altitude_m is NOT mean-sea-level. It
+    // is referenced to the captured ground pressure, so the launch point reads
+    // ~0 m. This is achieved numerically by feeding `ground_pa` (rather than a
+    // fixed sea-level constant) into pressure_to_altitude_m below, which makes
+    // the formula evaluate to 0 at ground pressure and grow positive as the
+    // craft climbs (pressure drops).
+    //
+    // 30 samples at the 25 Hz loop rate ≈ 1.2 s of averaging, smoothing
+    // per-sample noise while keeping startup short. The accumulator/divide are
+    // only ever exercised once real (non-zero) samples arrive, so the
+    // absent-hardware path never establishes a bogus reference.
+    const GROUND_AVG_SAMPLES: u32 = 30;
     let mut ground_pa:      f32 = 0.0;
     let mut ground_samples: u32 = 0;
 
@@ -180,7 +197,10 @@ pub async fn baro_task(cs_pin: Peri<'static, peripherals::PA8>) {
             ground_samples += 1;
             if ground_samples == GROUND_AVG_SAMPLES {
                 ground_pa /= GROUND_AVG_SAMPLES as f32;
-                info!("Baro: ground reference {} Pa", ground_pa as u32);
+                info!(
+                    "Baro: ground reference {} Pa ({} samples) — altitude_m now relative-to-launch (AGL, not MSL)",
+                    ground_pa as u32, GROUND_AVG_SAMPLES
+                );
             }
             *STATE.baro_data.lock().await = BaroData { pressure_pa, temp_c, altitude_m: 0.0 };
             continue;

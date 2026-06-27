@@ -12,7 +12,7 @@
 
 use core::f32::consts::PI;
 
-use defmt::{error, info};
+use defmt::{error, info, warn}; // warn used by gyro-cal (all builds) + nucleo-vcp IMU-missing path
 use embassy_stm32::{
     gpio::{Level, Output, Speed},
     peripherals,
@@ -20,8 +20,9 @@ use embassy_stm32::{
 };
 use embassy_time::{Duration, Ticker, Timer};
 
+#[cfg(not(feature = "nucleo-vcp"))] // only the flight build Faults on a missing IMU
+use crate::state::FlightState;
 use crate::{
-    state::FlightState,
     types::{ImuData, Vec3},
     STATE,
 };
@@ -49,6 +50,21 @@ const GYRO_SCALE:  f32 = (2000.0 / 32768.0) * (PI / 180.0);
 const ACCEL_SCALE: f32 = (16.0 / 32768.0) * 9.80665;
 
 // ---------------------------------------------------------------------------
+// Startup gyro-bias calibration
+// ---------------------------------------------------------------------------
+
+// Number of stationary samples to average for the bias estimate. At the 500 Hz
+// sample rate this is ~0.6 s of data; comfortably inside the 200–500 window and
+// quick enough not to stall bring-up.
+const CAL_SAMPLES: u32 = 300;
+
+// If the averaged per-axis gyro magnitude exceeds this, the board was almost
+// certainly moving during calibration. ~0.05 rad/s ≈ 2.9 °/s — far above the
+// few-tenths-of-a-°/s bias a stationary MEMS gyro shows, but well below any
+// real hand motion, so it catches a disturbed cal without false-positives.
+const CAL_SANITY_RAD_S: f32 = 0.05;
+
+// ---------------------------------------------------------------------------
 // SPI transaction helpers
 // ---------------------------------------------------------------------------
 
@@ -71,6 +87,69 @@ async fn read_reg(cs: &mut Output<'_>, addr: u8) -> u8 {
     spi.transfer_in_place(&mut buf).await.ok();
     cs.set_high();
     buf[1]
+}
+
+/// Burst-read the 14-byte sensor block (2 temp + 6 accel + 6 gyro, regs
+/// 0x1D–0x2A) and return the gyro XYZ in rad/s. Returns `None` if the SPI bus
+/// is unavailable or the transfer faults. Shared by calibration and the main
+/// loop so the read/scale path stays identical.
+async fn read_gyro(cs: &mut Output<'_>) -> Option<Vec3> {
+    let mut buf = [0u8; 15];
+    buf[0] = TEMP_DATA1 | 0x80;
+    {
+        let mut bus = crate::SPI1_BUS.lock().await;
+        let spi = bus.as_mut()?;
+        cs.set_low();
+        if spi.transfer_in_place(&mut buf).await.is_err() {
+            cs.set_high();
+            return None;
+        }
+        cs.set_high();
+    }
+    Some(Vec3 {
+        x: i16::from_be_bytes([buf[9],  buf[10]]) as f32 * GYRO_SCALE,
+        y: i16::from_be_bytes([buf[11], buf[12]]) as f32 * GYRO_SCALE,
+        z: i16::from_be_bytes([buf[13], buf[14]]) as f32 * GYRO_SCALE,
+    })
+}
+
+/// Collect `CAL_SAMPLES` stationary gyro samples at the loop rate and average
+/// them into a bias vector. If the result is implausibly large the board was
+/// likely moving; we `warn!` and return a zero bias so we never bake a bad
+/// offset into every subsequent reading.
+async fn calibrate_gyro_bias(cs: &mut Output<'_>, ticker: &mut Ticker) -> Vec3 {
+    info!("IMU: calibrating gyro bias — keep the board still ({} samples)", CAL_SAMPLES);
+
+    let (mut sx, mut sy, mut sz) = (0.0f32, 0.0f32, 0.0f32);
+    let mut n: u32 = 0;
+    while n < CAL_SAMPLES {
+        ticker.next().await;
+        if let Some(g) = read_gyro(cs).await {
+            sx += g.x;
+            sy += g.y;
+            sz += g.z;
+            n += 1;
+        }
+    }
+
+    let inv = 1.0 / n as f32;
+    let bias = Vec3 { x: sx * inv, y: sy * inv, z: sz * inv };
+
+    // Per-axis magnitude check (no sqrt needed in no_std hot path).
+    let moved = bias.x.abs() > CAL_SANITY_RAD_S
+        || bias.y.abs() > CAL_SANITY_RAD_S
+        || bias.z.abs() > CAL_SANITY_RAD_S;
+    if moved {
+        warn!(
+            "IMU: gyro-cal bias implausibly large (x={} y={} z={} rad/s) — board moved? \
+             discarding, using zero bias",
+            bias.x, bias.y, bias.z
+        );
+        return Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+    }
+
+    info!("IMU: gyro bias = (x={} y={} z={}) rad/s", bias.x, bias.y, bias.z);
+    bias
 }
 
 // ---------------------------------------------------------------------------
@@ -98,9 +177,21 @@ pub async fn imu_task(cs_pin: Peri<'static, peripherals::PA4>) {
         { raw }
     };
     if who != WHO_AM_I_EXPECTED {
-        error!("ICM-42688-P not found: WHO_AM_I = 0x{:02X} (expected 0x{:02X})", who, WHO_AM_I_EXPECTED);
-        crate::state::set(FlightState::Fault);
-        loop { Timer::after(Duration::from_secs(1)).await; }
+        // Default (flight) build: a missing IMU is fatal — a flight computer with no
+        // attitude source must refuse to operate, so Fault and park.
+        #[cfg(not(feature = "nucleo-vcp"))]
+        {
+            error!("ICM-42688-P not found: WHO_AM_I = 0x{:02X} (expected 0x{:02X})", who, WHO_AM_I_EXPECTED);
+            crate::state::set(FlightState::Fault);
+            loop { Timer::after(Duration::from_secs(1)).await; }
+        }
+        // Bench build (nucleo-vcp): tolerate a missing IMU so motor tests can run
+        // without faulting the board out of Idle. ⚠ No attitude — DO NOT FLY this build.
+        #[cfg(feature = "nucleo-vcp")]
+        {
+            warn!("ICM-42688-P not found (WHO_AM_I=0x{:02X}) — bench build, continuing WITHOUT IMU (no Fault, DO NOT FLY)", who);
+            loop { Timer::after(Duration::from_secs(1)).await; }
+        }
     }
     info!("IMU: ICM-42688-P found (WHO_AM_I = 0x{:02X})", who);
 
@@ -117,9 +208,15 @@ pub async fn imu_task(cs_pin: Peri<'static, peripherals::PA4>) {
     // Gyro startup in low-noise mode takes up to 45 ms (datasheet Table 1).
     Timer::after(Duration::from_millis(50)).await;
 
-    info!("IMU: running — ±2000 dps / ±16g @ 1 kHz ODR, sampling at 500 Hz");
-
     let mut ticker = Ticker::every(Duration::from_hz(500));
+
+    // Startup gyro-bias calibration. The IMU is confirmed present (WHO_AM_I
+    // matched above), so this only runs on real hardware — the bench/missing-
+    // IMU build never reaches here. Reuses the loop ticker so sampling happens
+    // at the same 500 Hz cadence as the steady read loop.
+    let gyro_bias = calibrate_gyro_bias(&mut cs, &mut ticker).await;
+
+    info!("IMU: running — ±2000 dps / ±16g @ 1 kHz ODR, sampling at 500 Hz");
 
     loop {
         ticker.next().await;
@@ -150,10 +247,11 @@ pub async fn imu_task(cs_pin: Peri<'static, peripherals::PA4>) {
         let ay = i16::from_be_bytes([buf[5],  buf[6]])  as f32 * ACCEL_SCALE;
         let az = i16::from_be_bytes([buf[7],  buf[8]])  as f32 * ACCEL_SCALE;
 
-        // Gyroscope XYZ (rad/s)
-        let gx = i16::from_be_bytes([buf[9],  buf[10]]) as f32 * GYRO_SCALE;
-        let gy = i16::from_be_bytes([buf[11], buf[12]]) as f32 * GYRO_SCALE;
-        let gz = i16::from_be_bytes([buf[13], buf[14]]) as f32 * GYRO_SCALE;
+        // Gyroscope XYZ (rad/s), with the startup bias removed so attitude
+        // integration doesn't drift from a stationary offset.
+        let gx = i16::from_be_bytes([buf[9],  buf[10]]) as f32 * GYRO_SCALE - gyro_bias.x;
+        let gy = i16::from_be_bytes([buf[11], buf[12]]) as f32 * GYRO_SCALE - gyro_bias.y;
+        let gz = i16::from_be_bytes([buf[13], buf[14]]) as f32 * GYRO_SCALE - gyro_bias.z;
 
         *STATE.imu_data.lock().await = ImuData {
             accel: Vec3 { x: ax, y: ay, z: az },

@@ -30,9 +30,15 @@ Usage:
 
 import argparse
 import glob
+import os
 import sys
 import threading
 import time
+
+# The flight-controller RX parser is MAVLink v2 ONLY (it syncs on 0xFD). pymavlink
+# can default to v1 (0xFE), which the FC silently ignores → no ACK. Force v2 here,
+# BEFORE importing pymavlink (the env var is read at import time).
+os.environ.setdefault('MAVLINK20', '1')
 
 try:
     from pymavlink import mavutil
@@ -64,18 +70,23 @@ def heartbeat_loop(master, stop: threading.Event, lock: threading.Lock) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Bench motor test (PROPS OFF).")
-    ap.add_argument('-m', '--motor', type=int, required=True, choices=(1, 2, 3, 4),
-                    help="motor index 1..4 (firmware M1..M4)")
+    ap.add_argument('-m', '--motor', type=int, choices=(1, 2, 3, 4),
+                    help="motor index 1..4 (firmware M1..M4); required unless --listen")
     ap.add_argument('-t', '--throttle', type=float, default=0.08,
                     help=f"throttle 0.0..{THROTTLE_MAX} (default 0.08)")
     ap.add_argument('-p', '--port', default=None,
                     help="serial port (default: autodetect ST-LINK VCP)")
     ap.add_argument('-b', '--baud', type=int, default=57600,
                     help="baud (default 57600, matches telemetry_task)")
+    ap.add_argument('--listen', action='store_true',
+                    help="link diagnostic: receive + count frames FROM the FC for 6 s, "
+                         "send nothing, then exit (no motor command)")
     args = ap.parse_args()
 
     if not 0.0 <= args.throttle <= THROTTLE_MAX:
         ap.error(f"throttle must be within 0.0..{THROTTLE_MAX} (firmware safety clamp)")
+    if not args.listen and args.motor is None:
+        ap.error("--motor is required (or use --listen for the link diagnostic)")
 
     port = args.port or autodetect_port()
     if not port:
@@ -85,6 +96,21 @@ def main() -> None:
     print(f"Connecting to {port} @ {args.baud}…")
     master = mavutil.mavlink_connection(port, baud=args.baud,
                                         source_system=10, source_component=1)
+
+    # Link diagnostic: just read frames coming FROM the FC. FC→host is whole-frame
+    # DMA, so a healthy count here while host→FC commands fail isolates the fault to
+    # the FC's RX path (dropped bytes) rather than baud/link.
+    if args.listen:
+        print("Listening 6 s for frames from the FC (sending nothing)…")
+        good = 0
+        t = time.time()
+        while time.time() - t < 6.0:
+            msg = master.recv_match(blocking=True, timeout=0.5)
+            if msg is not None:
+                good += 1
+                print(f"  decoded: {msg.get_type()} (sys {msg.get_srcSystem()})")
+        print(f"\ntotal good frames from FC: {good}")
+        return
 
     # One lock guards every send: the heartbeat thread and the command below
     # both write through master.mav, and interleaved byte streams corrupt frames.

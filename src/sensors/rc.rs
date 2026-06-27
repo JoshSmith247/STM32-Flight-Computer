@@ -119,12 +119,25 @@ pub async fn rc_task(
     info!("RC task started (SBUS @ 100 kbaud 8E2 inverted)");
 
     let mut buf = [0u8; SBUS_FRAME_LEN];
+    // Edge-triggered link-state logging: the timeout path fires at ~10 Hz when no RC
+    // is connected, so log only on the healthy↔lost transitions instead of every tick.
+    let mut link_up = false;
+    // A degrading link (continuous partial frames / UART errors) never reaches the
+    // timeout path, so trip failsafe after this many consecutive bad reads rather than
+    // leaving stale RC active. At ~14 ms/SBUS frame this is ~40 ms.
+    let mut bad_frames: u8 = 0;
+    const FAILSAFE_AFTER_BAD: u8 = 3;
 
     loop {
         // read_until_idle fires when the line goes idle after the 25-byte burst,
         // which is the natural gap between SBUS frames (~14 ms period).
         match with_timeout(SBUS_TIMEOUT, rx.read_until_idle(&mut buf)).await {
             Ok(Ok(SBUS_FRAME_LEN)) => {
+                bad_frames = 0;
+                if !link_up {
+                    info!("SBUS: link acquired");
+                    link_up = true;
+                }
                 if let Some(frame) = parse_sbus(&buf) {
                     let rc = if frame.failsafe {
                         RcInput { failsafe: true, ..Default::default() }
@@ -144,16 +157,26 @@ pub async fn rc_task(
                     *STATE.rc_input.lock().await = rc;
                 }
             }
-            Ok(Ok(_)) => {
-                // Partial frame — we caught the start mid-stream; wait for next idle.
-                warn!("SBUS: partial frame, re-syncing");
-            }
-            Ok(Err(_)) => {
-                warn!("SBUS: UART error");
+            // Partial frame or UART error — a degraded (not silent) link. Count
+            // consecutive bad reads and assert failsafe before stale RC can linger.
+            Ok(Ok(_)) | Ok(Err(_)) => {
+                bad_frames = bad_frames.saturating_add(1);
+                if bad_frames >= FAILSAFE_AFTER_BAD {
+                    if link_up {
+                        warn!("SBUS: link degraded (partial/error) — failsafe active");
+                        link_up = false;
+                    }
+                    *STATE.rc_input.lock().await = RcInput { failsafe: true, ..Default::default() };
+                }
             }
             Err(_) => {
-                // No frame within timeout — link lost.
-                warn!("SBUS: signal lost, failsafe active");
+                // No frame within the timeout — link fully lost. Failsafe every tick;
+                // log only on the healthy→lost edge to avoid flooding at ~10 Hz.
+                if link_up {
+                    warn!("SBUS: signal lost — failsafe active");
+                    link_up = false;
+                }
+                bad_frames = 0;
                 *STATE.rc_input.lock().await = RcInput { failsafe: true, ..Default::default() };
             }
         }

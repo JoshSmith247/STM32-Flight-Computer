@@ -38,6 +38,14 @@ const SLOTS:   usize = 18;             // 16 data bits + 2 reset
 const MOTORS:  usize = 4;
 const BUF_LEN: usize = SLOTS * MOTORS; // 72 u16 words
 
+// ⚠ BENCH ONLY (PROPS OFF): with `--features bench-force`, motor_task holds this one
+// motor at this throttle every cycle — a constant DSHOT stream on its pin for
+// scope/logic-analyzer probing, with no command/arming/watchdog. NEVER build for flight.
+#[cfg(feature = "bench-force")]
+const BENCH_FORCE_MOTOR:    u8  = 1;   // 1..=4 (M1=PB4, M2=PB5, M3=PB0, M4=PB1)
+#[cfg(feature = "bench-force")]
+const BENCH_FORCE_THROTTLE: f32 = 0.10;
+
 // TIM3 base = 0x4000_4000; DMAR at +0x4C
 const TIM3_DMAR: u32 = 0x4000_404C;
 
@@ -238,6 +246,7 @@ pub async fn motor_task(
         let outputs  = *STATE.motor_outputs.lock().await;
         let is_armed = *STATE.armed.lock().await;
 
+        #[cfg_attr(feature = "bench-force", allow(unused_variables))]
         let motors = if is_armed {
             // Arming voids any pending bench test so it can never carry into flight.
             *STATE.motor_test.lock().await = None;
@@ -255,6 +264,16 @@ pub async fn motor_task(
                     m[(t.idx - 1) as usize] = t.throttle;
                 }
             }
+            m
+        };
+
+        // ⚠ BENCH ONLY (PROPS OFF): override the mixer with a constant throttle on one
+        // motor so a steady DSHOT stream sits on its pin for probing — no command,
+        // arming, or watchdog needed. Overrides the result above. NEVER FLY.
+        #[cfg(feature = "bench-force")]
+        let motors = {
+            let mut m = [0.0f32; MOTORS];
+            m[(BENCH_FORCE_MOTOR - 1) as usize] = BENCH_FORCE_THROTTLE;
             m
         };
 

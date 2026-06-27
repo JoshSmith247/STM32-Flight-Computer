@@ -38,13 +38,107 @@ const REG_CHIP_ID: u8 = 0x0D;
 // bits [7:6]=00  [5:4]=01  [3:2]=10  [1:0]=01  → 0b00_01_10_01 = 0x19
 const CR1_VALUE: u8 = 0x19;
 
-// ── Hard-iron calibration offsets ─────────────────────────────────────────────
-// With the drone fully assembled and all electronics powered, rotate it slowly
-// in a figure-8 pattern. Record the min and max raw ADC count on each axis and
-// set each offset to (max + min) / 2.  All zeros = uncalibrated.
-const MAG_OFFSET_X: f32 = 0.0;
-const MAG_OFFSET_Y: f32 = 0.0;
-const MAG_OFFSET_Z: f32 = 0.0;
+// ── Runtime magnetometer calibration ──────────────────────────────────────────
+// We compute hard-iron + simple diagonal soft-iron calibration at every boot by
+// watching the raw vector while the USER ROTATES THE DRONE through all
+// orientations during a short window. There is NO flash persistence — the cal is
+// thrown away on reset and MUST be redone every power cycle. This is intentional
+// (out of scope); see the project notes.
+//
+// >>> THE USER MUST PHYSICALLY ROTATE THE DRONE (slow figure-8, hitting every
+// >>> axis +/-) for the entire calibration window or heading will be garbage. <<<
+//
+// Hard-iron offset (per axis) = (min + max) / 2.
+// Soft-iron is approximated as a diagonal scale that equalises the per-axis
+// ranges: scale_axis = avg_range / range_axis. This corrects only axis-aligned
+// scale distortion, not cross-axis (off-diagonal) terms — adequate for heading.
+
+/// How long the rotate-the-drone calibration window lasts. The user must keep
+/// rotating the airframe through all orientations for this whole duration.
+const CAL_WINDOW_SECS: u64 = 25;
+
+/// Set to `false` to skip calibration entirely (publish raw, no offset/scale).
+/// Useful on the bench when no field rotation is possible.
+const CAL_ENABLED: bool = true;
+
+/// Per-axis range below this (in LSB) means the user almost certainly did NOT
+/// rotate the drone; we then fall back to identity scale to avoid blowing up a
+/// near-zero range into a huge scale factor.
+const MIN_VALID_RANGE: f32 = 50.0;
+
+/// Hard-iron offset (subtracted) and diagonal soft-iron scale (multiplied)
+/// applied to every raw reading after the calibration window completes.
+#[derive(Clone, Copy)]
+struct MagCal {
+    offset: [f32; 3],
+    scale:  [f32; 3],
+}
+
+impl MagCal {
+    /// Identity: no offset, unity scale (uncalibrated passthrough).
+    const fn identity() -> Self {
+        MagCal { offset: [0.0; 3], scale: [1.0; 3] }
+    }
+
+    #[inline]
+    fn apply(&self, v: [f32; 3]) -> [f32; 3] {
+        [
+            (v[0] - self.offset[0]) * self.scale[0],
+            (v[1] - self.offset[1]) * self.scale[1],
+            (v[2] - self.offset[2]) * self.scale[2],
+        ]
+    }
+}
+
+/// Compute hard-iron offset + diagonal soft-iron scale from observed per-axis
+/// min/max. Falls back to identity scale on any axis whose range is implausibly
+/// small (drone was not actually rotated).
+fn compute_cal(min: [f32; 3], max: [f32; 3]) -> MagCal {
+    let mut offset = [0.0f32; 3];
+    let mut range  = [0.0f32; 3];
+    for i in 0..3 {
+        offset[i] = (min[i] + max[i]) * 0.5;
+        range[i]  = max[i] - min[i];
+    }
+    let avg_range = (range[0] + range[1] + range[2]) / 3.0;
+
+    let mut scale = [1.0f32; 3];
+    if avg_range >= MIN_VALID_RANGE {
+        for i in 0..3 {
+            scale[i] = if range[i] >= MIN_VALID_RANGE {
+                avg_range / range[i]
+            } else {
+                1.0
+            };
+        }
+    }
+    MagCal { offset, scale }
+}
+
+/// Poll DRDY and read one raw magnetometer vector (LSB, sensor frame).
+/// Returns `None` if data is not ready or an I2C read fails (caller skips tick).
+fn read_raw(
+    dev: &mut I2c<'static, embassy_stm32::mode::Blocking, embassy_stm32::i2c::Master>,
+) -> Option<[f32; 3]> {
+    let mut status = [0u8; 1];
+    if dev.blocking_write_read(ADDR, &[REG_STATUS], &mut status).is_err() {
+        warn!("Mag: status read failed");
+        return None;
+    }
+    if status[0] & 0x01 == 0 { return None; } // DRDY not set
+
+    let mut raw = [0u8; 6];
+    if dev.blocking_write_read(ADDR, &[REG_DATA], &mut raw).is_err() {
+        warn!("Mag: data read failed");
+        return None;
+    }
+
+    Some([
+        i16::from_le_bytes([raw[0], raw[1]]) as f32,
+        i16::from_le_bytes([raw[2], raw[3]]) as f32,
+        i16::from_le_bytes([raw[4], raw[5]]) as f32,
+    ])
+}
 
 fn tilt_compensated_heading(bx: f32, by: f32, bz: f32, roll: f32, pitch: f32) -> f32 {
     let (sr, cr) = (libm::sinf(roll),  libm::cosf(roll));
@@ -91,25 +185,72 @@ pub async fn mag_task(
 
     let mut ticker = Ticker::every(Duration::from_hz(25));
 
+    // ── Calibration window ─────────────────────────────────────────────────────
+    // NOTE: NOT persisted to flash — recalibrated on every boot, by design.
+    let cal = if CAL_ENABLED {
+        warn!(
+            "Mag: CALIBRATION STARTING — ROTATE THE DRONE through ALL orientations \
+             (slow figure-8) for the next {} s!",
+            CAL_WINDOW_SECS
+        );
+
+        let mut min = [f32::INFINITY; 3];
+        let mut max = [f32::NEG_INFINITY; 3];
+        let mut samples: u32 = 0;
+        let total_ticks = CAL_WINDOW_SECS * 25;
+        // Log a progress line ~ once per second.
+        let log_every = 25u64;
+
+        for tick in 0..total_ticks {
+            ticker.next().await;
+
+            if let Some(v) = read_raw(&mut dev) {
+                for i in 0..3 {
+                    if v[i] < min[i] { min[i] = v[i]; }
+                    if v[i] > max[i] { max[i] = v[i]; }
+                }
+                samples += 1;
+            }
+
+            if (tick + 1) % log_every == 0 {
+                let secs_left = (total_ticks - tick - 1) / 25;
+                info!(
+                    "Mag cal: {} s left, {} samples — KEEP ROTATING — \
+                     X[{=f32}..{=f32}] Y[{=f32}..{=f32}] Z[{=f32}..{=f32}]",
+                    secs_left, samples,
+                    min[0], max[0], min[1], max[1], min[2], max[2]
+                );
+            }
+        }
+
+        if samples == 0 || min[0].is_infinite() {
+            warn!("Mag cal: no samples captured — publishing UNCALIBRATED (identity)");
+            MagCal::identity()
+        } else {
+            let cal = compute_cal(min, max);
+            info!(
+                "Mag cal DONE ({} samples): offset[{=f32},{=f32},{=f32}] \
+                 scale[{=f32},{=f32},{=f32}]",
+                samples,
+                cal.offset[0], cal.offset[1], cal.offset[2],
+                cal.scale[0],  cal.scale[1],  cal.scale[2]
+            );
+            cal
+        }
+    } else {
+        warn!("Mag: calibration DISABLED (CAL_ENABLED=false) — publishing raw readings");
+        MagCal::identity()
+    };
+
     loop {
         ticker.next().await;
 
-        let mut status = [0u8; 1];
-        if dev.blocking_write_read(ADDR, &[REG_STATUS], &mut status).is_err() {
-            warn!("Mag: status read failed");
-            continue;
-        }
-        if status[0] & 0x01 == 0 { continue; } // DRDY not set
+        let raw = match read_raw(&mut dev) {
+            Some(v) => v,
+            None => continue,
+        };
 
-        let mut raw = [0u8; 6];
-        if dev.blocking_write_read(ADDR, &[REG_DATA], &mut raw).is_err() {
-            warn!("Mag: data read failed");
-            continue;
-        }
-
-        let x = i16::from_le_bytes([raw[0], raw[1]]) as f32 - MAG_OFFSET_X;
-        let y = i16::from_le_bytes([raw[2], raw[3]]) as f32 - MAG_OFFSET_Y;
-        let z = i16::from_le_bytes([raw[4], raw[5]]) as f32 - MAG_OFFSET_Z;
+        let [x, y, z] = cal.apply(raw);
 
         let q = *STATE.attitude.lock().await;
         let roll  = libm::atan2f(

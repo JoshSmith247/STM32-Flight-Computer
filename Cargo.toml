@@ -33,3 +33,7 @@ simulation = []
 # header pins (PB10/PB11), so a GCS can send DO_MOTOR_TEST etc. over the same
 # USB cable used to flash. Leave OFF for the deployed Pi wiring.
 nucleo-vcp = []
+# ⚠ BENCH ONLY (PROPS OFF): hold one motor (BENCH_FORCE_MOTOR in motor.rs) at a fixed
+# throttle continuously — a constant DSHOT stream for scope/logic-analyzer probing, no
+# command/arming/watchdog needed. NEVER flash for flight.
+bench-force = []

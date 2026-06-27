@@ -437,6 +437,22 @@ pub async fn navigation_task() {
                         let vel_right_ms = flow.vel_y_mrad_s as f32 * h_m / 1_000_000.0;
                         pitch += FLOW_DAMP_KP * vel_fwd_ms;
                         roll  -= FLOW_DAMP_KP * vel_right_ms;
+                    } else {
+                        // ── Fused-estimate velocity damping (ADDED: complementary estimator) ──
+                        // When optical flow is unavailable (too high / no rangefinder),
+                        // damp drift using the fused NED velocity from estimator_task,
+                        // rotated into body frame. This is purely additive damping on top
+                        // of the unchanged GPS-direct position loop above; it never runs
+                        // when flow is valid, so existing PosHold behaviour is preserved.
+                        // REVERSIBLE: delete this entire `else` block to restore the
+                        // original flow-only behaviour.
+                        let est = *STATE.pos_estimate.lock().await;
+                        if est.valid {
+                            let vel_fwd_ms   =  est.vel_n * cosf(yaw) + est.vel_e * sinf(yaw);
+                            let vel_right_ms = -est.vel_n * sinf(yaw) + est.vel_e * cosf(yaw);
+                            pitch += FLOW_DAMP_KP * vel_fwd_ms;
+                            roll  -= FLOW_DAMP_KP * vel_right_ms;
+                        }
                     }
 
                     (roll.clamp(-MAX_TILT_RAD, MAX_TILT_RAD), pitch.clamp(-MAX_TILT_RAD, MAX_TILT_RAD))
