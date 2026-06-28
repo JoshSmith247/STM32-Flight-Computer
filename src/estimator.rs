@@ -114,6 +114,13 @@ impl PosEstimator {
 
         let an = r00 * accel_body.x + r01 * accel_body.y + r02 * accel_body.z;
         let ae = r10 * accel_body.x + r11 * accel_body.y + r12 * accel_body.z;
+        // ⚠ FRAME CAVEAT — UNVERIFIED, reconcile at IMU bring-up. This assumes an
+        // NED/Z-down accel convention (rest accel ≈ -g on Down). But ahrs.rs (Madgwick)
+        // uses a Z-UP world (rest accel ≈ +1g on +Z), so the GRAVITY sign and the
+        // Down-axis labeling here are likely INVERTED. Do NOT trust the vertical channel
+        // until the real accel polarity is confirmed on hardware and this is corrected;
+        // horizontal channels are approximately OK at small tilt.
+        //
         // The accelerometer measures specific force; at rest it reads +g on the
         // axis opposing gravity. In NED the world-frame measured Down component
         // is ~ -g while stationary, so adding GRAVITY removes the bias and

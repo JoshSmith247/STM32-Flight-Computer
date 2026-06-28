@@ -3,6 +3,7 @@
 
 mod ahrs;
 mod estimator;
+mod health;
 mod navigation;
 mod pid;
 mod state;
@@ -163,11 +164,18 @@ async fn arming_task() {
                 state::set(FlightState::Flying);
             }
         } else if rc.arm && rc.throttle < 0.05 && !rc.failsafe {
-            // Reject arm in GPS-dependent modes without a 3-D fix.
+            // Pre-arm checks (health_task plausibility gates). A usable IMU is
+            // mandatory for any flight; GPS-dependent modes additionally require a
+            // nav-ready GPS fix (3-D + bounded accuracy) and a calibrated compass.
+            let health = *STATE.sensor_health.lock().await;
             let mode_needs_gps = matches!(rc.mode,
                 FlightMode::PositionHold | FlightMode::Auto | FlightMode::ReturnToHome);
-            if mode_needs_gps && !STATE.gps_fix.lock().await.fix_ok {
-                defmt::warn!("Arm denied: mode requires GPS 3D fix");
+            if !health.imu_ok {
+                defmt::warn!("Arm denied: IMU not healthy");
+            } else if mode_needs_gps && !health.gps_ok {
+                defmt::warn!("Arm denied: mode requires nav-ready GPS (3D fix + accuracy)");
+            } else if mode_needs_gps && !health.mag_ok {
+                defmt::warn!("Arm denied: mode requires a calibrated compass");
             } else {
                 *STATE.armed.lock().await = true;
                 state::set(FlightState::Armed);
@@ -246,6 +254,7 @@ async fn main(spawner: Spawner) {
     // spawner.spawn(sensors::battery::battery_task(p.ADC3, p.PC0).unwrap());
     spawner.spawn(navigation::navigation_task().unwrap());
     spawner.spawn(estimator::estimator_task().unwrap());
+    spawner.spawn(health::health_task().unwrap());
     spawner.spawn(control_task().unwrap());
     spawner.spawn(arming_task().unwrap());
     spawner.spawn(sensors::flow::flow_task(p.UART4, p.PC11, p.DMA1_CH2, Irqs).unwrap());

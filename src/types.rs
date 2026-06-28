@@ -225,6 +225,17 @@ pub struct PosEstimate {
     pub valid: bool,   // true once the NED origin has been set from GPS
 }
 
+/// Per-sensor health/plausibility flags, updated by health_task (~20 Hz). Each flag is
+/// true only when that sensor is producing physically plausible, usable data. Consumed
+/// by the pre-arm checks in arming_task (and available for future failsafe logic).
+#[derive(Clone, Copy, Default, defmt::Format)]
+pub struct SensorHealth {
+    pub imu_ok:  bool,   // accel magnitude near 1 g + gyro not saturated + finite
+    pub baro_ok: bool,   // altitude finite + no implausible single-tick spike
+    pub mag_ok:  bool,   // calibrated/valid compass data
+    pub gps_ok:  bool,   // 3-D fix with horizontal accuracy within bound
+}
+
 /// Magnetometer data from QMC5883L, updated by mag_task at 25 Hz.
 #[derive(Clone, Copy, Default, defmt::Format)]
 pub struct MagData {
@@ -282,6 +293,7 @@ pub struct SharedState {
     pub servo_outputs: Mutex<CriticalSectionRawMutex, ServoOutputs>,
     pub mag_data:      Mutex<CriticalSectionRawMutex, MagData>,
     pub pos_estimate:  Mutex<CriticalSectionRawMutex, PosEstimate>,
+    pub sensor_health: Mutex<CriticalSectionRawMutex, SensorHealth>,
     pub payload_flags:  Mutex<CriticalSectionRawMutex, u32>,
     pub weed_target:    Mutex<CriticalSectionRawMutex, WeedTarget>,
     /// Written by telemetry_task when MAV_CMD_DO_SET_HOME (179) arrives.
@@ -307,6 +319,7 @@ impl SharedState {
             servo_outputs: Mutex::new(ServoOutputs { s1:0.0, s2:0.0, s3:0.0, s4:0.0 }),
             mag_data:      Mutex::new(MagData { x:0.0, y:0.0, z:0.0, heading_rad:0.0, valid:false }),
             pos_estimate:  Mutex::new(PosEstimate { pos_n:0.0, pos_e:0.0, pos_d:0.0, vel_n:0.0, vel_e:0.0, vel_d:0.0, valid:false }),
+            sensor_health: Mutex::new(SensorHealth { imu_ok:false, baro_ok:false, mag_ok:false, gps_ok:false }),
             payload_flags:  Mutex::new(0u32),
             weed_target:    Mutex::new(WeedTarget { position: LatLonAlt { lat_deg:0.0, lon_deg:0.0, alt_m:0.0 }, extract_alt_m: 0.4, valid: false }),
             home_override:  Mutex::new(None),
