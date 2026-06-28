@@ -48,6 +48,10 @@ enum WeedPhase {
 pub const MAX_WAYPOINTS: usize = 32;
 
 const WAYPOINT_RADIUS_M: f32 = 2.0;
+const TAKEOFF_ALT_M:     f32 = 2.0;          // auto-takeoff climb height (baro, AGL)
+const TAKEOFF_BAND_M:    f32 = 0.3;          // "reached takeoff altitude" tolerance
+const GEOFENCE_MAX_ALT_M:    f32 = 120.0;    // altitude ceiling, AGL (~400 ft)
+const GEOFENCE_MAX_RADIUS_M: f32 = 300.0;    // max horizontal distance from home
 const LAND_DESCENT_MPS:  f32 = 0.5;          // m/s target descent rate
 const BATT_LOW_PCT:      u8  = 20;           // trigger RTH when SoC drops below this
 const CRUISE_SPEED_MPS:  f32 = 5.0;          // nominal cruise (sets error cap)
@@ -261,6 +265,9 @@ pub async fn navigation_task() {
     let mut prev_mode:        FlightMode           = FlightMode::Stabilise;
     let mut home_set:         bool                 = false;
     let mut last_gps_ok:      Instant              = Instant::now();
+    let mut prev_armed:       bool                 = false;
+    let mut takeoff_done:     bool                 = false;
+    let mut takeoff_target_alt: f32               = 0.0;
 
     info!("Navigation task started (100 Hz)");
     let mut ticker = Ticker::every(Duration::from_hz(100));
@@ -283,6 +290,14 @@ pub async fn navigation_task() {
             2.0 * (attitude.w * attitude.z + attitude.x * attitude.y),
             1.0 - 2.0 * (attitude.y * attitude.y + attitude.z * attitude.z),
         );
+
+        // Auto-takeoff bookkeeping: on the disarmed→armed edge, capture the takeoff
+        // target (current baro + climb height) and require a fresh climb next mission.
+        if is_armed && !prev_armed {
+            takeoff_target_alt = baro.altitude_m + TAKEOFF_ALT_M;
+            takeoff_done = false;
+        }
+        prev_armed = is_armed;
 
         if !is_armed {
             STATE.nav_command.lock().await.autonomous = false;
@@ -320,6 +335,21 @@ pub async fn navigation_task() {
         // Resolve effective mode: Fault → Land; critical battery → RTH or Land
         let effective_mode = if state::get() == state::FlightState::Fault {
             FlightMode::Land
+        } else if home_set
+            && (baro.altitude_m > GEOFENCE_MAX_ALT_M
+                || (gps.fix_ok && haversine_m(pos, mission.home) > GEOFENCE_MAX_RADIUS_M))
+            && !matches!(mode, FlightMode::Land | FlightMode::ReturnToHome)
+        {
+            // Geofence breach (altitude ceiling or distance from home) → come home / land.
+            if gps.fix_ok {
+                warn!("Geofence breach — forcing RTH");
+                state::set(state::FlightState::Landing);
+                FlightMode::ReturnToHome
+            } else {
+                warn!("Geofence breach — forcing Land");
+                state::set(state::FlightState::Landing);
+                FlightMode::Land
+            }
         } else if battery.critical
             && !matches!(mode, FlightMode::Land | FlightMode::ReturnToHome)
         {
@@ -489,6 +519,26 @@ pub async fn navigation_task() {
                 if !gps.fix_ok {
                     warn!("Auto: no GPS fix");
                     NavCommand { autonomous: false, ..Default::default() }
+                } else if !takeoff_done {
+                    // ── AUTO-TAKEOFF: climb to TAKEOFF_ALT_M before running the mission.
+                    // Level attitude + alt PID to the captured target. NOTE: autonomous
+                    // flight still requires an RC link up — control_task zeros motors on
+                    // RC failsafe, so this assumes a safety-pilot link is present.
+                    let climb = NavCommand {
+                        autonomous: true,
+                        attitude_setpoint: AttitudeSetpoint {
+                            roll: 0.0, pitch: 0.0, yaw_rate: 0.0,
+                            throttle: alt_pid.update(takeoff_target_alt, baro.altitude_m),
+                        },
+                        target: Default::default(),
+                    };
+                    if baro.altitude_m >= takeoff_target_alt - TAKEOFF_BAND_M {
+                        takeoff_done = true;
+                        nav_pid_n.reset();
+                        nav_pid_e.reset();
+                        info!("Auto: takeoff complete at {=f32} m — starting mission", baro.altitude_m);
+                    }
+                    climb
                 } else {
                     let weed = *STATE.weed_target.lock().await;
 
@@ -514,6 +564,7 @@ pub async fn navigation_task() {
                             WeedPhase::Approach => {
                                 let dist = haversine_m(pos, weed.position);
                                 if dist < WEED_ARRIVE_M {
+                                    alt_pid.reset(); // altitude reference switches baro→AGL
                                     weed_phase       = Some(WeedPhase::Descend);
                                     weed_phase_timer = None;
                                     info!("Weed overhead (dist={=f32}m) — descending to {=f32}m AGL",

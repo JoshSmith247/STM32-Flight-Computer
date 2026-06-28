@@ -70,12 +70,20 @@ bind_interrupts!(pub struct Irqs {
 #[embassy_executor::task]
 async fn control_task() {
     use ahrs::MadgwickFilter;
-    use pid::{mix_quad_x, FlightPids};
+    use pid::{mix_quad_x, FlightPids, LowPass3};
+
+    // Gyro low-pass cutoff for the rate loop (attenuates motor noise on the D-term).
+    const GYRO_LPF_HZ: f32 = 90.0;
+    // Crash/tumble cutoff: disarm if |roll| or |pitch| exceeds this for CRASH_TICKS.
+    const CRASH_ANGLE_RAD: f32 = 1.31;   // ~75°
+    const CRASH_TICKS: u32 = 100;        // 0.2 s sustained @ 500 Hz
 
     let mut filter = MadgwickFilter::new(0.1, 1.0 / 500.0);
+    let mut gyro_lpf = LowPass3::new(GYRO_LPF_HZ, 1.0 / 500.0);
     let mut pids = FlightPids::default();
     let mut ticker = Ticker::every(Duration::from_hz(500));
     let mut wdg_tick: u32 = 0;
+    let mut crash_ticks: u32 = 0;
 
     loop {
         ticker.next().await;
@@ -89,6 +97,10 @@ async fn control_task() {
         let is_armed = *STATE.armed.lock().await;
         let nav_cmd  = *STATE.nav_command.lock().await;
         let rc       = *STATE.rc_input.lock().await;
+
+        // Filtered gyro for the rate loop (run every tick to keep it warm); the
+        // Madgwick estimator below intentionally uses the raw gyro to avoid added lag.
+        let gyro_f = gyro_lpf.apply(imu.gyro);
 
         let setpoint = if nav_cmd.autonomous {
             nav_cmd.attitude_setpoint
@@ -117,15 +129,42 @@ async fn control_task() {
                   euler.roll * R2D, euler.pitch * R2D, euler.yaw * R2D);
         }
 
+        // Crash/tumble cutoff: a sustained extreme tilt while armed means we've flipped
+        // or hit the ground — kill motors and latch Fault so they can't keep driving in.
+        if is_armed && (euler.roll.abs() > CRASH_ANGLE_RAD || euler.pitch.abs() > CRASH_ANGLE_RAD) {
+            crash_ticks += 1;
+            if crash_ticks > CRASH_TICKS {
+                *STATE.armed.lock().await = false;
+                state::set(FlightState::Fault);
+                *STATE.motor_outputs.lock().await = Default::default();
+                pids.reset_all();
+                defmt::warn!("Crash/tumble: extreme tilt — disarmed + Fault");
+                crash_ticks = 0;
+                continue;
+            }
+        } else {
+            crash_ticks = 0;
+        }
+
         if !is_armed || rc.failsafe {
             pids.reset_all();
             *STATE.motor_outputs.lock().await = Default::default();
             continue;
         }
 
-        let (roll_out, pitch_out, yaw_out) = pids.update(&setpoint, &euler, imu.gyro);
+        let (roll_out, pitch_out, yaw_out) = pids.update(&setpoint, &euler, gyro_f);
         let outputs = mix_quad_x(setpoint.throttle, roll_out, pitch_out, yaw_out);
         *STATE.motor_outputs.lock().await = outputs;
+
+        // ── Blackbox / PID-tuning stream — capture via RTT (`cargo run --features tune-log`) ──
+        // ~50 Hz: per-axis setpoint vs measured attitude, filtered gyro, and PID outputs, so
+        // step responses and oscillation are visible for tuning. Off by default (zero cost).
+        #[cfg(feature = "tune-log")]
+        if wdg_tick % 10 == 0 {
+            info!("TUNE spR={=f32} spP={=f32} mR={=f32} mP={=f32} gx={=f32} gy={=f32} gz={=f32} oR={=f32} oP={=f32} oY={=f32}",
+                  setpoint.roll, setpoint.pitch, euler.roll, euler.pitch,
+                  gyro_f.x, gyro_f.y, gyro_f.z, roll_out, pitch_out, yaw_out);
+        }
     }
 }
 
@@ -216,7 +255,13 @@ async fn main(spawner: Spawner) {
     config.rcc.apb2_pre = APBPrescaler::Div2;    // APB2   = 100 MHz
     config.rcc.apb3_pre = APBPrescaler::Div2;    // APB3   = 100 MHz
     config.rcc.apb4_pre = APBPrescaler::Div2;    // APB4   = 100 MHz
-    
+
+    // ADC kernel clock from per_ck (HSI). Without it ADC conversions never complete —
+    // the reason battery_task was disabled. ⚠ Runtime-unverified: confirm a sane PC0
+    // reading and calibrate V_DIVIDER (battery.rs) at hardware bring-up before trusting
+    // the low-battery failsafe — a wrong reading reads "critical" and forces RTH/Land.
+    config.rcc.mux.adcsel = mux::Adcsel::Per;
+
     let p = embassy_stm32::init(config);
 
     init_watchdog();
@@ -246,12 +291,12 @@ async fn main(spawner: Spawner) {
     spawner.spawn(telemetry::telemetry_task(p.USART3, p.PD9, p.PD8, p.DMA1_CH3, p.DMA1_CH1, Irqs).unwrap());
     spawner.spawn(sensors::baro::baro_task(p.PA8).unwrap());
     spawner.spawn(sensors::gps::gps_task(p.USART1, p.PA10, p.PA9, p.DMA2_CH6, p.DMA2_CH5, Irqs).unwrap());
-    // DISABLED: battery_task's `adc.blocking_read()` busy-spins forever because the
-    // ADC3 kernel clock is not configured in the RCC setup above — wedging the
-    // single-threaded executor (board appears dead). Re-enable once the ADC clock
-    // is set (e.g. config.rcc.mux.adcsel) or the read is moved to async DMA.
-    // Not needed for bench motor testing. See sensors/battery.rs:66.
-    // spawner.spawn(sensors::battery::battery_task(p.ADC3, p.PC0).unwrap());
+    // Battery voltage monitor (ADC3/PC0). The ADC kernel clock is now configured in RCC
+    // above (adcsel = PER), so blocking_read no longer wedges the executor. ⚠ Verify the
+    // reading + tune V_DIVIDER in battery.rs at hardware bring-up: until calibrated it may
+    // read low and trip the critical-battery failsafe (forces RTH/Land). On the bench
+    // (no pack on PC0) it reads ~0 V → "critical", harmless since you don't arm-fly there.
+    spawner.spawn(sensors::battery::battery_task(p.ADC3, p.PC0).unwrap());
     spawner.spawn(navigation::navigation_task().unwrap());
     spawner.spawn(estimator::estimator_task().unwrap());
     spawner.spawn(health::health_task().unwrap());

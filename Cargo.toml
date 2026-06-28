@@ -37,3 +37,6 @@ nucleo-vcp = []
 # throttle continuously — a constant DSHOT stream for scope/logic-analyzer probing, no
 # command/arming/watchdog needed. NEVER flash for flight.
 bench-force = []
+# PID-tuning "blackbox": stream ~50 Hz setpoint/measured/gyro/output over RTT defmt for
+# capture + plotting during tuning (`cargo run --features tune-log`). Off by default.
+tune-log = []

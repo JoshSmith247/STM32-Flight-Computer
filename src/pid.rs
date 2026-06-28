@@ -9,6 +9,35 @@
 use crate::types::{AttitudeSetpoint, Euler, MotorOutputs, Vec3};
 
 // ---------------------------------------------------------------------------
+// Gyro low-pass filter (PT1)
+// ---------------------------------------------------------------------------
+
+/// First-order (PT1) low-pass on a 3-axis signal, applied to the gyro before the rate
+/// PID to attenuate motor-induced noise — especially on the D-term, which otherwise
+/// heats the motors and wrecks the tune. `cutoff_hz` trades noise rejection against
+/// added phase lag; ~80–100 Hz is typical for a 7" quad at a 500 Hz loop.
+#[derive(Clone, Copy)]
+pub struct LowPass3 {
+    alpha: f32,
+    y:     Vec3,
+}
+
+impl LowPass3 {
+    pub fn new(cutoff_hz: f32, dt: f32) -> Self {
+        let rc = 1.0 / (2.0 * core::f32::consts::PI * cutoff_hz);
+        Self { alpha: dt / (dt + rc), y: Vec3 { x: 0.0, y: 0.0, z: 0.0 } }
+    }
+
+    /// Update with a new sample and return the filtered value.
+    pub fn apply(&mut self, x: Vec3) -> Vec3 {
+        self.y.x += self.alpha * (x.x - self.y.x);
+        self.y.y += self.alpha * (x.y - self.y.y);
+        self.y.z += self.alpha * (x.z - self.y.z);
+        self.y
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Single-axis PID state
 // ---------------------------------------------------------------------------
 
