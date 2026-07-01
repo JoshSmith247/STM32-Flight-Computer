@@ -46,6 +46,8 @@ const MAGIC_MISSION_REQUEST_INT: u8 = 196;
 const MAGIC_MISSION_ACK:                    u8 = 153;
 const MAGIC_SET_POSITION_TARGET_LOCAL_NED: u8 = 143;
 const MAGIC_SCALED_IMU:                    u8 = 170;
+#[cfg(feature = "dshot-debug")]
+const MAGIC_STATUSTEXT:                    u8 = 83;
 
 const MAV_RESULT_ACCEPTED:             u8 = 0;
 const MAV_RESULT_TEMPORARILY_REJECTED: u8 = 1;
@@ -305,6 +307,41 @@ fn build_mission_ack(result: u8) -> [u8; 3] {
     [255, 0, result]
 }
 
+// STATUSTEXT #253 — severity(u8) + text[50]. Used (only under `dshot-debug`) to surface
+// the DSHOT TX-path counters to the GCS, so the bench is diagnosable over the Pi serial
+// link with no probe-rs/RTT attached. Trailing id/chunk_seq extensions left zero.
+#[cfg(feature = "dshot-debug")]
+struct FixedBuf { buf: [u8; 50], len: usize }
+
+#[cfg(feature = "dshot-debug")]
+impl core::fmt::Write for FixedBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.len >= self.buf.len() { break; }
+            self.buf[self.len] = b;
+            self.len += 1;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "dshot-debug")]
+fn build_statustext_dshot() -> [u8; 51] {
+    use core::fmt::Write;
+    use core::sync::atomic::Ordering;
+    use crate::actuators::motor::debug_stats as ds;
+
+    let mut p = [0u8; 51];
+    p[0] = 6; // MAV_SEVERITY_INFO
+    let mut fb = FixedBuf { buf: [0u8; 50], len: 0 };
+    let _ = write!(fb, "DSHOT f={} tc={} sk={} st={} e={} pin={:04b}",
+        ds::FRAMES.load(Ordering::Relaxed),   ds::TC.load(Ordering::Relaxed),
+        ds::SKIPPED.load(Ordering::Relaxed),  ds::STUCK_EN.load(Ordering::Relaxed),
+        ds::ERRORS.load(Ordering::Relaxed),   ds::PIN_MASK.load(Ordering::Relaxed));
+    p[1..1 + fb.len].copy_from_slice(&fb.buf[..fb.len]);
+    p
+}
+
 // ── Command dispatcher ────────────────────────────────────────────────────────
 
 async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
@@ -364,7 +401,7 @@ async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
                 warn!("MOTOR_TEST rejected: must be disarmed and Idle (on ground)");
                 return MAV_RESULT_TEMPORARILY_REJECTED;
             }
-            let throttle = param2.clamp(0.0, 0.20);
+            let throttle = param2.clamp(0.0, 0.40); // TEMP bench diagnostic: was 0.20 — revert before flight
             let until = Instant::now() + Duration::from_secs(2);
             *STATE.motor_test.lock().await = Some(MotorTest { idx, throttle, until });
             info!("MOTOR_TEST: M{} @ {} for 2 s", idx, throttle);
@@ -612,6 +649,14 @@ pub async fn telemetry_task(
                     let baro = *STATE.baro_data.lock().await;
                     let p = build_global_position_int(time_ms, &gps, baro.altitude_m, yaw);
                     let n = write_frame(&mut buf, seq, 33, &p, MAGIC_GLOBAL_POSITION_INT);
+                    tx.write(&buf[..n]).await.ok();
+                    seq = seq.wrapping_add(1);
+                }
+                // #4: DSHOT TX-path counters → GCS as a 1 Hz STATUSTEXT (bench builds only).
+                #[cfg(feature = "dshot-debug")]
+                3 => {
+                    let p = build_statustext_dshot();
+                    let n = write_frame(&mut buf, seq, 253, &p, MAGIC_STATUSTEXT);
                     tx.write(&buf[..n]).await.ok();
                     seq = seq.wrapping_add(1);
                 }

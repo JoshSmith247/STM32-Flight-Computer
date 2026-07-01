@@ -37,6 +37,26 @@ nucleo-vcp = []
 # throttle continuously — a constant DSHOT stream for scope/logic-analyzer probing, no
 # command/arming/watchdog needed. NEVER flash for flight.
 bench-force = []
+# BENCH DIAGNOSTIC (`--features pin-test`): replace motor_task with a GPIO sweep that
+# drives PB4/PB5/PB0/PB1 HIGH one at a time, so a multimeter (DC volts) can verify each
+# STM pin reaches its ESC signal pad. No DShot, no TIM3 — nothing spins. Bench only.
+pin-test = []
+# ⚠ BENCH ONLY (PROPS OFF): `--features spin-all` arms the ESCs (continuous zeros) then
+# holds ALL FOUR motors at a low fixed throttle automatically — watch every motor spin
+# without the GCS script. NEVER flash for flight.
+spin-all = []
 # PID-tuning "blackbox": stream ~50 Hz setpoint/measured/gyro/output over RTT defmt for
 # capture + plotting during tuning (`cargo run --features tune-log`). Off by default.
 tune-log = []
+# BENCH DIAGNOSTIC (`--features dshot-debug`): instrument the DSHOT TX path — a one-shot
+# readback of the GPIO alternate-function / TIM3 / DMAMUX config at init, plus a 1 Hz
+# DMA-health log (frames sent/skipped, transfer-complete + error flags, last NDTR). Pure
+# observability, no behaviour change. Combine with spin-all to watch the signal path
+# while the motors are commanded — tells you if the chip is clocking a clean frame out.
+dshot-debug = []
+# ⚠ BENCH ONLY, PROTOCOL-CHANGING (`--features dshot-bidir`): switch the DSHOT encoding to
+# BIDIRECTIONAL (inverted CRC) so the ESC replies with eRPM telemetry. The encode + GCR
+# decode are implemented; the on-wire edge CAPTURE is a documented, NOT-yet-bench-validated
+# scaffold. Mutually exclusive with plain DSHOT — an ESC on standard firmware won't decode
+# it. Implies dshot-debug for the readout. NEVER flash for flight.
+dshot-bidir = ["dshot-debug"]

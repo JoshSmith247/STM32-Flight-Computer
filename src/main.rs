@@ -281,7 +281,13 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(status::led::led_task(led).unwrap());
     spawner.spawn(sensors::imu::imu_task(p.PA4).unwrap());
+    #[cfg(not(feature = "pin-test"))]
     spawner.spawn(actuators::motor::motor_task(p.TIM3, p.PB4, p.PB5, p.PB0, p.PB1).unwrap());
+    // ⚠ BENCH DIAGNOSTIC (`--features pin-test`): drive the four motor pins as plain GPIO
+    // (one HIGH at a time) so a DMM can confirm each STM pin reaches the right ESC pad.
+    // No DShot, no TIM3 — nothing spins. TIM3 is simply left unused in this build.
+    #[cfg(feature = "pin-test")]
+    spawner.spawn(actuators::motor::pin_test_task(p.PB4, p.PB5, p.PB0, p.PB1).unwrap());
     spawner.spawn(sensors::rc::rc_task(p.USART2, p.PA2, p.PA3, p.DMA1_CH5, Irqs).unwrap());
     // MAVLink on USART3. Default = Pi header pins (PB11/PB10); `nucleo-vcp`
     // routes it to the ST-Link VCP (PD9/PD8) for prop-off bench testing over USB.
