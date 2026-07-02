@@ -280,7 +280,8 @@ async fn main(spawner: Spawner) {
     let led = Output::new(p.PG7, Level::High, Speed::Low); // active-low: start HIGH = off
 
     spawner.spawn(status::led::led_task(led).unwrap());
-    spawner.spawn(sensors::imu::imu_task(p.PA4).unwrap());
+    // TEMP-BISECT (revert!): sensor/UART tasks disabled to test if one blocks the executor.
+    // spawner.spawn(sensors::imu::imu_task(p.PA4).unwrap());
     #[cfg(not(feature = "pin-test"))]
     spawner.spawn(actuators::motor::motor_task(p.TIM3, p.PB4, p.PB5, p.PB0, p.PB1).unwrap());
     // ⚠ BENCH DIAGNOSTIC (`--features pin-test`): drive the four motor pins as plain GPIO
@@ -288,29 +289,33 @@ async fn main(spawner: Spawner) {
     // No DShot, no TIM3 — nothing spins. TIM3 is simply left unused in this build.
     #[cfg(feature = "pin-test")]
     spawner.spawn(actuators::motor::pin_test_task(p.PB4, p.PB5, p.PB0, p.PB1).unwrap());
-    spawner.spawn(sensors::rc::rc_task(p.USART2, p.PA2, p.PA3, p.DMA1_CH5, Irqs).unwrap());
+    // TEMP-BISECT: ALL sensor/UART tasks OFF → steady 500 Hz. Spin test: let it run PAST 7 s.
+    // spawner.spawn(sensors::rc::rc_task(p.USART2, p.PA2, p.PA3, p.DMA1_CH5, Irqs).unwrap());
     // MAVLink on USART3. Default = Pi header pins (PB11/PB10); `nucleo-vcp`
     // routes it to the ST-Link VCP (PD9/PD8) for prop-off bench testing over USB.
-    #[cfg(not(feature = "nucleo-vcp"))]
-    spawner.spawn(telemetry::telemetry_task(p.USART3, p.PB11, p.PB10, p.DMA1_CH3, p.DMA1_CH1, Irqs).unwrap());
-    #[cfg(feature = "nucleo-vcp")]
-    spawner.spawn(telemetry::telemetry_task(p.USART3, p.PD9, p.PD8, p.DMA1_CH3, p.DMA1_CH1, Irqs).unwrap());
-    spawner.spawn(sensors::baro::baro_task(p.PA8).unwrap());
-    spawner.spawn(sensors::gps::gps_task(p.USART1, p.PA10, p.PA9, p.DMA2_CH6, p.DMA2_CH5, Irqs).unwrap());
+    // TEMP-BISECT: telemetry OFF (rc/gps still on) — is the MAVLink TX blocking?
+    // #[cfg(not(feature = "nucleo-vcp"))]
+    // spawner.spawn(telemetry::telemetry_task(p.USART3, p.PB11, p.PB10, p.DMA1_CH3, p.DMA1_CH1, Irqs).unwrap());
+    // #[cfg(feature = "nucleo-vcp")]
+    // spawner.spawn(telemetry::telemetry_task(p.USART3, p.PD9, p.PD8, p.DMA1_CH3, p.DMA1_CH1, Irqs).unwrap());
+    // TEMP-BISECT (revert!): // spawner.spawn(sensors::baro::baro_task(p.PA8).unwrap());
+    // spawner.spawn(sensors::gps::gps_task(p.USART1, p.PA10, p.PA9, p.DMA2_CH6, p.DMA2_CH5, Irqs).unwrap());
     // Battery voltage monitor (ADC3/PC0). The ADC kernel clock is now configured in RCC
     // above (adcsel = PER), so blocking_read no longer wedges the executor. ⚠ Verify the
     // reading + tune V_DIVIDER in battery.rs at hardware bring-up: until calibrated it may
     // read low and trip the critical-battery failsafe (forces RTH/Land). On the bench
     // (no pack on PC0) it reads ~0 V → "critical", harmless since you don't arm-fly there.
-    spawner.spawn(sensors::battery::battery_task(p.ADC3, p.PC0).unwrap());
+    // TEMP-BISECT (revert!):
+    // spawner.spawn(sensors::battery::battery_task(p.ADC3, p.PC0).unwrap());
     spawner.spawn(navigation::navigation_task().unwrap());
     spawner.spawn(estimator::estimator_task().unwrap());
     spawner.spawn(health::health_task().unwrap());
     spawner.spawn(control_task().unwrap());
     spawner.spawn(arming_task().unwrap());
-    spawner.spawn(sensors::flow::flow_task(p.UART4, p.PC11, p.DMA1_CH2, Irqs).unwrap());
+    // TEMP-BISECT: flow OFF (rc/telemetry/gps still on) — is the flow sensor the blocker?
+    // spawner.spawn(sensors::flow::flow_task(p.UART4, p.PC11, p.DMA1_CH2, Irqs).unwrap());
     spawner.spawn(actuators::payloads::servo::servo_task(p.TIM4, p.PD12, p.PD13, p.PD14, p.PD15).unwrap());
-    spawner.spawn(sensors::mag::mag_task(p.I2C1, p.PB8, p.PB9).unwrap());
+    // spawner.spawn(sensors::mag::mag_task(p.I2C1, p.PB8, p.PB9).unwrap());
 
     state::set(FlightState::Idle);
 

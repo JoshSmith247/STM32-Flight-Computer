@@ -1,6 +1,11 @@
-//! Motor output — DSHOT600 via TIM3 burst DMA.
+//! Motor output — DSHOT300 (default) via TIM3 burst DMA. DSHOT600 available via
+//! `--features dshot600` for ESCs that support it — the fitted HGLRC 60A V2 4-in-1
+//! BLHeli_S ESC's target MCU cannot parse DShot600 despite the "DShot600/300" listing
+//! on the box, confirmed by bench test 2026-07-02, so DShot300 is the working default.
 //!
-//! TIM3 runs at 200 MHz (APB1=100 MHz × 2), ARR=332 → 333-tick period = 1.667 µs = 600 kHz.
+//! TIM3 runs at 200 MHz (APB1=100 MHz × 2) with PSC=1 → 100 MHz timer clock,
+//! ARR=332 → 333-tick period = 3.33 µs = 300 kHz (DSHOT300). `dshot600` keeps PSC=0
+//! for the full 200 MHz → 1.667 µs = 600 kHz bit rate; duty ratios are unchanged.
 //! DMA1 stream 4 writes 72 u16 values to TIM3_DMAR on each timer update event.
 //! Each update event distributes 4 CCR values (one per motor) via TIM3's burst DMA,
 //! advancing through 16 data bits + 2 reset slots = 18 timer periods per DSHOT frame.
@@ -28,7 +33,7 @@ use embassy_time::{Duration, Instant, Ticker, Timer};
 use crate::state::{self, FlightState};
 use crate::STATE;
 
-// ── DSHOT600 constants ───────────────────────────────────────────────────────
+// ── DSHOT timing constants (bit width shared; PSC below selects 300 vs 600) ──
 
 const ARR:  u16 = 332;  // TIM period = 333 ticks at 200 MHz → 1.667 µs = 600 kHz
 const T1H:  u16 = 250;  // 75%   duty — logic 1
@@ -50,7 +55,9 @@ const BENCH_FORCE_THROTTLE: f32 = 0.10;
 // zeros for SPIN_ALL_ARM_SECS, then holds ALL FOUR motors at SPIN_ALL_THROTTLE so every
 // motor spins together — no GCS script, no arming switch. NEVER build for flight.
 #[cfg(feature = "spin-all")]
-const SPIN_ALL_ARM_SECS:  u64 = 5;    // continuous-zero arming window before throttle
+const SPIN_ALL_ARM_SECS:  u64 = 5;    // continuous-zero arming window before each throttle burst
+#[cfg(feature = "spin-all")]
+const SPIN_ALL_ON_SECS:   u64 = 5;    // throttle burst length before returning to zeros
 #[cfg(feature = "spin-all")]
 const SPIN_ALL_THROTTLE:  f32 = 0.30; // props-off bench test: above BLHeli_S startup/low-RPM threshold (was 0.12)
 
@@ -204,10 +211,17 @@ unsafe fn dshot_init() {
         gp.afr(0).modify(|w| w.set_afr(pin, 2)); // AF2 = TIM3
     }
 
-    // Configure TIM3 for DSHOT600 bit rate
+    // Configure TIM3 for the DSHOT bit rate. Default = DShot300 (PSC=1, confirmed
+    // working on the fitted ESC 2026-07-02). `--features dshot600` selects PSC=0 for
+    // ESCs that support it — the same ARR/T1H/T0H tick values then yield 1.667 µs bits
+    // instead of 3.33 µs; duty ratios are identical across DShot speeds, so nothing
+    // else in the TX path changes.
     let tim = pac::TIM3;
-    tim.psc().write(|w| *w = 0u16);              // prescaler = 0 → 200 MHz
-    tim.arr().write(|w| w.set_arr(ARR));          // period = 333 ticks = 1.667 µs
+    #[cfg(not(feature = "dshot600"))]
+    tim.psc().write(|w| *w = 1u16);              // prescaler = 1 → 100 MHz → 300 kbit/s
+    #[cfg(feature = "dshot600")]
+    tim.psc().write(|w| *w = 0u16);              // prescaler = 0 → 200 MHz → 600 kbit/s
+    tim.arr().write(|w| w.set_arr(ARR));          // period = 333 ticks
 
     // PWM mode 1 with output preload on all 4 channels.
     // ccmr_output(0) covers CH1 (n=0) and CH2 (n=1).
@@ -336,6 +350,11 @@ struct DshotDbg {
     dmeif:      u32, // direct-mode error
     prev_active: bool, // any motor commanded non-zero last tick (for edge detection)
     last_pin_mask: u8, // most recent pin-toggle probe result
+    // Loop-cadence tracking: exposes bursty executor scheduling. Reset each 1 Hz window.
+    last_loop:  Option<Instant>, // timestamp of previous loop iteration
+    max_gap_us: u32,             // largest gap between iterations (steady 500 Hz ≈ 2000)
+    long_gaps:  u32,             // gaps > 5 ms (executor slept past ≥2 ticks)
+    short_gaps: u32,             // gaps < 1 ms (Ticker firing catch-up frames back-to-back)
 }
 
 /// One-shot readback of the GPIO AF / TIM3 / DMA / DMAMUX configuration after init,
@@ -538,7 +557,10 @@ pub async fn motor_task(
 
     Timer::after(Duration::from_millis(2000)).await;
 
-    info!("Motors: DSHOT600 running (TIM3 + DMA1_CH4)");
+    #[cfg(not(feature = "dshot600"))]
+    info!("Motors: DSHOT300 running (TIM3 + DMA1_CH4, PSC=1)");
+    #[cfg(feature = "dshot600")]
+    info!("Motors: DSHOT600 running (TIM3 + DMA1_CH4, PSC=0)");
 
     let mut ticker = Ticker::every(Duration::from_hz(500));
 
@@ -566,6 +588,15 @@ pub async fn motor_task(
             let ndtr = s.ndtr().read().ndt();
             let isr  = pac::DMA1.isr(1).read();
             dbg.frames += 1;
+            // Loop cadence: gap since the previous iteration = the real inter-frame interval.
+            let now = Instant::now();
+            if let Some(last) = dbg.last_loop {
+                let gap = (now - last).as_micros() as u32;
+                if gap > dbg.max_gap_us { dbg.max_gap_us = gap; }
+                if gap > 5_000 { dbg.long_gaps += 1; }   // slept past ≥2 ticks
+                if gap < 1_000 { dbg.short_gaps += 1; }  // catch-up burst
+            }
+            dbg.last_loop = Some(now);
             if isr.tcif(0)      { dbg.tc += 1; }
             if isr.teif(0)      { dbg.teif += 1; }
             if isr.feif(0)      { dbg.feif += 1; }
@@ -576,6 +607,9 @@ pub async fn motor_task(
                 info!("DSHOT dbg: frames={=u32} tc={=u32} skipped={=u32} stuck_en={=u32} short={=u32} teif={=u32} feif={=u32} dmeif={=u32} ndtr={=u16} en={=bool}",
                       dbg.frames, dbg.tc, dbg.skipped, dbg.stuck_en, dbg.short_xfer,
                       dbg.teif, dbg.feif, dbg.dmeif, ndtr, en);
+                info!("DSHOT dbg: cadence max_gap={=u32}us long_gaps(>5ms)={=u32} short_gaps(<1ms)={=u32} (steady 500Hz ⇒ max≈2000, 0, 0)",
+                      dbg.max_gap_us, dbg.long_gaps, dbg.short_gaps);
+                dbg.max_gap_us = 0; dbg.long_gaps = 0; dbg.short_gaps = 0;
                 // #4: surface the snapshot to telemetry_task → STATUSTEXT → GCS.
                 debug_stats::publish(dbg.frames, dbg.tc, dbg.skipped, dbg.stuck_en,
                                      dbg.teif + dbg.feif + dbg.dmeif, dbg.last_pin_mask);
@@ -616,16 +650,20 @@ pub async fn motor_task(
             m
         };
 
-        // ⚠ BENCH ONLY (PROPS OFF): arm with continuous zeros, then hold ALL FOUR motors
-        // at a low throttle so every motor spins together. Overrides the result above.
-        // NEVER FLY.
+        // ⚠ BENCH ONLY (PROPS OFF): CYCLE zeros → throttle → zeros forever, so the ESC
+        // always gets a fresh zero-throttle arming window no matter when it powers up
+        // (BLHeli_S refuses to arm into a non-zero throttle, so a latched 0.30 stream
+        // is unarm-able for an ESC that boots late). Overrides the result above. NEVER FLY.
         #[cfg(feature = "spin-all")]
         let motors = {
-            if spin_start.elapsed() < Duration::from_secs(SPIN_ALL_ARM_SECS) {
-                [0.0f32; MOTORS] // arming: continuous zero-throttle stream
+            let phase = spin_start.elapsed().as_secs() % (SPIN_ALL_ARM_SECS + SPIN_ALL_ON_SECS);
+            if phase < SPIN_ALL_ARM_SECS {
+                spin_announced = false;
+                [0.0f32; MOTORS] // arming window: continuous zero-throttle stream
             } else {
                 if !spin_announced {
-                    info!("SPIN-ALL: armed — driving all 4 motors @ {} (⚠ PROPS OFF)", SPIN_ALL_THROTTLE);
+                    info!("SPIN-ALL: throttle burst — all 4 motors @ {} for {}s (⚠ PROPS OFF)",
+                          SPIN_ALL_THROTTLE, SPIN_ALL_ON_SECS);
                     spin_announced = true;
                 }
                 [SPIN_ALL_THROTTLE; MOTORS]

@@ -4,7 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", features = ["stm32h723zg", "rt", "exti", "defmt", "time-driver-any", "unstable-pac"] }
+# time-driver-tim5: pin the embassy time driver to the free 32-bit TIM5 (app uses TIM3/TIM4).
+# `time-driver-any` had selected a 16-bit timer whose compare/alarm interrupt wasn't servicing
+# near deadlines — every timed task (500 Hz control loop, motor DShot ticker, …) only woke at the
+# timer OVERFLOW rate (~40 Hz), so wake-ups clumped into ~50 ms bursts. A 32-bit timer keeps all
+# alarms in range of the compare interrupt, so the executor wakes precisely on schedule.
+embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", features = ["stm32h723zg", "rt", "exti", "defmt", "time-driver-tim5", "unstable-pac"] }
 embassy-executor = { git = "https://github.com/embassy-rs/embassy", features = ["platform-cortex-m", "executor-thread", "executor-interrupt"] }
 embassy-time = { git = "https://github.com/embassy-rs/embassy", features = ["defmt", "defmt-timestamp-uptime"] }
 embassy-sync = { git = "https://github.com/embassy-rs/embassy", features = ["defmt"] }
@@ -41,10 +46,16 @@ bench-force = []
 # drives PB4/PB5/PB0/PB1 HIGH one at a time, so a multimeter (DC volts) can verify each
 # STM pin reaches its ESC signal pad. No DShot, no TIM3 — nothing spins. Bench only.
 pin-test = []
-# ⚠ BENCH ONLY (PROPS OFF): `--features spin-all` arms the ESCs (continuous zeros) then
-# holds ALL FOUR motors at a low fixed throttle automatically — watch every motor spin
-# without the GCS script. NEVER flash for flight.
+# ⚠ BENCH ONLY (PROPS OFF): `--features spin-all` cycles all four motors between a
+# zero-throttle arming window and a low fixed throttle burst, forever — so the ESC
+# catches a zero window to arm regardless of power-up timing. NEVER flash for flight.
 spin-all = []
+# Default motor protocol is DShot300 (TIM3 PSC=1) — the fitted HGLRC 60A V2 4-in-1
+# BLHeli_S ESC's target MCU cannot parse DShot600 despite the box listing "DShot600/300"
+# support, confirmed by bench test 2026-07-02. `--features dshot600` raises the bit rate
+# back to 600 kbit/s (TIM3 PSC=0) for a different/upgraded ESC — nothing else in the TX
+# path changes, DShot duty ratios are speed-independent.
+dshot600 = []
 # PID-tuning "blackbox": stream ~50 Hz setpoint/measured/gyro/output over RTT defmt for
 # capture + plotting during tuning (`cargo run --features tune-log`). Off by default.
 tune-log = []
