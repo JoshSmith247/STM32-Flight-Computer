@@ -5,10 +5,11 @@ edition = "2021"
 
 [dependencies]
 # time-driver-tim5: pin the embassy time driver to the free 32-bit TIM5 (app uses TIM3/TIM4).
-# `time-driver-any` had selected a 16-bit timer whose compare/alarm interrupt wasn't servicing
-# near deadlines — every timed task (500 Hz control loop, motor DShot ticker, …) only woke at the
-# timer OVERFLOW rate (~40 Hz), so wake-ups clumped into ~50 ms bursts. A 32-bit timer keeps all
-# alarms in range of the compare interrupt, so the executor wakes precisely on schedule.
+# NOTE: this was tried as a fix for the ~40 Hz executor wake-up clumping and proved NEUTRAL —
+# the clumping persisted until sensor/UART tasks were bisected out, so its cause lives in that
+# task group (leading suspects: defmt-RTT blocking mode under probe, or a UART error-IRQ storm)
+# and is STILL UNRESOLVED. Keeping tim5 anyway: an explicit 32-bit timer is strictly safer than
+# letting time-driver-any pick. Do not treat this feature as the cadence fix.
 embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", features = ["stm32h723zg", "rt", "exti", "defmt", "time-driver-tim5", "unstable-pac"] }
 embassy-executor = { git = "https://github.com/embassy-rs/embassy", features = ["platform-cortex-m", "executor-thread", "executor-interrupt"] }
 embassy-time = { git = "https://github.com/embassy-rs/embassy", features = ["defmt", "defmt-timestamp-uptime"] }

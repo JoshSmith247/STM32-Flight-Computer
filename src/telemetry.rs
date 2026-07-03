@@ -401,7 +401,7 @@ async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
                 warn!("MOTOR_TEST rejected: must be disarmed and Idle (on ground)");
                 return MAV_RESULT_TEMPORARILY_REJECTED;
             }
-            let throttle = param2.clamp(0.0, 0.40); // TEMP bench diagnostic: was 0.20 — revert before flight
+            let throttle = param2.clamp(0.0, 0.20);
             let until = Instant::now() + Duration::from_secs(2);
             *STATE.motor_test.lock().await = Some(MotorTest { idx, throttle, until });
             info!("MOTOR_TEST: M{} @ {} for 2 s", idx, throttle);

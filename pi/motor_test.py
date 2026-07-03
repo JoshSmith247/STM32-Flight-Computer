@@ -45,7 +45,7 @@ try:
 except ImportError:
     sys.exit("pymavlink not installed — run: pip install pymavlink")
 
-THROTTLE_MAX = 0.40   # TEMP bench diagnostic: was 0.20 — revert with telemetry.rs clamp
+THROTTLE_MAX = 0.20   # matches the firmware clamp in telemetry.rs (cmd 209)
 HEARTBEAT_HZ = 4      # < the FC's 5 s Pi-loss watchdog timeout
 
 
