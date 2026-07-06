@@ -47,30 +47,52 @@ pub struct Pid {
     kd: f32,
     integral:         f32,
     prev_measurement: f32,
+    prev_derivative:  f32,    // held D-term while the measurement is unchanged
+    stale_ticks:      u32,    // updates since the measurement last changed
+    primed:           bool,   // false until the first sample after reset
     i_limit:          f32,    // anti-windup clamp
     output_limit:     f32,
 }
 
 impl Pid {
     pub const fn new(kp: f32, ki: f32, kd: f32, i_limit: f32, output_limit: f32) -> Self {
-        Self { kp, ki, kd, integral: 0.0, prev_measurement: 0.0, i_limit, output_limit }
+        Self { kp, ki, kd, integral: 0.0, prev_measurement: 0.0,
+               prev_derivative: 0.0, stale_ticks: 0, primed: false,
+               i_limit, output_limit }
     }
 
     /// Run one PID step. `dt` in seconds.
     ///
-    /// Uses derivative-on-measurement (D acts on -Δmeasurement, not Δerror) so
-    /// setpoint step-changes don't produce a derivative spike ("D-kick").
+    /// D acts on -Δmeasurement (no setpoint D-kick), recomputed only when the
+    /// measurement CHANGES (averaged over the static ticks) and held between —
+    /// loops often outrun their measurement source (100 Hz on 5 Hz GPS / 25 Hz
+    /// baro) and per-tick differencing would spike `step/dt` on each new sample.
     pub fn update(&mut self, setpoint: f32, measurement: f32, dt: f32) -> f32 {
         let error = setpoint - measurement;
 
         self.integral = (self.integral + error * dt).clamp(-self.i_limit, self.i_limit);
 
-        let derivative = if dt > 0.0 {
-            -(measurement - self.prev_measurement) / dt
-        } else {
+        let derivative = if dt <= 0.0 {
             0.0
+        } else if !self.primed {
+            // First sample after reset: no history, no kick.
+            self.prev_measurement = measurement;
+            self.primed = true;
+            self.stale_ticks = 0;
+            self.prev_derivative = 0.0;
+            0.0
+        } else if measurement != self.prev_measurement {
+            let span = dt * (self.stale_ticks + 1) as f32;
+            let d = -(measurement - self.prev_measurement) / span;
+            self.prev_measurement = measurement;
+            self.stale_ticks = 0;
+            self.prev_derivative = d;
+            d
+        } else {
+            // Measurement unchanged — hold the last derivative.
+            self.stale_ticks = self.stale_ticks.saturating_add(1);
+            self.prev_derivative
         };
-        self.prev_measurement = measurement;
 
         let output = self.kp * error + self.ki * self.integral + self.kd * derivative;
         output.clamp(-self.output_limit, self.output_limit)
@@ -79,6 +101,9 @@ impl Pid {
     pub fn reset(&mut self) {
         self.integral         = 0.0;
         self.prev_measurement = 0.0;
+        self.prev_derivative  = 0.0;
+        self.stale_ticks      = 0;
+        self.primed           = false;
     }
 }
 

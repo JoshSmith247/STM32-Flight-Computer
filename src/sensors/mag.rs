@@ -39,19 +39,11 @@ const REG_CHIP_ID: u8 = 0x0D;
 const CR1_VALUE: u8 = 0x19;
 
 // ── Runtime magnetometer calibration ──────────────────────────────────────────
-// We compute hard-iron + simple diagonal soft-iron calibration at every boot by
-// watching the raw vector while the USER ROTATES THE DRONE through all
-// orientations during a short window. There is NO flash persistence — the cal is
-// thrown away on reset and MUST be redone every power cycle. This is intentional
-// (out of scope); see the project notes.
+// Boot-time hard-iron + diagonal soft-iron cal; NO flash persistence — must be
+// redone every power cycle (intentional).
 //
-// >>> THE USER MUST PHYSICALLY ROTATE THE DRONE (slow figure-8, hitting every
-// >>> axis +/-) for the entire calibration window or heading will be garbage. <<<
-//
-// Hard-iron offset (per axis) = (min + max) / 2.
-// Soft-iron is approximated as a diagonal scale that equalises the per-axis
-// ranges: scale_axis = avg_range / range_axis. This corrects only axis-aligned
-// scale distortion, not cross-axis (off-diagonal) terms — adequate for heading.
+// >>> ROTATE THE DRONE (slow figure-8, every axis ±) for the whole window,
+// >>> or the cal fails and GPS-mode arming stays blocked. <<<
 
 /// How long the rotate-the-drone calibration window lasts. The user must keep
 /// rotating the airframe through all orientations for this whole duration.
@@ -90,29 +82,30 @@ impl MagCal {
     }
 }
 
-/// Compute hard-iron offset + diagonal soft-iron scale from observed per-axis
-/// min/max. Falls back to identity scale on any axis whose range is implausibly
-/// small (drone was not actually rotated).
-fn compute_cal(min: [f32; 3], max: [f32; 3]) -> MagCal {
+/// Hard-iron offset + diagonal soft-iron scale from per-axis min/max.
+/// Returns `(cal, ok)`. Any axis range too small = drone wasn't rotated →
+/// FULL identity (a stationary min/max midpoint equals the ambient field, and
+/// subtracting it reduces readings to noise) and ok=false, which keeps the
+/// mag_ok pre-arm gate closed.
+fn compute_cal(min: [f32; 3], max: [f32; 3]) -> (MagCal, bool) {
     let mut offset = [0.0f32; 3];
     let mut range  = [0.0f32; 3];
     for i in 0..3 {
         offset[i] = (min[i] + max[i]) * 0.5;
         range[i]  = max[i] - min[i];
     }
-    let avg_range = (range[0] + range[1] + range[2]) / 3.0;
 
-    let mut scale = [1.0f32; 3];
-    if avg_range >= MIN_VALID_RANGE {
-        for i in 0..3 {
-            scale[i] = if range[i] >= MIN_VALID_RANGE {
-                avg_range / range[i]
-            } else {
-                1.0
-            };
-        }
+    let rotated = range.iter().all(|&r| r >= MIN_VALID_RANGE);
+    if !rotated {
+        return (MagCal::identity(), false);
     }
-    MagCal { offset, scale }
+
+    let avg_range = (range[0] + range[1] + range[2]) / 3.0;
+    let mut scale = [1.0f32; 3];
+    for i in 0..3 {
+        scale[i] = avg_range / range[i];
+    }
+    (MagCal { offset, scale }, true)
 }
 
 /// Poll DRDY and read one raw magnetometer vector (LSB, sensor frame).
@@ -186,8 +179,9 @@ pub async fn mag_task(
     let mut ticker = Ticker::every(Duration::from_hz(25));
 
     // ── Calibration window ─────────────────────────────────────────────────────
-    // NOTE: NOT persisted to flash — recalibrated on every boot, by design.
-    let cal = if CAL_ENABLED {
+    // NOT persisted to flash — recalibrated every boot, by design. `cal_ok`
+    // gates the published `valid` flag (and therefore GPS-mode arming).
+    let (cal, cal_ok) = if CAL_ENABLED {
         warn!(
             "Mag: CALIBRATION STARTING — ROTATE THE DRONE through ALL orientations \
              (slow figure-8) for the next {} s!",
@@ -224,22 +218,30 @@ pub async fn mag_task(
         }
 
         if samples == 0 || min[0].is_infinite() {
-            warn!("Mag cal: no samples captured — publishing UNCALIBRATED (identity)");
-            MagCal::identity()
+            warn!("Mag cal: no samples captured — publishing UNCALIBRATED (valid=false)");
+            (MagCal::identity(), false)
         } else {
-            let cal = compute_cal(min, max);
-            info!(
-                "Mag cal DONE ({} samples): offset[{=f32},{=f32},{=f32}] \
-                 scale[{=f32},{=f32},{=f32}]",
-                samples,
-                cal.offset[0], cal.offset[1], cal.offset[2],
-                cal.scale[0],  cal.scale[1],  cal.scale[2]
-            );
-            cal
+            let (cal, ok) = compute_cal(min, max);
+            if ok {
+                info!(
+                    "Mag cal DONE ({} samples): offset[{=f32},{=f32},{=f32}] \
+                     scale[{=f32},{=f32},{=f32}]",
+                    samples,
+                    cal.offset[0], cal.offset[1], cal.offset[2],
+                    cal.scale[0],  cal.scale[1],  cal.scale[2]
+                );
+            } else {
+                warn!(
+                    "Mag cal FAILED: axis range too small (drone not rotated?) — \
+                     publishing UNCALIBRATED (valid=false, GPS-mode arming blocked). \
+                     Reboot and rotate the drone to retry."
+                );
+            }
+            (cal, ok)
         }
     } else {
-        warn!("Mag: calibration DISABLED (CAL_ENABLED=false) — publishing raw readings");
-        MagCal::identity()
+        warn!("Mag: calibration DISABLED (CAL_ENABLED=false) — publishing raw, valid=false");
+        (MagCal::identity(), false)
     };
 
     loop {
@@ -261,6 +263,10 @@ pub async fn mag_task(
 
         let heading_rad = tilt_compensated_heading(x, y, z, roll, pitch);
 
-        *STATE.mag_data.lock().await = MagData { x, y, z, heading_rad, valid: true };
+        *STATE.mag_data.lock().await = MagData {
+            x, y, z, heading_rad,
+            valid: cal_ok,
+            stamp_ms: crate::types::stamp_now_ms(),
+        };
     }
 }

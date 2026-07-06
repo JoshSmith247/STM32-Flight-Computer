@@ -50,7 +50,7 @@ WEED_LOG_PATH    = os.environ.get('WEED_LOG', '/tmp/weed_events.jsonl')
 # MAVLink v2 constants for the Pi GCS component
 PI_SYS_ID        = 10   # distinct from drone's sys_id=1
 PI_COMP_ID       = 1
-HEARTBEAT_HZ     = 4    # send heartbeat at 4 Hz — tolerates 3 consecutive missed frames within 3 s watchdog
+HEARTBEAT_HZ     = 4    # send heartbeat at 4 Hz — many retries within the FC's 5 s Pi-loss watchdog
 
 # Shared monotonic sequence number for all frames sent from PI_SYS_ID/PI_COMP_ID.
 # Lock required: heartbeat and weed-target threads both increment it.
@@ -90,9 +90,9 @@ def _build_set_position_target_local_ned(seq: int, north_m: float, east_m: float
                                          down_m: float = 0.0) -> bytes:
     """Build a MAVLink v2 SET_POSITION_TARGET_LOCAL_NED frame (msg_id=84, CRC_EXTRA=143).
 
-    Sends a position-only command (type_mask=0x0FF8) in MAV_FRAME_LOCAL_NED.
-    The drone will fly to (north_m, east_m, down_m) offset from its current position.
-    down_m > 0 commands a descent; 0.0 holds current altitude.
+    Position-only command (type_mask=0x0FF8) in MAV_FRAME_LOCAL_OFFSET_NED
+    (frame=7): north/east/down OFFSETS from the drone's current position —
+    exactly how the STM32 interprets them. down_m > 0 commands a descent.
     """
     # MAVLink v2 wire format: fields sorted largest-first (all floats before u16/u8)
     payload = struct.pack(
@@ -105,7 +105,7 @@ def _build_set_position_target_local_ned(seq: int, north_m: float, east_m: float
         0x0FF8,                                             # type_mask: pos only   @48
         1,                                                  # target_system         @50
         1,                                                  # target_component      @51
-        1,                                                  # MAV_FRAME_LOCAL_NED   @52
+        7,                                                  # MAV_FRAME_LOCAL_OFFSET_NED @52
     )
     n = len(payload)  # 53
     header = bytes([n, 0, 0, seq & 0xFF, PI_SYS_ID, PI_COMP_ID,

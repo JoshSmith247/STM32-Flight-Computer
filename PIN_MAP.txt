@@ -152,13 +152,15 @@
    *** Configure the ELRS RX for SBUS output, NOT CRSF, before wiring. ***
 
 ------------------------------------------------------------------------------
- FLOW  —  MTF-02P optical flow + rangefinder        BUS: UART4, 19200, RX-only
+ FLOW  —  MTF-02P optical flow + rangefinder        BUS: UART4, 115200, RX-only
 ------------------------------------------------------------------------------
    Sensor pin          ->  MCU pin    Notes
-   VCC                 ->  5 V (typical for MTF-02P — check its label)
+   VCC                 ->  5 V (40 mA)
    GND                 ->  GND
    TX                  ->  PC11       sensor TX -> MCU RX (only line needed)
    RX                  ->  (n/c)      MCU does not transmit to it
+   *** Set the module's protocol jumper / MicoAssistant to MICOLINK       ***
+   *** (NOT MAVLink or MSP) — flow.rs parses MICOLINK msg 0x51 only.      ***
 
 ------------------------------------------------------------------------------
  TELEMETRY  —  Raspberry Pi (MAVLink v2)            BUS: USART3, 57600, duplex

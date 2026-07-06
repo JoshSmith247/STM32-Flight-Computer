@@ -11,7 +11,7 @@ use embassy_stm32::{
     peripherals, Peri,
     usart::{Config, DataBits, Parity, StopBits, UartRx},
 };
-use embassy_time::{with_timeout, Duration};
+use embassy_time::{with_timeout, Duration, Instant};
 use defmt::{info, warn};
 
 use crate::{
@@ -98,6 +98,12 @@ fn decode_mode(raw: u16) -> FlightMode {
 /// window the link is considered lost and inputs are zeroed with failsafe set.
 const SBUS_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// How long `frame_lost` must persist before escalating to failsafe. It is a
+/// MOMENTARY per-frame flag (routine RF blips) — during the grace window we
+/// fly on the receiver's held channels. The receiver's own `failsafe` flag
+/// still acts immediately.
+const FRAME_LOST_GRACE: Duration = Duration::from_millis(250);
+
 #[embassy_executor::task]
 pub async fn rc_task(
     uart_peri: Peri<'static, peripherals::USART2>,
@@ -127,6 +133,10 @@ pub async fn rc_task(
     // leaving stale RC active. At ~14 ms/SBUS frame this is ~40 ms.
     let mut bad_frames: u8 = 0;
     const FAILSAFE_AFTER_BAD: u8 = 3;
+    // frame_lost staging; None = link clean.
+    let mut frame_lost_since: Option<Instant> = None;
+    // A mode-switch transition revokes any MAVLink mode override.
+    let mut prev_switch_mode: Option<FlightMode> = None;
 
     loop {
         // read_until_idle fires when the line goes idle after the 25-byte burst,
@@ -140,8 +150,33 @@ pub async fn rc_task(
                 }
                 if let Some(frame) = parse_sbus(&buf) {
                     let rc = if frame.failsafe {
+                        // Receiver's own failsafe: act immediately.
+                        frame_lost_since = None;
                         RcInput { failsafe: true, ..Default::default() }
                     } else {
+                        let lost_failsafe = if frame.frame_lost {
+                            let first = frame_lost_since.is_none();
+                            let since = *frame_lost_since.get_or_insert_with(Instant::now);
+                            let escalate = since.elapsed() >= FRAME_LOST_GRACE;
+                            if first {
+                                warn!("SBUS: frame_lost flagged — holding channels ({} ms grace)",
+                                      FRAME_LOST_GRACE.as_millis());
+                            }
+                            escalate
+                        } else {
+                            frame_lost_since = None;
+                            false
+                        };
+
+                        let switch_mode = decode_mode(frame.channels[5]);
+                        if prev_switch_mode.is_some() && prev_switch_mode != Some(switch_mode) {
+                            let mut ov = STATE.mode_override.lock().await;
+                            if ov.take().is_some() {
+                                info!("RC mode switch moved — MAVLink mode override cleared");
+                            }
+                        }
+                        prev_switch_mode = Some(switch_mode);
+
                         RcInput {
                             throttle: normalise_01(frame.channels[2]),
                             roll:     normalise(frame.channels[0]),
@@ -150,8 +185,8 @@ pub async fn rc_task(
                             // Ch5: arm switch (high = armed)
                             arm:      frame.channels[4] > 1000,
                             // Ch6: 3-position mode switch
-                            mode:     decode_mode(frame.channels[5]),
-                            failsafe: frame.frame_lost,
+                            mode:     switch_mode,
+                            failsafe: lost_failsafe,
                         }
                     };
                     *STATE.rc_input.lock().await = rc;
@@ -177,6 +212,7 @@ pub async fn rc_task(
                     link_up = false;
                 }
                 bad_frames = 0;
+                frame_lost_since = None;
                 *STATE.rc_input.lock().await = RcInput { failsafe: true, ..Default::default() };
             }
         }

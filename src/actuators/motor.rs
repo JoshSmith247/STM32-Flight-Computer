@@ -16,29 +16,34 @@
 //! Pinout (TIM3 AF2):
 //!   M1 → PB4 (TIM3 CH1)   M3 → PB0 (TIM3 CH3)
 //!   M2 → PB5 (TIM3 CH2)   M4 → PB1 (TIM3 CH4)
-//!
-//! !! VERIFY before first run: open RM0468 Table 105, search for "TIM3_UP", confirm
-//! DMAMUX_TIM3_UP matches that row's request ID. Wrong value = DMA never fires =
-//! motors silently disabled (safe to diagnose, not dangerous).
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use defmt::info;
 use embassy_stm32::{pac, peripherals, Peri};
-use embassy_time::{Duration, Instant, Ticker, Timer};
+use embassy_time::{Duration, Instant, Ticker};
+#[cfg(feature = "pin-test")]
+use embassy_time::Timer;
 
 use crate::state::{self, FlightState};
 use crate::STATE;
 
 // ── DSHOT timing constants (bit width shared; PSC below selects 300 vs 600) ──
 
-const ARR:  u16 = 332;  // TIM period = 333 ticks at 200 MHz → 1.667 µs = 600 kHz
+#[cfg_attr(feature = "pin-test", allow(dead_code))] // pin-test builds skip motor_task
+const ARR:  u16 = 332;  // TIM period = 333 ticks; at 100 MHz (PSC=1) → 3.33 µs/bit = DSHOT300
 const T1H:  u16 = 250;  // 75%   duty — logic 1
 const T0H:  u16 = 125;  // 37.5% duty — logic 0
 
 const SLOTS:   usize = 18;             // 16 data bits + 2 reset
 const MOTORS:  usize = 4;
 const BUF_LEN: usize = SLOTS * MOTORS; // 72 u16 halfwords (DMA to 16-bit TIM3_DMAR)
+
+// Idle floor while ARMED: DSHOT 0 stops the rotor entirely — a stopped rotor
+// has zero attitude authority and BLHeli_S restart in-air is not instant.
+// ⚠ Motors spin at this the moment the craft arms — props clear!
+#[cfg_attr(feature = "pin-test", allow(dead_code))]
+const MOTOR_IDLE: f32 = 0.04;
 
 // ⚠ BENCH ONLY (PROPS OFF): with `--features bench-force`, motor_task holds this one
 // motor at this throttle every cycle — a constant DSHOT stream on its pin for
@@ -58,11 +63,9 @@ const SPIN_ALL_ON_SECS:   u64 = 5;    // throttle burst length before returning 
 #[cfg(feature = "spin-all")]
 const SPIN_ALL_THROTTLE:  f32 = 0.30; // must exceed BLHeli_S startup/low-RPM threshold
 
-// The DMA's peripheral address is derived from `pac::TIM3.dmar()` in dshot_init —
-// never hardcode it: a wrong address silently ships every frame to a different
-// peripheral while the pins free-run whatever PWM was last latched.
-
-// DMAMUX1 request ID for TIM3_UP (RM0468 Table 105; embassy: `dma_trait_impl!(UpDma, TIM3, DMA1_CH4, 27u8)`).
+// DMAMUX1 request ID for TIM3_UP (RM0468 Table 105) — verified on hardware 2026-06-20.
+// Wrong value = DMA never fires = motors silently dead.
+#[cfg_attr(feature = "pin-test", allow(dead_code))]
 const DMAMUX_TIM3_UP: u8 = 27;
 
 // ── DSHOT frame encoding ─────────────────────────────────────────────────────
@@ -75,11 +78,8 @@ fn throttle_to_dshot(t: f32) -> u16 {
 fn encode_dshot(thr: u16) -> u16 {
     let payload = thr << 1; // telemetry request bit = 0
     let csum = payload ^ (payload >> 4) ^ (payload >> 8);
-    // Normal DSHOT uses the 4-bit checksum directly. Bidirectional DSHOT
-    // (`--features dshot-bidir`, item #5) INVERTS it — that inversion is exactly how
-    // the ESC tells the two protocols apart and decides whether to drive an eRPM reply
-    // back onto the line. ⚠ The two encodings are mutually exclusive on the wire: a
-    // bidir build will NOT be understood by an ESC running plain-DSHOT firmware.
+    // Bidirectional DSHOT inverts the checksum — that inversion is how the ESC
+    // distinguishes the protocols. ⚠ Mutually exclusive on the wire with plain DSHOT.
     #[cfg(not(feature = "dshot-bidir"))]
     let crc = csum & 0x0F;
     #[cfg(feature = "dshot-bidir")]
@@ -183,6 +183,7 @@ static mut DSHOT_BUF: [u16; BUF_LEN] = [0u16; BUF_LEN];
 
 // ── Hardware init ────────────────────────────────────────────────────────────
 
+#[cfg_attr(feature = "pin-test", allow(dead_code))]
 unsafe fn dshot_init() {
     use pac::gpio::vals::{Moder, Ospeedr, Ot};
     use pac::timer::vals::OcmGp;
@@ -290,18 +291,13 @@ unsafe fn dshot_init() {
     });
 }
 
-/// Queue one DSHOT frame via DMA. Returns `true` if the frame was started, or
-/// `false` if it was skipped because the previous DMA was still running (see below).
-/// The skip path is the silent failure mode worth counting: a sustained run of
-/// `false` means the DMA is wedged and the pins are getting NO new frames.
+/// Queue one DSHOT frame via DMA. Returns `false` (frame skipped) if the
+/// previous DMA is still enabled — never busy-wait here: a stuck DMA must not
+/// hog the single-threaded executor and starve the watchdog pet. A sustained
+/// run of `false` means the DMA is wedged and the pins get NO new frames.
 unsafe fn dshot_send() -> bool {
     let s = pac::DMA1.st(4);
 
-    // The previous frame (≈30 µs) is always finished by the next 500 Hz tick
-    // (2 ms later). If the DMA is somehow still enabled, SKIP this frame rather
-    // than busy-spin: a stuck DMA (e.g. a wrong DMAMUX request) must never hog
-    // the single-threaded executor — that starves the watchdog pet and resets
-    // the board. Once the DMA actually completes each frame, this never trips.
     if s.cr().read().en() {
         return false;
     }
@@ -470,10 +466,26 @@ fn capture_erpm_raw(_pin: usize) -> Option<u32> {
 
 // ── Emergency stop (called from panic handler) ───────────────────────────────
 
-/// Zero all motors and fire one DSHOT frame. Safe to call from a panic handler:
-/// spins ≤30 µs waiting for any in-flight DMA to drain, then sends a zero frame
-/// so ESCs receive an explicit stop rather than relying on signal-loss timeout.
+/// Zero all motors and fire one DSHOT stop frame. Panic-handler safe: drains
+/// any in-flight DMA (bounded), force-aborting a wedged stream, then sends —
+/// dshot_send() bails while EN is set, so the drain must happen here.
 pub(crate) unsafe fn emergency_stop() {
+    let s = pac::DMA1.st(4);
+    let mut guard = 0u32;
+    while s.cr().read().en() && guard < 20_000 {
+        guard += 1;
+        core::hint::spin_loop();
+    }
+    if s.cr().read().en() {
+        // Wedged: request abort (EN=0), then wait for it so the re-enable takes.
+        s.cr().modify(|w| w.set_en(false));
+        guard = 0;
+        while s.cr().read().en() && guard < 20_000 {
+            guard += 1;
+            core::hint::spin_loop();
+        }
+    }
+
     fill_buf(&mut *(&raw mut DSHOT_BUF), [0.0f32; MOTORS]);
     compiler_fence(Ordering::SeqCst);
     dshot_send();
@@ -540,7 +552,28 @@ pub async fn motor_task(
     #[cfg(feature = "dshot-debug")]
     unsafe { dshot_debug_dump() };
 
-    Timer::after(Duration::from_millis(2000)).await;
+    // ESC arming window: 2 s of continuous zero frames at 500 Hz — BLHeli_S
+    // treats a silent line as signal loss and won't arm.
+    {
+        let mut arm_ticker = Ticker::every(Duration::from_hz(500));
+        for _ in 0..1000u32 {
+            arm_ticker.next().await;
+            unsafe {
+                let st = pac::DMA1.st(4);
+                if !st.cr().read().en() {
+                    fill_buf(&mut *(&raw mut DSHOT_BUF), [0.0f32; MOTORS]);
+                    compiler_fence(Ordering::SeqCst);
+                    dshot_send();
+                    // WFE clock-gating workaround: stay awake until the frame drains.
+                    let mut guard = 0u32;
+                    while st.cr().read().en() && guard < 20_000 {
+                        guard += 1;
+                        core::hint::spin_loop();
+                    }
+                }
+            }
+        }
+    }
 
     #[cfg(not(feature = "dshot600"))]
     info!("Motors: DSHOT300 running (TIM3 + DMA1_CH4, PSC=1)");
@@ -604,11 +637,16 @@ pub async fn motor_task(
         let outputs  = *STATE.motor_outputs.lock().await;
         let is_armed = *STATE.armed.lock().await;
 
-        #[cfg_attr(feature = "bench-force", allow(unused_variables))]
+        #[cfg_attr(any(feature = "bench-force", feature = "spin-all"), allow(unused_variables))]
         let motors = if is_armed {
             // Arming voids any pending bench test so it can never carry into flight.
             *STATE.motor_test.lock().await = None;
-            [outputs.m1, outputs.m2, outputs.m3, outputs.m4]
+            [
+                outputs.m1.max(MOTOR_IDLE),
+                outputs.m2.max(MOTOR_IDLE),
+                outputs.m3.max(MOTOR_IDLE),
+                outputs.m4.max(MOTOR_IDLE),
+            ]
         } else {
             // Disarmed: all motors zero, unless a MAV_CMD_DO_MOTOR_TEST override is
             // active. It only runs on the ground (Idle) and self-expires by time,
@@ -656,17 +694,22 @@ pub async fn motor_task(
         };
 
         unsafe {
-            fill_buf(&mut *(&raw mut DSHOT_BUF), motors);
-            compiler_fence(Ordering::SeqCst);
-            let _sent = dshot_send();
+            // DMA must be idle BEFORE touching the buffer — rewriting DSHOT_BUF
+            // mid-transfer corrupts the frame on the wire. Skip the tick instead.
+            let busy = pac::DMA1.st(4).cr().read().en();
+            let _sent = if busy {
+                false
+            } else {
+                fill_buf(&mut *(&raw mut DSHOT_BUF), motors);
+                compiler_fence(Ordering::SeqCst);
+                dshot_send()
+            };
             #[cfg(feature = "dshot-debug")]
             if !_sent { dbg.skipped += 1; }
 
-            // Keep the CPU awake until this frame drains onto the wire, THEN yield.
-            // On H7 the executor's WFE idle-sleep clock-gates the TIM3/DMA path, so
-            // yielding right after enabling the DMA strands the frame mid-transfer.
-            // ~30 µs spin (~1.5 % CPU at 500 Hz); bounded so a stuck DMA can't wedge
-            // the executor.
+            // Stay awake until the frame drains, THEN yield: the executor's WFE
+            // idle-sleep clock-gates the TIM3/DMA path and strands the frame
+            // mid-transfer. ~30 µs spin, bounded.
             let st = pac::DMA1.st(4);
             let mut guard = 0u32;
             while st.cr().read().en() && guard < 20_000 {

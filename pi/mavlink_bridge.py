@@ -42,7 +42,11 @@ def serial_to_udp(ser, sock: socket.socket) -> None:
 def udp_to_serial(ser, sock: socket.socket) -> None:
     while True:
         try:
-            data, _ = sock.recvfrom(4096)
+            data, addr = sock.recvfrom(4096)
+            # Only relay commands from the known GCS laptop — anyone on the
+            # network could otherwise inject MAVLink at the drone.
+            if addr[0] != LAPTOP_IP:
+                continue
             ser.write(data)
         except socket.timeout:
             pass
@@ -58,7 +62,8 @@ def main() -> None:
         print("pyserial not installed — run: pip install pyserial", flush=True)
         sys.exit(1)
 
-    ser = _serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=0.1)
+    # write_timeout: a wedged write must error (→ systemd restart), not hang the thread.
+    ser = _serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=0.1, write_timeout=0.5)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

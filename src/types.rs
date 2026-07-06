@@ -4,6 +4,29 @@ use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 use embassy_time::Instant;
 
 // ---------------------------------------------------------------------------
+// Sensor freshness
+// ---------------------------------------------------------------------------
+//
+// Sensor structs carry `stamp_ms` (0 = never written). Consumers MUST gate on
+// the `usable()`/`is_fresh()` helpers, never a bare `valid`/`fix_ok` flag —
+// a dead sensor task leaves its last snapshot in STATE forever.
+
+pub const GPS_FRESH_MS: u64 = 2_500;  // nominal 5 Hz
+pub const FLOW_FRESH_MS: u64 = 300;   // continuous stream
+pub const MAG_FRESH_MS: u64 = 500;    // 25 Hz
+pub const IMU_FRESH_MS: u64 = 100;    // 500 Hz
+
+#[inline]
+pub fn stamp_now_ms() -> u64 {
+    Instant::now().as_millis()
+}
+
+#[inline]
+fn is_fresh(stamp_ms: u64, limit_ms: u64) -> bool {
+    stamp_ms != 0 && Instant::now().as_millis().saturating_sub(stamp_ms) <= limit_ms
+}
+
+// ---------------------------------------------------------------------------
 // Basic geometric types
 // ---------------------------------------------------------------------------
 
@@ -56,13 +79,14 @@ pub struct GpsFix {
     pub hacc_m:   f32,    // horizontal accuracy estimate
     pub fix_ok:   bool,   // true = gnssFixOK flag set and fix_type >= 3
     pub fix_type: u8,     // NAV-PVT fixType: 0=none 1=DR 2=2D 3=3D 4=combined
+    pub stamp_ms: u64,    // Instant ms when gps_task last wrote this; 0 = never
 }
 
 impl Default for GpsFix {
     fn default() -> Self {
         Self { lat_deg: 0.0, lon_deg: 0.0, alt_m: 0.0,
                vel_n_ms: 0.0, vel_e_ms: 0.0, vel_d_ms: 0.0,
-               hacc_m: 9999.0, fix_ok: false, fix_type: 0 }
+               hacc_m: 9999.0, fix_ok: false, fix_type: 0, stamp_ms: 0 }
     }
 }
 
@@ -70,6 +94,12 @@ impl GpsFix {
     /// Extract a plain waypoint coordinate for use with navigation helpers.
     pub fn pos(&self) -> LatLonAlt {
         LatLonAlt { lat_deg: self.lat_deg, lon_deg: self.lon_deg, alt_m: self.alt_m }
+    }
+
+    /// gnssFixOK + 3-D fix AND fresh. Never trust `fix_ok` alone — a dead GPS
+    /// leaves the last fix_ok=true snapshot in STATE forever.
+    pub fn usable(&self) -> bool {
+        self.fix_ok && is_fresh(self.stamp_ms, GPS_FRESH_MS)
     }
 }
 
@@ -82,6 +112,11 @@ pub struct ImuData {
     pub accel: Vec3,        // m/s²
     pub gyro:  Vec3,        // rad/s
     pub temp_c: f32,
+    pub stamp_ms: u64,      // Instant ms when imu_task last wrote this; 0 = never
+}
+
+impl ImuData {
+    pub fn is_fresh(&self) -> bool { is_fresh(self.stamp_ms, IMU_FRESH_MS) }
 }
 
 #[derive(Clone, Copy, Default, defmt::Format)]
@@ -96,7 +131,7 @@ pub struct BaroData {
 pub struct BatteryData {
     pub voltage_v: f32,
     pub pct:       u8,      // 0–100 %
-    pub critical:  bool,    // true when per-cell V < 3.50 V for ≥ 2.5 s
+    pub critical:  bool,    // true when per-cell V < V_CELL_CRIT for 3 samples (~1.5 s)
     /// Measured pack current from the ESC's CUR pad (A). Negative = sensor not
     /// fitted/calibrated — consumers (telemetry) then fall back to the
     /// throttle-based estimate.
@@ -105,9 +140,7 @@ pub struct BatteryData {
 
 impl Default for BatteryData {
     fn default() -> Self {
-        // Pessimistic defaults: GCS shows 0 V / critical until battery_task
-        // confirms healthy voltage (~2.5 s after boot). Prevents the operator
-        // from receiving a false "battery OK" before the first ADC reading.
+        // Pessimistic until battery_task's first reading: no false "battery OK".
         Self { voltage_v: 0.0, pct: 0, critical: true, current_a: -1.0 }
     }
 }
@@ -190,10 +223,8 @@ pub struct MotorOutputs {
     pub m4: f32,
 }
 
-/// Bench bring-up motor test, set by MAV_CMD_DO_MOTOR_TEST (209). Honoured ONLY
-/// by motor_task while disarmed and on the ground (FlightState::Idle), and auto-
-/// expired at `until` — so a stale override can never spin a motor in flight.
-/// Use with PROPS OFF to verify per-corner wiring and spin direction.
+/// Bench motor test (MAV_CMD_DO_MOTOR_TEST 209). Honoured ONLY while disarmed
+/// + Idle, auto-expires at `until`. ⚠ PROPS OFF.
 #[derive(Clone, Copy)]
 pub struct MotorTest {
     pub idx:      u8,       // 1..=4 → firmware M1..M4
@@ -209,10 +240,15 @@ pub struct MotorTest {
 #[derive(Clone, Copy, Default, defmt::Format)]
 pub struct FlowData {
     pub quality:      u8,    // 0–255
-    pub vel_x_mrad_s: i32,   // body-frame X velocity (mrad/s × 1000)
-    pub vel_y_mrad_s: i32,   // body-frame Y velocity (mrad/s × 1000)
+    pub vel_x_mrad_s: i32,   // body-frame X angular flow rate (µrad/s)
+    pub vel_y_mrad_s: i32,   // body-frame Y angular flow rate (µrad/s)
     pub height_mm:    i32,   // rangefinder reading in mm; -1 = no data
-    pub valid:        bool,  // quality > 50 and recent frame received
+    pub valid:        bool,  // quality > 50 and height > 0 in the last frame
+    pub stamp_ms:     u64,   // Instant ms when flow_task last wrote this; 0 = never
+}
+
+impl FlowData {
+    pub fn usable(&self) -> bool { self.valid && is_fresh(self.stamp_ms, FLOW_FRESH_MS) }
 }
 
 /// Fused NED position/velocity estimate, updated by estimator_task (~150 Hz).
@@ -243,11 +279,16 @@ pub struct SensorHealth {
 /// Magnetometer data from QMC5883L, updated by mag_task at 25 Hz.
 #[derive(Clone, Copy, Default, defmt::Format)]
 pub struct MagData {
-    pub x:           f32,  // raw X (LSB, sensor frame)
-    pub y:           f32,  // raw Y (LSB, sensor frame)
-    pub z:           f32,  // raw Z (LSB, sensor frame)
+    pub x:           f32,  // calibrated X (LSB, sensor frame)
+    pub y:           f32,  // calibrated Y (LSB, sensor frame)
+    pub z:           f32,  // calibrated Z (LSB, sensor frame)
     pub heading_rad: f32,  // tilt-compensated magnetic heading (0=N, clockwise +)
-    pub valid:       bool,
+    pub valid:       bool, // true only if the boot-time rotation cal succeeded
+    pub stamp_ms:    u64,  // 0 = never written
+}
+
+impl MagData {
+    pub fn usable(&self) -> bool { self.valid && is_fresh(self.stamp_ms, MAG_FRESH_MS) }
 }
 
 /// Normalised servo positions [0.0, 1.0] written by navigation/ground station.
@@ -305,29 +346,45 @@ pub struct SharedState {
     pub home_override:  Mutex<CriticalSectionRawMutex, Option<LatLonAlt>>,
     /// Bench motor-test override (MAV_CMD_DO_MOTOR_TEST). None = no test active.
     pub motor_test:     Mutex<CriticalSectionRawMutex, Option<MotorTest>>,
+    /// Flight-mode override commanded over MAVLink (DO_SET_MODE / RTL / LAND).
+    /// Wins over the RC mode switch until the pilot MOVES the switch (rc_task
+    /// clears it on any physical switch transition).
+    pub mode_override:  Mutex<CriticalSectionRawMutex, Option<FlightMode>>,
 }
 
 impl SharedState {
     pub const fn new() -> Self {
         Self {
             attitude:      Mutex::new(Quaternion { w: 1.0, x: 0.0, y: 0.0, z: 0.0 }),
-            imu_data:      Mutex::new(ImuData    { accel: Vec3 { x:0.0,y:0.0,z:0.0 }, gyro: Vec3 { x:0.0,y:0.0,z:0.0 }, temp_c: 0.0 }),
+            imu_data:      Mutex::new(ImuData    { accel: Vec3 { x:0.0,y:0.0,z:0.0 }, gyro: Vec3 { x:0.0,y:0.0,z:0.0 }, temp_c: 0.0, stamp_ms: 0 }),
             baro_data:     Mutex::new(BaroData   { pressure_pa: 101325.0, temp_c: 25.0, altitude_m: 0.0 }),
             rc_input:      Mutex::new(RcInput    { throttle:0.0, roll:0.0, pitch:0.0, yaw:0.0, arm:false, mode: FlightMode::Stabilise, failsafe: false }),
             nav_command:   Mutex::new(NavCommand { autonomous: false, attitude_setpoint: AttitudeSetpoint { roll:0.0, pitch:0.0, yaw_rate:0.0, throttle:0.0 }, target: LatLonAlt { lat_deg:0.0, lon_deg:0.0, alt_m:0.0 } }),
             motor_outputs: Mutex::new(MotorOutputs { m1:0.0, m2:0.0, m3:0.0, m4:0.0 }),
-            gps_fix:       Mutex::new(GpsFix { lat_deg:0.0, lon_deg:0.0, alt_m:0.0, vel_n_ms:0.0, vel_e_ms:0.0, vel_d_ms:0.0, hacc_m:9999.0, fix_ok:false, fix_type:0 }),
+            gps_fix:       Mutex::new(GpsFix { lat_deg:0.0, lon_deg:0.0, alt_m:0.0, vel_n_ms:0.0, vel_e_ms:0.0, vel_d_ms:0.0, hacc_m:9999.0, fix_ok:false, fix_type:0, stamp_ms:0 }),
             battery:       Mutex::new(BatteryData { voltage_v:0.0, pct:0, critical:true, current_a:-1.0 }),
             armed:         Mutex::new(false),
-            flow:          Mutex::new(FlowData { quality:0, vel_x_mrad_s:0, vel_y_mrad_s:0, height_mm:-1, valid:false }),
+            flow:          Mutex::new(FlowData { quality:0, vel_x_mrad_s:0, vel_y_mrad_s:0, height_mm:-1, valid:false, stamp_ms:0 }),
             servo_outputs: Mutex::new(ServoOutputs { s1:0.0, s2:0.0, s3:0.0, s4:0.0 }),
-            mag_data:      Mutex::new(MagData { x:0.0, y:0.0, z:0.0, heading_rad:0.0, valid:false }),
+            mag_data:      Mutex::new(MagData { x:0.0, y:0.0, z:0.0, heading_rad:0.0, valid:false, stamp_ms:0 }),
             pos_estimate:  Mutex::new(PosEstimate { pos_n:0.0, pos_e:0.0, pos_d:0.0, vel_n:0.0, vel_e:0.0, vel_d:0.0, valid:false }),
             sensor_health: Mutex::new(SensorHealth { imu_ok:false, baro_ok:false, mag_ok:false, gps_ok:false }),
             payload_flags:  Mutex::new(0u32),
             weed_target:    Mutex::new(WeedTarget { position: LatLonAlt { lat_deg:0.0, lon_deg:0.0, alt_m:0.0 }, extract_alt_m: 0.4, valid: false }),
             home_override:  Mutex::new(None),
             motor_test:     Mutex::new(None),
+            mode_override:  Mutex::new(None),
+        }
+    }
+}
+
+impl SharedState {
+    /// Effective flight mode: MAVLink override (if set) wins over the RC switch.
+    pub async fn effective_mode(&self) -> FlightMode {
+        if let Some(m) = *self.mode_override.lock().await {
+            m
+        } else {
+            self.rc_input.lock().await.mode
         }
     }
 }

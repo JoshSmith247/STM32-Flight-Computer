@@ -168,14 +168,18 @@ pub async fn imu_task(cs_pin: Peri<'static, peripherals::PA4>) {
     // Device needs up to 1 ms to complete reset before accepting new commands.
     Timer::after(Duration::from_millis(2)).await;
 
-    // Confirm we're talking to the right chip.
-    let who = {
-        let raw = read_reg(&mut cs, WHO_AM_I).await;
-        #[cfg(feature = "simulation")]
-        { WHO_AM_I_EXPECTED }
-        #[cfg(not(feature = "simulation"))]
-        { raw }
-    };
+    // Confirm we're talking to the right chip. Retried: one flaky SPI read at
+    // power-up must not permanently Fault the flight build.
+    #[cfg_attr(feature = "simulation", allow(unused_assignments, unused_mut))]
+    let mut who = read_reg(&mut cs, WHO_AM_I).await;
+    for attempt in 1..3u8 {
+        if who == WHO_AM_I_EXPECTED { break; }
+        warn!("IMU: WHO_AM_I = 0x{:02X} (attempt {}/3) — retrying", who, attempt);
+        Timer::after(Duration::from_millis(10)).await;
+        who = read_reg(&mut cs, WHO_AM_I).await;
+    }
+    #[cfg(feature = "simulation")]
+    let who = WHO_AM_I_EXPECTED;
     if who != WHO_AM_I_EXPECTED {
         // Default (flight) build: a missing IMU is fatal — a flight computer with no
         // attitude source must refuse to operate, so Fault and park.
@@ -210,10 +214,7 @@ pub async fn imu_task(cs_pin: Peri<'static, peripherals::PA4>) {
 
     let mut ticker = Ticker::every(Duration::from_hz(500));
 
-    // Startup gyro-bias calibration. The IMU is confirmed present (WHO_AM_I
-    // matched above), so this only runs on real hardware — the bench/missing-
-    // IMU build never reaches here. Reuses the loop ticker so sampling happens
-    // at the same 500 Hz cadence as the steady read loop.
+    // Startup gyro-bias calibration — board must be still (checked inside).
     let gyro_bias = calibrate_gyro_bias(&mut cs, &mut ticker).await;
 
     info!("IMU: running — ±2000 dps / ±16g @ 1 kHz ODR, sampling at 500 Hz");
@@ -257,6 +258,7 @@ pub async fn imu_task(cs_pin: Peri<'static, peripherals::PA4>) {
             accel: Vec3 { x: ax, y: ay, z: az },
             gyro:  Vec3 { x: gx, y: gy, z: gz },
             temp_c,
+            stamp_ms: crate::types::stamp_now_ms(),
         };
     }
 }

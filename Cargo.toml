@@ -4,17 +4,16 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# time-driver-tim5: pin the embassy time driver to the free 32-bit TIM5 (app uses TIM3/TIM4).
-# NOTE: this was tried as a fix for the ~40 Hz executor wake-up clumping and proved NEUTRAL —
-# the clumping persisted until sensor/UART tasks were bisected out, so its cause lives in that
-# task group (leading suspects: defmt-RTT blocking mode under probe, or a UART error-IRQ storm)
-# and is STILL UNRESOLVED. Keeping tim5 anyway: an explicit 32-bit timer is strictly safer than
-# letting time-driver-any pick. Do not treat this feature as the cadence fix.
-embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", features = ["stm32h723zg", "rt", "exti", "defmt", "time-driver-tim5", "unstable-pac"] }
-embassy-executor = { git = "https://github.com/embassy-rs/embassy", features = ["platform-cortex-m", "executor-thread", "executor-interrupt"] }
-embassy-time = { git = "https://github.com/embassy-rs/embassy", features = ["defmt", "defmt-timestamp-uptime"] }
-embassy-sync = { git = "https://github.com/embassy-rs/embassy", features = ["defmt"] }
-embassy-futures = { git = "https://github.com/embassy-rs/embassy" }
+# time-driver-tim5: explicit free 32-bit timer (app uses TIM3/TIM4). NOT a fix
+# for the still-unresolved executor cadence-clumping (suspects: defmt-RTT
+# blocking under probe, UART error-IRQ storm) — proved neutral when tried.
+# rev PINNED to the hardware-validated commit; bump deliberately and re-run
+# bench bring-up.
+embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", rev = "7f8bb6f4ca46e1da4b7cff5a9cc628f5a583a272", features = ["stm32h723zg", "rt", "exti", "defmt", "time-driver-tim5", "unstable-pac"] }
+embassy-executor = { git = "https://github.com/embassy-rs/embassy", rev = "7f8bb6f4ca46e1da4b7cff5a9cc628f5a583a272", features = ["platform-cortex-m", "executor-thread", "executor-interrupt"] }
+embassy-time = { git = "https://github.com/embassy-rs/embassy", rev = "7f8bb6f4ca46e1da4b7cff5a9cc628f5a583a272", features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-sync = { git = "https://github.com/embassy-rs/embassy", rev = "7f8bb6f4ca46e1da4b7cff5a9cc628f5a583a272", features = ["defmt"] }
+embassy-futures = { git = "https://github.com/embassy-rs/embassy", rev = "7f8bb6f4ca46e1da4b7cff5a9cc628f5a583a272" }
 
 libm = "0.2"
 
@@ -24,7 +23,9 @@ cortex-m-rt = "0.7"
 
 defmt = "0.3"
 defmt-rtt = "0.4"
-panic-probe = { version = "0.3", features = ["print-defmt"] }
+# NOTE: no panic-probe — main.rs defines its own #[panic_handler] (motor
+# emergency-stop + LED off). Linking panic-probe as well would be a duplicate
+# panic_handler; it was a dead dependency here.
 
 [profile.release]
 debug = true

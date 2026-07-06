@@ -216,8 +216,9 @@ def _mav_listener() -> None:
                 _mav_state['mag_y'] = msg.ymag
                 _mav_state['mag_z'] = msg.zmag
             elif msg.get_type() == 'COMMAND_ACK':
-                _RESULT = {0: 'ACCEPTED', 1: 'DENIED', 2: 'UNSUPPORTED',
-                           3: 'FAILED', 4: 'IN_PROGRESS'}
+                # MAV_RESULT enum values
+                _RESULT = {0: 'ACCEPTED', 1: 'TEMPORARILY_REJECTED', 2: 'DENIED',
+                           3: 'UNSUPPORTED', 4: 'FAILED', 5: 'IN_PROGRESS'}
                 _mav_state['last_ack'] = (msg.command, msg.result)
                 if msg.result != 0:
                     print(f"COMMAND_ACK cmd={msg.command} "

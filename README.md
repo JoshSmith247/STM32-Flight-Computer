@@ -11,7 +11,7 @@ src/
 ├── imu.rs           — ICM-42688-P driver (SPI1, 12.5 MHz) — 500 Hz task
 ├── mag.rs           — QMC5883L compass driver (I2C1, 400 kHz) — 25 Hz task
 ├── baro.rs          — MS5611 barometer driver (SPI1 shared) — 25 Hz task
-├── gps.rs           — u-blox M10 UBX NAV-PVT parser (USART1) — 1 Hz task
+├── gps.rs           — u-blox M10 UBX NAV-PVT parser (USART1) — 5 Hz task
 ├── flow.rs          — MTF-02P optical flow + rangefinder (UART4) — frame-driven task
 ├── battery.rs       — LiPo voltage monitor via ADC3 (PC0) — 2 Hz task
 ├── ahrs.rs          — Madgwick 9-DOF AHRS filter → quaternion attitude estimate
@@ -41,7 +41,7 @@ pi/                  — Raspberry Pi Zero 2W relay scripts (MAVLink bridge, wee
 | Barometer       | MS5611             | SPI1 (shared mutex)    |
 | Compass         | QMC5883L           | I2C1 @ 400 kHz         |
 | GPS             | u-blox M10         | USART1 @ 38400         |
-| Optical flow    | MTF-02P            | UART4 @ 19200          |
+| Optical flow    | MTF-02P            | UART4 @ 115200 (MICOLINK) |
 | RC receiver     | ELRS / SBUS        | USART2 @ 100 kbaud 8E2 |
 | ESCs (×4)       | DSHOT600           | TIM3 CH1–4 (DMA)       |
 | Servos (×4)     | PWM 50 Hz          | TIM4 CH1–4             |
@@ -64,7 +64,7 @@ pi/                  — Raspberry Pi Zero 2W relay scripts (MAVLink bridge, wee
 | `mag_task`        | 25 Hz      | Tilt-compensated heading                |
 | `servo_task`      | 50 Hz      | TIM4 PWM duty update                    |
 | `battery_task`    | 2 Hz       | ADC voltage → %, critical failsafe      |
-| `gps_task`        | 1 Hz       | UBX NAV-PVT parse                       |
+| `gps_task`        | 5 Hz       | UBX NAV-PVT parse                       |
 | `flow_task`       | frame      | MTF-02P height + body-frame velocity    |
 | `rc_task`         | IRQ        | SBUS frame parser (100 ms timeout)      |
 | `led_task`        | 1–5 Hz     | Status LED blink pattern                |

@@ -137,6 +137,8 @@ impl MadgwickFilter {
     }
 
     /// Convert current quaternion to Euler angles (roll, pitch, yaw) in radians.
+    /// NOTE: `yaw` here is in the filter's native (Z-up / NWU) convention —
+    /// positive CCW from North. For NED navigation/telemetry use [`ned_yaw`].
     pub fn euler(&self) -> Euler {
         let q = &self.q;
         Euler {
@@ -145,4 +147,18 @@ impl MadgwickFilter {
             yaw:   libm::atan2f(2.0*(q.w*q.z + q.x*q.y), 1.0 - 2.0*(q.y*q.y + q.z*q.z)),
         }
     }
+}
+
+/// NED heading from the attitude quaternion, radians (-π, π]: 0 = North,
+/// positive CLOCKWISE from above.
+///
+/// The Madgwick objectives above define a Z-up NWU world (rest accel =
+/// (0,0,+1); mag pins world X to magnetic North), so the raw ZYX yaw is CCW-
+/// positive — NED heading is its negation. Every NED consumer MUST use this
+/// helper; never hand-roll atan2 on the quaternion.
+///
+/// ⚠ BRING-UP: rotate the airframe clockwise (from above) and confirm this
+/// INCREASES and matches the compass before trusting any GPS mode.
+pub fn ned_yaw(q: &crate::types::Quaternion) -> f32 {
+    -libm::atan2f(2.0*(q.w*q.z + q.x*q.y), 1.0 - 2.0*(q.y*q.y + q.z*q.z))
 }

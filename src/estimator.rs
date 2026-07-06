@@ -1,21 +1,12 @@
-//! Lightweight complementary position/velocity estimator.
+//! Complementary NED position/velocity estimator (deliberately not an EKF):
+//! trusts IMU dead-reckoning on short timescales, pulls toward GPS on long,
+//! optional low-altitude flow correction. Publishes `STATE.pos_estimate`.
 //!
-//! Fuses high-rate accelerometer dead-reckoning with low-rate GPS (and
-//! optionally optical-flow) corrections into a single NED position/velocity
-//! estimate, published to `STATE.pos_estimate`. This is deliberately NOT a
-//! full EKF: it is a pair of complementary filters (one per integration
-//! stage) that trust the IMU on short timescales and pull the estimate back
-//! toward GPS on long timescales, so the estimate keeps dead-reckoning
-//! sensibly through brief GPS dropouts.
+//! Output frame: NED (x=N, y=E, z=Down). Origin = first valid GPS 3-D fix
+//! (same point navigation captures as home). Flat-earth conversion:
+//!   meters_n = dlat_deg * 111_320;  meters_e = dlon_deg * 111_320 * cos(lat)
 //!
-//! Frame conventions match navigation.rs:
-//!   NED: x=North, y=East, z=Down (+down). Gravity is +9.81 on Down.
-//!   Origin = first valid GPS 3-D fix (the same point navigation.rs captures
-//!   as `home`). Local NED is derived from lat/lon deltas:
-//!     meters_n = dlat_deg * 111_320
-//!     meters_e = dlon_deg * 111_320 * cos(lat)
-//!
-//! Runs at 150 Hz from a dedicated embassy task.
+//! Runs at 150 Hz.
 
 use defmt::info;
 use embassy_time::{Duration, Instant, Ticker};
@@ -94,12 +85,11 @@ impl PosEstimator {
         (n, e, d)
     }
 
-    /// High-rate PREDICT step. Rotate the body-frame specific-force vector into
-    /// NED using the attitude quaternion, remove gravity, integrate to velocity
-    /// then position.
+    /// High-rate PREDICT: rotate body specific force into the world frame,
+    /// convert NWU→NED, remove gravity, integrate to velocity then position.
     fn predict(&mut self, accel_body: Vec3, q: Quaternion) {
-        // Rotate body accel into NED: a_ned = R(q) * a_body, where R is the
-        // body→world (NED) rotation matrix from the unit quaternion.
+        // R(q) rotates body → Madgwick world frame = Z-UP / NWU
+        // (X=North, Y=West, Z=Up — see ahrs::ned_yaw).
         let (w, x, y, z) = (q.w, q.x, q.y, q.z);
 
         let r00 = 1.0 - 2.0 * (y * y + z * z);
@@ -112,20 +102,18 @@ impl PosEstimator {
         let r21 = 2.0 * (y * z + w * x);
         let r22 = 1.0 - 2.0 * (x * x + y * y);
 
-        let an = r00 * accel_body.x + r01 * accel_body.y + r02 * accel_body.z;
-        let ae = r10 * accel_body.x + r11 * accel_body.y + r12 * accel_body.z;
-        // ⚠ FRAME CAVEAT — UNVERIFIED, reconcile at IMU bring-up. This assumes an
-        // NED/Z-down accel convention (rest accel ≈ -g on Down). But ahrs.rs (Madgwick)
-        // uses a Z-UP world (rest accel ≈ +1g on +Z), so the GRAVITY sign and the
-        // Down-axis labeling here are likely INVERTED. Do NOT trust the vertical channel
-        // until the real accel polarity is confirmed on hardware and this is corrected;
-        // horizontal channels are approximately OK at small tilt.
-        //
-        // The accelerometer measures specific force; at rest it reads +g on the
-        // axis opposing gravity. In NED the world-frame measured Down component
-        // is ~ -g while stationary, so adding GRAVITY removes the bias and
-        // leaves only true linear acceleration.
-        let ad = r20 * accel_body.x + r21 * accel_body.y + r22 * accel_body.z + GRAVITY;
+        // Specific force in the NWU world frame.
+        let f_n  = r00 * accel_body.x + r01 * accel_body.y + r02 * accel_body.z;
+        let f_w  = r10 * accel_body.x + r11 * accel_body.y + r12 * accel_body.z;
+        let f_up = r20 * accel_body.x + r21 * accel_body.y + r22 * accel_body.z;
+
+        // NWU → NED: N = X, E = -Y, D = -Z. At rest f_up = +g, so linear
+        // down-acceleration a_d = g - f_up = 0.
+        // ⚠ BRING-UP: lift the board sharply and confirm vel_d goes negative
+        // (up) before trusting the vertical channel.
+        let an = f_n;
+        let ae = -f_w;
+        let ad = GRAVITY - f_up;
 
         // Integrate accel → velocity → position (forward Euler).
         self.vel_n += an * DT;
@@ -210,9 +198,9 @@ pub async fn estimator_task() {
         let q = *STATE.attitude.lock().await;
         est.predict(imu.accel, q);
 
-        // ── CORRECT from GPS (when a fresh valid fix is available) ───────────
+        // ── CORRECT from GPS (fresh valid fix only) ──────────────────────────
         let gps = *STATE.gps_fix.lock().await;
-        if gps.fix_ok {
+        if gps.usable() {
             let moved = (gps.lat_deg != last_gps_lat) || (gps.lon_deg != last_gps_lon);
             // Correct on a new fix, or at least every 250 ms to keep tracking
             // even when stationary (lat/lon static but velocity meaningful).
@@ -240,17 +228,14 @@ pub async fn estimator_task() {
         // horizontal velocity estimate during dropout near the ground).
         if est.origin_set && !had_recent_gps {
             let flow = *STATE.flow.lock().await;
-            if flow.valid && flow.height_mm > 0 && flow.height_mm <= FLOW_MAX_HEIGHT_MM {
+            if flow.usable() && flow.height_mm > 0 && flow.height_mm <= FLOW_MAX_HEIGHT_MM {
                 let h_m = flow.height_mm as f32 / 1000.0;
                 // Body-frame velocities from flow (matches navigation.rs scaling).
                 let vel_fwd = flow.vel_x_mrad_s as f32 * h_m / 1_000_000.0;
                 let vel_right = flow.vel_y_mrad_s as f32 * h_m / 1_000_000.0;
 
-                // Rotate body horizontal velocity into NED using yaw.
-                let yaw = libm::atan2f(
-                    2.0 * (q.w * q.z + q.x * q.y),
-                    1.0 - 2.0 * (q.y * q.y + q.z * q.z),
-                );
+                // Rotate body horizontal velocity into NED using the NED yaw.
+                let yaw = crate::ahrs::ned_yaw(&q);
                 let (cy, sy) = (cosf(yaw), libm::sinf(yaw));
                 let flow_vel_n = vel_fwd * cy - vel_right * sy;
                 let flow_vel_e = vel_fwd * sy + vel_right * cy;

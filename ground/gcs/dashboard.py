@@ -25,10 +25,12 @@ _STATE_COLORS = {
     5: (40,  40, 210),
 }
 
-# Maps PROGRAMS index → (cmd, param1, param2) sent on SEND
+# Maps PROGRAMS index → (cmd, param1, param2) sent on SEND. DO_SET_MODE param2
+# = firmware FlightMode discriminant, same numbering as HEARTBEAT custom_mode
+# (0=Stab 1=AltH 2=PosH 3=Auto 4=RTH 5=Land 6=FollowMe).
 _PROG_COMMANDS = {
     0: (176, 0.0, 0.0),   # MANUAL      → DO_SET_MODE, Stabilise
-    1: (176, 0.0, 4.0),   # FOLLOW ME   → DO_SET_MODE, FollowMe
+    1: (176, 0.0, 6.0),   # FOLLOW ME   → DO_SET_MODE, FollowMe
     2: (176, 0.0, 3.0),   # WEED PICKER → DO_SET_MODE, Auto
     3: (20,  0.0, 0.0),   # RETURN HOME → NAV_RETURN_TO_LAUNCH
 }

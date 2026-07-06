@@ -4,8 +4,9 @@
 //! Default baud rate on M10 is 38400 (M8N was 9600).
 //!
 //! Startup sequence:
-//!   1. UBX-CFG-VALSET — enable NAV-PVT output at 1 Hz on UART1
+//!   1. UBX-CFG-VALSET — enable NAV-PVT output on UART1
 //!      (module typically ships with NMEA enabled; we add UBX NAV-PVT on top)
+//!   2. UBX-CFG-VALSET — CFG-RATE-MEAS = 200 ms → 5 Hz navigation rate
 //!
 //! Then loops reading NAV-PVT frames (92-byte payload) and writing STATE.gps_fix.
 //! Non-NAV-PVT frames (NMEA or other UBX) are drained and discarded.
@@ -36,7 +37,7 @@ use crate::{types::GpsFix, Irqs, STATE};
 
 // ── UBX configuration frame (checksum pre-computed) ────────────────────────
 
-/// UBX-CFG-VALSET (M10): enable NAV-PVT output at 1 Hz on UART1.
+/// UBX-CFG-VALSET (M10): enable NAV-PVT output (1 per nav epoch) on UART1.
 ///
 /// Payload (9 bytes):
 ///   version=0x00, layers=0x01 (RAM), reserved=0x00 0x00,
@@ -53,6 +54,24 @@ const CFG_VALSET_NAV_PVT: &[u8] = &[
     0x07, 0x00, 0x91, 0x20, // key: CFG-MSGOUT-UBX_NAV_PVT_UART1
     0x01,                    // value: 1 per nav epoch
     0x53, 0x48,              // CK_A, CK_B
+];
+
+/// UBX-CFG-VALSET (M10): 5 Hz navigation rate (CFG-RATE-MEAS = 200 ms).
+/// Position-hold needs ≥5 Hz — the estimator gains and PosPid assume it.
+///
+/// Payload (10 bytes):
+///   version=0x00, layers=0x01 (RAM), reserved=0x00 0x00,
+///   key=0x30210001 (CFG-RATE-MEAS, type U2), value=200 (ms)
+const CFG_VALSET_RATE_5HZ: &[u8] = &[
+    0xB5, 0x62,              // sync chars
+    0x06, 0x8A,              // class=CFG, id=VALSET
+    0x0A, 0x00,              // length = 10
+    0x00,                    // version
+    0x01,                    // layers: RAM
+    0x00, 0x00,              // reserved
+    0x01, 0x00, 0x21, 0x30, // key: CFG-RATE-MEAS (U2, ms)
+    0xC8, 0x00,              // value: 200 ms → 5 Hz
+    0xB5, 0x81,              // CK_A, CK_B
 ];
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -87,6 +106,7 @@ fn parse_pvt(payload: &[u8; 92]) -> GpsFix {
         hacc_m:   hacc as f32 * 1e-3,
         fix_ok:   (flags & 0x01) != 0 && fix_type >= 3,
         fix_type,
+        stamp_ms: crate::types::stamp_now_ms(),
     }
 }
 
@@ -108,9 +128,12 @@ pub async fn gps_task(
         .expect("USART1 (GPS) init failed");
     let (mut tx, rx) = uart.split();
 
-    // Give the module time to boot, then enable NAV-PVT via CFG-VALSET (M10 API)
+    // Give the module time to boot, then configure via CFG-VALSET (M10 API):
+    // NAV-PVT output on UART1, then a 5 Hz nav rate.
     Timer::after(Duration::from_millis(200)).await;
     tx.write(CFG_VALSET_NAV_PVT).await.ok();
+    Timer::after(Duration::from_millis(50)).await;
+    tx.write(CFG_VALSET_RATE_5HZ).await.ok();
 
     // Ring-buffered DMA RX so the interleaved NMEA/UBX stream isn't dropped between
     // reads — one-shot byte reads lose bytes under load and corrupt UBX frames.
@@ -118,12 +141,15 @@ pub async fn gps_task(
     let mut rx_ring = [0u8; 512];
     let mut rx = rx.into_ring_buffered(&mut rx_ring);
 
-    info!("GPS task started — UBX NAV-PVT @ 38400 baud on USART1 (M10)");
+    info!("GPS task started — UBX NAV-PVT @ 5 Hz, 38400 baud on USART1 (M10)");
 
     let mut byte    = [0u8; 1];
     let mut hdr     = [0u8; 4];   // [class, id, len_l, len_h]
     let mut payload = [0u8; 92];
     let mut ckbuf   = [0u8; 2];
+    // Fix logging: edge + every 5 s (per-fix logging floods RTT at 5 Hz).
+    let mut had_fix   = false;
+    let mut last_log  = embassy_time::Instant::now();
 
     loop {
         // ── sync char 1 ────────────────────────────────────────────────────
@@ -168,9 +194,12 @@ pub async fn gps_task(
         let fix = parse_pvt(&payload);
         *STATE.gps_fix.lock().await = fix;
 
-        if fix.fix_ok {
+        // Log on the no-fix→fix edge, then at most every 5 s.
+        if fix.fix_ok && (!had_fix || last_log.elapsed() > Duration::from_secs(5)) {
             info!("GPS 3D fix  lat={=f64}  lon={=f64}  alt={=f32}m  hacc={=f32}m",
                   fix.lat_deg, fix.lon_deg, fix.alt_m, fix.hacc_m);
+            last_log = embassy_time::Instant::now();
         }
+        had_fix = fix.fix_ok;
     }
 }

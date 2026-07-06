@@ -144,15 +144,15 @@ fn build_heartbeat(flight_state: u8, mode: FlightMode, payload_flags: u32) -> [u
 
 // SYS_STATUS #1 — 31 bytes: 3×u32, 9×u16/i16, 1×i8
 // health: MAV_SYS_STATUS_SENSOR bitmask of sensors that passed their runtime checks.
-//   gyro=0x01, accel=0x02, baro=0x08, GPS=0x20
-fn build_sys_status(voltage_mv: u16, pct: u8, health: u32) -> [u8; 31] {
+//   gyro=0x01, accel=0x02, mag=0x04, baro=0x08, GPS=0x20
+fn build_sys_status(voltage_mv: u16, pct: u8, health: u32, current_ca: i16) -> [u8; 31] {
     let mut p = [0u8; 31];
-    let present: u32 = 0x2B; // sensors fitted and enabled (constant)
+    let present: u32 = 0x2F; // sensors fitted and enabled (constant)
     p[0..4].copy_from_slice(&present.to_le_bytes());
     p[4..8].copy_from_slice(&present.to_le_bytes());
     p[8..12].copy_from_slice(&health.to_le_bytes());
     p[14..16].copy_from_slice(&voltage_mv.to_le_bytes());
-    p[16..18].copy_from_slice(&(-1i16).to_le_bytes()); // current unknown
+    p[16..18].copy_from_slice(&current_ca.to_le_bytes());
     p[30] = pct;
     p
 }
@@ -348,14 +348,25 @@ async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
     match cmd {
         400 => {
             if param1 >= 0.5 {
+                // Same pre-arm gates as the RC path, plus the RC arm switch
+                // must be ON — arming_task disarms within 20 ms if it's low.
                 let rc = *STATE.rc_input.lock().await;
-                if rc.throttle < 0.05 && !rc.failsafe && state::get() != FlightState::Fault {
+                if !rc.arm {
+                    warn!("MAVLink: arm rejected — RC arm switch is off");
+                    MAV_RESULT_TEMPORARILY_REJECTED
+                } else if rc.throttle >= 0.05 || rc.failsafe
+                    || state::get() == FlightState::Fault
+                {
+                    warn!("MAVLink: arm rejected — throttle/failsafe/Fault gate");
+                    MAV_RESULT_TEMPORARILY_REJECTED
+                } else if let Err(reason) = crate::pre_arm_check(STATE.effective_mode().await).await {
+                    warn!("MAVLink: arm rejected — {=str}", reason);
+                    MAV_RESULT_TEMPORARILY_REJECTED
+                } else {
                     *STATE.armed.lock().await = true;
                     state::set(FlightState::Armed);
                     info!("MAVLink: armed");
                     MAV_RESULT_ACCEPTED
-                } else {
-                    MAV_RESULT_UNSUPPORTED
                 }
             } else {
                 // Reject in-air disarm unless the GCS supplies the MAVLink
@@ -407,14 +418,25 @@ async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
             info!("MOTOR_TEST: M{} @ {} for 2 s", idx, throttle);
             MAV_RESULT_ACCEPTED
         }
-        20  => { STATE.rc_input.lock().await.mode = FlightMode::ReturnToHome; MAV_RESULT_ACCEPTED }
-        21  => { STATE.rc_input.lock().await.mode = FlightMode::Land;         MAV_RESULT_ACCEPTED }
+        // Mode commands write STATE.mode_override, NOT rc_input.mode (rc_task
+        // rewrites rc_input.mode from the switch every SBUS frame). The
+        // override holds until the pilot moves the mode switch.
+        20  => {
+            *STATE.mode_override.lock().await = Some(FlightMode::ReturnToHome);
+            info!("MAVLink: mode override -> ReturnToHome");
+            MAV_RESULT_ACCEPTED
+        }
+        21  => {
+            *STATE.mode_override.lock().await = Some(FlightMode::Land);
+            info!("MAVLink: mode override -> Land");
+            MAV_RESULT_ACCEPTED
+        }
         179 => {
             // MAV_CMD_DO_SET_HOME — param1=1 means use current GPS position.
             // param1=0 (explicit lat/lon) is not supported via this handler.
             if param1 >= 0.5 {
                 let gps = *STATE.gps_fix.lock().await;
-                if gps.fix_ok {
+                if gps.usable() {
                     *STATE.home_override.lock().await = Some(gps.pos());
                     info!("MAVLink: home set lat={=f64} lon={=f64}", gps.lat_deg, gps.lon_deg);
                     MAV_RESULT_ACCEPTED
@@ -427,13 +449,17 @@ async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
             }
         }
         176 => {
+            // param2 = FlightMode discriminant, same numbering HEARTBEAT
+            // custom_mode reports (0=Stab … 6=FollowMe).
             let mode = match param2 as u8 {
-                0 => FlightMode::Stabilise, 1 => FlightMode::AltitudeHold,
+                0 => FlightMode::Stabilise,    1 => FlightMode::AltitudeHold,
                 2 => FlightMode::PositionHold, 3 => FlightMode::Auto,
-                4 => FlightMode::FollowMe,
+                4 => FlightMode::ReturnToHome, 5 => FlightMode::Land,
+                6 => FlightMode::FollowMe,
                 _ => return MAV_RESULT_UNSUPPORTED,
             };
-            STATE.rc_input.lock().await.mode = mode;
+            *STATE.mode_override.lock().await = Some(mode);
+            info!("MAVLink: mode override -> {}", mode);
             MAV_RESULT_ACCEPTED
         }
         _ => MAV_RESULT_UNSUPPORTED,
@@ -494,19 +520,15 @@ pub async fn telemetry_task(
     let tx_fut = async {
         let mut seq:     u8  = 0;
         let mut tick:    u8  = 0;
-        let mut time_ms: u32 = 0;
         let mut buf = [0u8; 64];
         let mut ticker = Ticker::every(Duration::from_hz(10));
 
-        // Runtime sensor health — updated each tick, used by SYS_STATUS @ 1 Hz.
-        let imu_health:  Cell<bool> = Cell::new(false);
-        let baro_health: Cell<bool> = Cell::new(false);
         // Throttle-integrated mAh estimate — accumulated at 10 Hz.
         let est_mah: Cell<f32> = Cell::new(0.0);
 
         loop {
             ticker.next().await;
-            time_ms = time_ms.wrapping_add(100);
+            let time_ms = Instant::now().as_millis() as u32;
 
             // Pi heartbeat watchdog — triggers regardless of armed state so the
             // operator cannot arm into a dead-Pi configuration.
@@ -534,16 +556,9 @@ pub async fn telemetry_task(
 
             let quat = *STATE.attitude.lock().await;
             let imu  = *STATE.imu_data.lock().await;
-            let (roll, pitch, yaw) = quat_to_euler(quat);
-
-            // Update IMU health: accel must be finite and magnitude plausible (gravity ± 50 %).
-            {
-                let sq = imu.accel.x * imu.accel.x
-                       + imu.accel.y * imu.accel.y
-                       + imu.accel.z * imu.accel.z;
-                imu_health.set(imu.accel.x.is_finite() && imu.gyro.x.is_finite()
-                               && sq > 21.5 && sq < 216.1); // 4.6–14.7 m/s² (0.47–1.50 g)
-            }
+            let (roll, pitch, _yaw_nwu) = quat_to_euler(quat);
+            // MAVLink heading fields are NED — never the raw (NWU) Madgwick yaw.
+            let yaw = crate::ahrs::ned_yaw(&quat);
 
             // Accumulate mAh: 10 Hz tick = 0.1 s = 0.1/3600 h. Prefer the measured
             // pack current (ESC CUR pad, battery_task) when fitted (current_a >= 0);
@@ -567,13 +582,11 @@ pub async fn telemetry_task(
                 seq = seq.wrapping_add(1);
             }
 
-            // Even ticks — VFR_HUD #74 + SERVO_OUTPUT_RAW #36 @ 5 Hz
+            // Even ticks @ 5 Hz — VFR_HUD #74 + SERVO_OUTPUT_RAW #36 +
+            // GLOBAL_POSITION_INT #33 (5 Hz needed: the GCS computes weed/follow
+            // offsets against the drone's last reported position).
             if tick % 2 == 0 {
                 let baro   = *STATE.baro_data.lock().await;
-                // Baro healthy if pressure is within the valid ISA operating range.
-                baro_health.set(baro.pressure_pa.is_finite()
-                                && baro.pressure_pa > 50_000.0
-                                && baro.pressure_pa < 110_000.0);
                 let rc     = *STATE.rc_input.lock().await;
                 let gps    = *STATE.gps_fix.lock().await;
                 let motors = *STATE.motor_outputs.lock().await;
@@ -591,6 +604,11 @@ pub async fn telemetry_task(
                 let n = write_frame(&mut buf, seq, 36, &p, MAGIC_SERVO_OUTPUT_RAW);
                 tx.write(&buf[..n]).await.ok();
                 seq = seq.wrapping_add(1);
+
+                let p = build_global_position_int(time_ms, &gps, baro.altitude_m, yaw);
+                let n = write_frame(&mut buf, seq, 33, &p, MAGIC_GLOBAL_POSITION_INT);
+                tx.write(&buf[..n]).await.ok();
+                seq = seq.wrapping_add(1);
             }
 
             // Staggered 1 Hz messages
@@ -603,7 +621,8 @@ pub async fn telemetry_task(
                     seq = seq.wrapping_add(1);
                 }
                 0 => {
-                    let mode         = STATE.rc_input.lock().await.mode;
+                    // Effective mode = what navigation actually flies.
+                    let mode         = STATE.effective_mode().await;
                     let flight_state = state::get() as u8;
                     let pl_flags     = *STATE.payload_flags.lock().await;
                     let p = build_heartbeat(flight_state, mode, pl_flags);
@@ -615,11 +634,21 @@ pub async fn telemetry_task(
                 2 => {
                     let bat = *STATE.battery.lock().await;
                     let gps = *STATE.gps_fix.lock().await;
+                    // Same health_task flags that gate arming — GCS lamps must
+                    // agree with what the firmware will actually arm.
+                    let h = *STATE.sensor_health.lock().await;
                     let mut health: u32 = 0;
-                    if imu_health.get()    { health |= 0x01 | 0x02; } // gyro + accel
-                    if baro_health.get()   { health |= 0x08; }         // barometer
-                    if gps.fix_type >= 2   { health |= 0x20; }         // GPS communicating
-                    let p = build_sys_status((bat.voltage_v * 1000.0) as u16, bat.pct, health);
+                    if h.imu_ok          { health |= 0x01 | 0x02; } // gyro + accel
+                    if h.mag_ok          { health |= 0x04; }        // magnetometer
+                    if h.baro_ok         { health |= 0x08; }        // barometer
+                    if gps.fix_type >= 2 { health |= 0x20; }        // GPS communicating
+                    let current_ca = if bat.current_a >= 0.0 {
+                        (bat.current_a * 100.0).clamp(0.0, i16::MAX as f32) as i16
+                    } else {
+                        -1
+                    };
+                    let p = build_sys_status((bat.voltage_v * 1000.0) as u16, bat.pct,
+                                             health, current_ca);
                     let n = write_frame(&mut buf, seq, 1, &p, MAGIC_SYS_STATUS);
                     tx.write(&buf[..n]).await.ok();
                     seq = seq.wrapping_add(1);
@@ -650,14 +679,6 @@ pub async fn telemetry_task(
                     let p = build_battery_status(bat.voltage_v, bat.pct,
                                                  current_ca, mah, time_s);
                     let n = write_frame(&mut buf, seq, 147, &p, MAGIC_BATTERY_STATUS);
-                    tx.write(&buf[..n]).await.ok();
-                    seq = seq.wrapping_add(1);
-                }
-                8 => {
-                    let gps  = *STATE.gps_fix.lock().await;
-                    let baro = *STATE.baro_data.lock().await;
-                    let p = build_global_position_int(time_ms, &gps, baro.altitude_m, yaw);
-                    let n = write_frame(&mut buf, seq, 33, &p, MAGIC_GLOBAL_POSITION_INT);
                     tx.write(&buf[..n]).await.ok();
                     seq = seq.wrapping_add(1);
                 }
@@ -902,7 +923,7 @@ pub async fn telemetry_task(
 
                             let gps  = *STATE.gps_fix.lock().await;
                             let baro = *STATE.baro_data.lock().await;
-                            if gps.fix_ok {
+                            if gps.usable() {
                                 let lat_rad   = (gps.lat_deg as f32).to_radians();
                                 let target_lat = gps.lat_deg + (ned_n as f64) / 111_320.0;
                                 let target_lon = gps.lon_deg

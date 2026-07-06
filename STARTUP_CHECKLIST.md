@@ -159,6 +159,7 @@ There are two independent arm paths. Use **one** — not both simultaneously.
 3. `arming_task` checks every 20 ms:
    - RBF pin removed (PA0 open)
    - Arm switch high, throttle < 5 %, no failsafe, not in Fault state
+   - ⚠ All four motors spin at idle (~4 %) the moment the craft arms — props clear!
    - IMU healthy (plausibility gates)
    - Any mode except Stabilise: **live barometer required**
    - PositionHold / Auto / RTH: **nav-ready GPS** (3-D fix, ≤ 5 m accuracy) **and calibrated compass**
@@ -172,7 +173,7 @@ Each denial is logged with its reason (defmt/RTT). Common causes:
 |---|---|
 | "remove-before-flight pin installed" | Pull the RBF jumper |
 | GCS ARM button stays grey | Not all 7 checklist items green |
-| GCS ARM pulses but never confirms | STM32 returned `MAV_RESULT_UNSUPPORTED` — throttle not at zero, failsafe active, or Fault state |
+| GCS ARM pulses but never confirms | STM32 returned `MAV_RESULT_TEMPORARILY_REJECTED` — RC arm switch off, throttle not at zero, failsafe, Fault state, or a pre-arm gate (safety pin / IMU / baro / GPS / mag / battery critical) |
 | "mode requires a live barometer" | Baro absent/dead and mode ≠ Stabilise |
 | "mode requires nav-ready GPS" / "calibrated compass" | GPS-dependent mode without 3-D fix / mag figure-8 not done this boot |
 | LED stays slow-blink after arm | Fault state — check defmt RTT log for cause |
@@ -188,8 +189,9 @@ Each denial is logged with its reason (defmt/RTT). Common causes:
    - **AltitudeHold → PositionHold:** GPS position locks at the moment you switch
    - **Any mode → Auto:** mission runs only if waypoints were uploaded; otherwise holds current position
 4. **Battery warnings:**
-   - < 20% SoC → `navigation_task` forces RTH (GPS fix present) or Land (no fix)
-   - < 3.5 V/cell → immediate forced Land; auto-disarms on ground; Fault state locked until battery swap
+   - < 30% SoC → `navigation_task` forces RTH (GPS fix present) or Land (no fix)
+   - < 3.30 V/cell under load (critical) → immediate forced RTH/Land; auto-disarms on ground; Fault state locked until battery swap
+   - Note: arming is refused while the battery reads critical (also catches an uncalibrated V_DIVIDER reading 0 V)
 
 ---
 

@@ -7,9 +7,9 @@
 //! Tune CELL_COUNT and V_DIVIDER for your pack and resistor values.
 //!
 //! Safe-abort behaviour (navigation_task reads STATE.battery.critical):
-//!   • 5 consecutive samples below V_CELL_CRIT (≈ 2.5 s) → critical = true
+//!   • 3 consecutive samples below V_CELL_CRIT (≈ 1.5 s) → critical = true
 //!   • Navigation overrides to RTH (GPS fix present) or Land (no fix)
-//!   • Once on the ground (baro alt < 0.3 m) the task disarms and sets Fault
+//!   • Once on the ground (AGL < 0.15 m) the task disarms and sets Fault
 //!     state, preventing re-arm until the battery is swapped
 //!
 //! NOTE: The embassy-stm32 ADC API changes between versions.  If Adc::new
@@ -45,7 +45,10 @@ const CUR_A_PER_V: f32 = 40.0;
 
 const V_CELL_FULL:  f32 = 4.20;     // 100 %
 const V_CELL_EMPTY: f32 = 3.00;     //   0 %
-const V_CELL_CRIT:  f32 = 3.50;     //  ~5 % — triggers safe abort
+/// Per-cell critical threshold, measured UNDER LOAD (≈3.5–3.6 V resting).
+/// Maps to 25 % on the linear pct curve — must stay BELOW navigation's
+/// BATT_LOW_PCT (30 %) so the low→RTH stage fires before the critical abort.
+const V_CELL_CRIT:  f32 = 3.30;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -110,7 +113,7 @@ pub async fn battery_task(
             // Prefer rangefinder AGL; fall back to baro when flow sensor is invalid.
             let flow  = *STATE.flow.lock().await;
             let armed = *STATE.armed.lock().await;
-            let agl   = if flow.valid && flow.height_mm > 0 && flow.height_mm < 5_000 {
+            let agl   = if flow.usable() && flow.height_mm > 0 && flow.height_mm < 5_000 {
                 flow.height_mm as f32 / 1000.0
             } else {
                 STATE.baro_data.lock().await.altitude_m
