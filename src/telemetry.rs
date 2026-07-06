@@ -469,10 +469,8 @@ pub async fn telemetry_task(
         .expect("USART3 init failed");
     let (mut tx, rx) = uart.split();
 
-    // Ring-buffered DMA RX: the DMA fills this buffer continuously in the background,
-    // so no incoming bytes are lost while the executor is busy elsewhere. The previous
-    // one-shot, byte-at-a-time read dropped bytes between reads → corrupted frames →
-    // CRC failures on inbound HEARTBEAT/COMMAND_LONG. 512 B ≈ 89 ms of slack @57600.
+    // Ring-buffered DMA RX: the DMA fills this buffer continuously so no inbound
+    // bytes are lost while the executor is busy. 512 B ≈ 89 ms of slack @ 57600.
     let mut rx_ring = [0u8; 512];
     let mut rx = rx.into_ring_buffered(&mut rx_ring);
 
@@ -547,11 +545,17 @@ pub async fn telemetry_task(
                                && sq > 21.5 && sq < 216.1); // 4.6–14.7 m/s² (0.47–1.50 g)
             }
 
-            // Accumulate mAh: 10 Hz tick = 0.1 s = 0.1/3600 h
-            // mAh added = throttle × MAX_CURRENT_A × 1000 mA/A × (0.1 s / 3600 s/h)
+            // Accumulate mAh: 10 Hz tick = 0.1 s = 0.1/3600 h. Prefer the measured
+            // pack current (ESC CUR pad, battery_task) when fitted (current_a >= 0);
+            // otherwise integrate the throttle-based estimate as before.
             {
-                let thr = STATE.rc_input.lock().await.throttle;
-                est_mah.set(est_mah.get() + thr * EST_MAX_CURRENT_A * (100.0 / 3600.0));
+                let measured = STATE.battery.lock().await.current_a;
+                let amps = if measured >= 0.0 {
+                    measured
+                } else {
+                    STATE.rc_input.lock().await.throttle * EST_MAX_CURRENT_A
+                };
+                est_mah.set(est_mah.get() + amps * (100.0 / 3600.0));
             }
 
             // Every tick — ATTITUDE #30 @ 10 Hz
@@ -629,8 +633,13 @@ pub async fn telemetry_task(
                 }
                 6 => {
                     let bat        = *STATE.battery.lock().await;
-                    let throttle   = STATE.rc_input.lock().await.throttle;
-                    let current_a  = throttle * EST_MAX_CURRENT_A;
+                    // Measured pack current when the CUR-pad sensor is fitted
+                    // (current_a >= 0); throttle-based estimate otherwise.
+                    let current_a  = if bat.current_a >= 0.0 {
+                        bat.current_a
+                    } else {
+                        STATE.rc_input.lock().await.throttle * EST_MAX_CURRENT_A
+                    };
                     let current_ca = (current_a * 100.0).clamp(0.0, i16::MAX as f32) as i16;
                     let mah        = est_mah.get() as i32;
                     // Remaining capacity from voltage-based pct; time = capacity / rate.

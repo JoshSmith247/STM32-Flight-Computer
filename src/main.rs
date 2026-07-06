@@ -180,16 +180,10 @@ async fn control_task() {
 /// The control_task also zeros motors immediately on failsafe; this task
 /// confirms the disarm within one 20 ms tick.
 ///
-/// `safety_pin`: a physical "remove before flight" interlock (2-pin header on PA0/GND,
-/// bridged by a pull-pin/jumper). Wired with the internal pull-up, so pin INSERTED
-/// (shorts PA0 to GND) reads LOW = blocked, pin REMOVED (open) reads HIGH = clear.
-/// ⚠ This only gates the disarmed→armed transition, not an already-flying aircraft —
-/// checking it on every tick while armed would let a flaky wire force a mid-air disarm,
-/// which is worse than the hazard it's meant to prevent. It is also fail-*open*, not
-/// fail-safe: a severed wire reads identically to "pin removed" (HIGH = clear). It is a
-/// discipline/reminder layer stacked on top of the RC arm switch + throttle-zero +
-/// health gates below, not a certified standalone interlock — treat pulling it as part
-/// of the pre-flight checklist, not a substitute for prop-off / area-clear checks.
+/// `safety_pin`: "remove before flight" jumper (PA0→GND, pull-up: inserted = LOW =
+/// arm denied). ⚠ Gates only the disarmed→armed transition — never checked while
+/// flying, so a flaky wire can't force a mid-air disarm. Fail-open (a severed wire
+/// reads as "removed"): a reminder layer on top of the arm gates, not an interlock.
 #[embassy_executor::task]
 async fn arming_task(safety_pin: Input<'static>) {
     let mut ticker = Ticker::every(Duration::from_hz(50));
@@ -220,10 +214,14 @@ async fn arming_task(safety_pin: Input<'static>) {
             let health = *STATE.sensor_health.lock().await;
             let mode_needs_gps = matches!(rc.mode,
                 FlightMode::PositionHold | FlightMode::Auto | FlightMode::ReturnToHome);
+            // Every mode except Stabilise runs an altitude PID off the baro.
+            let mode_needs_baro = !matches!(rc.mode, FlightMode::Stabilise);
             if safety_pin.is_low() {
                 defmt::warn!("Arm denied: remove-before-flight pin installed");
             } else if !health.imu_ok {
                 defmt::warn!("Arm denied: IMU not healthy");
+            } else if mode_needs_baro && !health.baro_ok {
+                defmt::warn!("Arm denied: mode requires a live barometer");
             } else if mode_needs_gps && !health.gps_ok {
                 defmt::warn!("Arm denied: mode requires nav-ready GPS (3D fix + accuracy)");
             } else if mode_needs_gps && !health.mag_ok {
@@ -269,10 +267,9 @@ async fn main(spawner: Spawner) {
     config.rcc.apb3_pre = APBPrescaler::Div2;    // APB3   = 100 MHz
     config.rcc.apb4_pre = APBPrescaler::Div2;    // APB4   = 100 MHz
 
-    // ADC kernel clock from per_ck (HSI). Without it ADC conversions never complete —
-    // the reason battery_task was disabled. ⚠ Runtime-unverified: confirm a sane PC0
-    // reading and calibrate V_DIVIDER (battery.rs) at hardware bring-up before trusting
-    // the low-battery failsafe — a wrong reading reads "critical" and forces RTH/Land.
+    // ADC kernel clock from per_ck (HSI) — without it ADC conversions never complete.
+    // ⚠ Calibrate V_DIVIDER (battery.rs) at bring-up before trusting the low-battery
+    // failsafe: a wrong reading reads "critical" and forces RTH/Land.
     config.rcc.mux.adcsel = mux::Adcsel::Per;
 
     let p = embassy_stm32::init(config);
@@ -285,18 +282,31 @@ async fn main(spawner: Spawner) {
         let mut spi_cfg = spi::Config::default();
         spi_cfg.frequency = Hertz(12_500_000);
         spi_cfg.mode      = spi::MODE_0;
-        *SPI1_BUS.lock().await = Some(Spi::new(
-            p.SPI1, p.PA5, p.PA7, p.PA6, p.DMA2_CH3, p.DMA2_CH0, Irqs, spi_cfg,
-        ));
+        // MOSI: PA7 on the custom FC; PD7 on the Nucleo, where PA7 is hard-wired
+        // to the on-board Ethernet PHY (RMII_CRS_DV) and unusable for SPI.
+        #[cfg(not(feature = "nucleo"))]
+        let spi = Spi::new(p.SPI1, p.PA5, p.PA7, p.PA6, p.DMA2_CH3, p.DMA2_CH0, Irqs, spi_cfg);
+        #[cfg(feature = "nucleo")]
+        let spi = Spi::new(p.SPI1, p.PA5, p.PD7, p.PA6, p.DMA2_CH3, p.DMA2_CH0, Irqs, spi_cfg);
+        *SPI1_BUS.lock().await = Some(spi);
     }
 
-    let led = Output::new(p.PG7, Level::High, Speed::Low); // active-low: start HIGH = off
+    // Status LED: PG7 on the custom FC (active-LOW); LD2/PE1 on the Nucleo
+    // (active-HIGH). Both start OFF. led_task handles the polarity.
+    #[cfg(not(feature = "nucleo"))]
+    let led = Output::new(p.PG7, Level::High, Speed::Low);
+    #[cfg(feature = "nucleo")]
+    let led = Output::new(p.PE1, Level::Low, Speed::Low);
 
     // Remove-before-flight safety pin: 2-pin header on PA0 (Zio) + GND, bridged by a
     // physical pull-pin/jumper. Internal pull-up so "pin removed" (open) reads HIGH =
     // clear to arm; "pin installed" (shorts PA0→GND) reads LOW = arm denied. See the
     // fail-open + arm-transition-only caveats on arming_task's doc comment.
     let safety_pin = Input::new(p.PA0, Pull::Up);
+
+    // Gripper-jaw microswitch (PC2 → GND, closed = weed held = LOW). Read by
+    // navigation_task's grip check under `--features grip-sense`.
+    let grip_pin = Input::new(p.PC2, Pull::Up);
 
     spawner.spawn(status::led::led_task(led).unwrap());
     spawner.spawn(sensors::imu::imu_task(p.PA4).unwrap());
@@ -316,20 +326,16 @@ async fn main(spawner: Spawner) {
     spawner.spawn(telemetry::telemetry_task(p.USART3, p.PD9, p.PD8, p.DMA1_CH3, p.DMA1_CH1, Irqs).unwrap());
     spawner.spawn(sensors::baro::baro_task(p.PA8).unwrap());
     spawner.spawn(sensors::gps::gps_task(p.USART1, p.PA10, p.PA9, p.DMA2_CH6, p.DMA2_CH5, Irqs).unwrap());
-    // Battery voltage monitor (ADC3/PC0). The ADC kernel clock is now configured in RCC
-    // above (adcsel = PER), so blocking_read no longer wedges the executor. ⚠ Verify the
-    // reading + tune V_DIVIDER in battery.rs at hardware bring-up: until calibrated it may
-    // read low and trip the critical-battery failsafe (forces RTH/Land). On the bench
-    // (no pack on PC0) it reads ~0 V → "critical", harmless since you don't arm-fly there.
-    spawner.spawn(sensors::battery::battery_task(p.ADC3, p.PC0).unwrap());
-    spawner.spawn(navigation::navigation_task().unwrap());
+    // Battery monitor (ADC3: PC0 = pack divider, PF3 = ESC CUR pad). On the bench with
+    // no pack it reads ~0 V → "critical" — harmless while not arming to fly.
+    spawner.spawn(sensors::battery::battery_task(p.ADC3, p.PC0, p.PF3).unwrap());
+    spawner.spawn(navigation::navigation_task(grip_pin).unwrap());
     spawner.spawn(estimator::estimator_task().unwrap());
     spawner.spawn(health::health_task().unwrap());
     spawner.spawn(control_task().unwrap());
     spawner.spawn(arming_task(safety_pin).unwrap());
-    // Flow (MTF-02P): order cancelled — task stays spawned; with nothing on UART4 it
-    // simply never sets flow.valid, and every consumer (estimator, land_step) falls
-    // back to GPS/baro. Wiring the sensor later needs no firmware change.
+    // Flow (MTF-02P): safe to run unwired — flow.valid stays false and every
+    // consumer falls back to GPS/baro.
     spawner.spawn(sensors::flow::flow_task(p.UART4, p.PC11, p.DMA1_CH2, Irqs).unwrap());
     spawner.spawn(actuators::payloads::servo::servo_task(p.TIM4, p.PD12, p.PD13, p.PD14, p.PD15).unwrap());
     spawner.spawn(sensors::mag::mag_task(p.I2C1, p.PB8, p.PB9).unwrap());
@@ -348,14 +354,14 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
         // Send a zero DSHOT frame before halting so ESCs receive an explicit stop.
         // Spins ≤30 µs for any in-flight DMA to drain, then fires once and halts.
         actuators::motor::emergency_stop();
-        // Turn off status LED (PG7, active-low: set ODR bit to drive HIGH = off).
-        // GPIOG base on the STM32H7 is 0x5802_1800 (AHB4). NOTE: this was previously
-        // 0x4002_1800 — that's the STM32F4 GPIO base, so on the H723 the write landed
-        // in the APB1 region and the LED-off silently did nothing. ODR is at +0x14
-        // (offset(5) on a u32 ptr). If the status LED is moved off PG7 (e.g. to an
-        // onboard Nucleo LED), update this base/bit to the new port.
-        let gpiog = 0x5802_1800 as *mut u32;
-        *gpiog.offset(5) = 1 << 7;
+        // Turn off the status LED via BSRR (+0x18, offset(6)) — atomic set/reset,
+        // can't clobber other pins on the port. H7 GPIO bases are 0x5802_xxxx
+        // (AHB4) — never F4-era 0x4002_xxxx. Update if the LED pin moves.
+        #[cfg(not(feature = "nucleo"))] // custom FC: PG7 active-low → set HIGH = off
+        let (gpio_base, bsrr) = (0x5802_1800u32, 1u32 << 7);
+        #[cfg(feature = "nucleo")]      // Nucleo: PE1 active-high → reset LOW = off
+        let (gpio_base, bsrr) = (0x5802_1000u32, 1u32 << (1 + 16));
+        (gpio_base as *mut u32).offset(6).write_volatile(bsrr);
     }
     loop {}
 }

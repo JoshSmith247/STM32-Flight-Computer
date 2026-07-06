@@ -34,11 +34,16 @@ opt-level = 's'
 [features]
 default = []
 simulation = []
-# Bench bring-up on the NUCLEO-H723ZG with no Pi attached: route the MAVLink
-# USART3 onto the ST-Link Virtual COM Port pins (PD8/PD9) instead of the Pi
-# header pins (PB10/PB11), so a GCS can send DO_MOTOR_TEST etc. over the same
-# USB cable used to flash. Leave OFF for the deployed Pi wiring.
-nucleo-vcp = []
+# Target the NUCLEO-H723ZG dev board (vs the custom flight computer):
+#  • SPI1 MOSI moves PA7 → PD7 — on the Nucleo, PA7 is RMII_CRS_DV, hard-wired to
+#    the on-board Ethernet PHY, which loads the line and kills the IMU/baro bus.
+#  • Status LED moves PG7 → PE1 (LD2, active-HIGH; PG7 is active-low on the FC).
+# Flying the Nucleo with the Pi attached = `--features nucleo` alone.
+nucleo = []
+# Nucleo bench bring-up with no Pi attached: `nucleo` plus MAVLink USART3 routed
+# onto the ST-Link Virtual COM Port pins (PD8/PD9) instead of the Pi header pins
+# (PB10/PB11), so a GCS can send DO_MOTOR_TEST etc. over the flashing USB cable.
+nucleo-vcp = ["nucleo"]
 # ⚠ BENCH ONLY (PROPS OFF): hold one motor (BENCH_FORCE_MOTOR in motor.rs) at a fixed
 # throttle continuously — a constant DSHOT stream for scope/logic-analyzer probing, no
 # command/arming/watchdog needed. NEVER flash for flight.
@@ -57,6 +62,10 @@ spin-all = []
 # back to 600 kbit/s (TIM3 PSC=0) for a different/upgraded ESC — nothing else in the TX
 # path changes, DShot duty ratios are speed-independent.
 dshot600 = []
+# Gripper-jaw feedback: require the PC2 microswitch (closed→GND = weed held) to
+# confirm each grab; failed grabs retry up to MAX_GRIP_ATTEMPTS then abort to
+# mission. OFF = legacy open-loop timer behaviour (no switch fitted).
+grip-sense = []
 # PID-tuning "blackbox": stream ~50 Hz setpoint/measured/gyro/output over RTT defmt for
 # capture + plotting during tuning (`cargo run --features tune-log`). Off by default.
 tune-log = []

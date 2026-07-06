@@ -9,11 +9,15 @@ Steps are ordered; each section depends on the previous one completing successfu
 
 These are prerequisites — if already done, skip to Section 1.
 
-- [ ] **Flash firmware** — `cargo run --release` with ST-Link or J-Link connected
-- [ ] **Power-cycle STM32 after every flash** — CR3 is write-once per POR; the bootloader leaves state that faults on first run without a full power cycle
-- [ ] **Compass calibration** — set `MAG_OFFSET_X/Y/Z` in `src/sensors/mag.rs` by rotating the fully-assembled drone in a figure-8 and recording (max + min) / 2 per axis
+- [ ] **Flash firmware** — `cargo run --release`. On the **Nucleo** build with `--features nucleo`
+      (Pi wiring) or `--features nucleo-vcp` (bench, MAVLink over ST-Link USB); probe-rs
+      boots it directly. On the **custom FC** (DFU): true power-cycle after every flash —
+      CR3 is write-once per POR and a soft reset hangs the time driver (board looks dead)
+- [ ] **Wire the safety inputs** — remove-before-flight jumper header on **PA0↔GND**;
+      gripper-jaw microswitch on **PC2↔GND** (weed missions, `--features grip-sense`)
 - [ ] **Verify voltage divider** — measure R1 and R2 on the battery sense line and confirm `V_DIVIDER = (R1 + R2) / R2` in `src/sensors/battery.rs` matches
-- [ ] **Verify DSHOT DMAMUX** — open RM0468 Table 105, confirm `DMAMUX_TIM3_UP = 22` in `src/actuators/motor.rs`
+- [ ] **Current sense (optional)** — ESC CUR pad → PF3, calibrate `CUR_A_PER_V` against a
+      clamp meter, then set `CUR_SENSE_FITTED = true` in `src/sensors/battery.rs`
 - [ ] **Pi services installed** — run the setup block from `pi/README.md` on the Pi once:
   ```bash
   sed -i 's|/home/pi/drone|/home/jsmith/pi|g; s|User=pi|User=jsmith|g' \
@@ -45,10 +49,17 @@ These are prerequisites — if already done, skip to Section 1.
 
 1. Connect LiPo (or bench power via BEC at 5 V on the 5 V rail — **do not** power STM32 from USB only when ESCs are connected)
 2. **Expected immediately:**
-   - LED (PG7) starts **slow 1 Hz blink** → Idle state
+   - LED starts **slow 1 Hz blink** → Idle state (PG7 on the FC; LD2 on the Nucleo)
    - ESCs beep startup sequence (takes ~2 s while `motor_task` runs its startup delay)
-3. **Within 50 ms:** IMU initializes; if it fails (wiring fault) the LED switches to **rapid strobe** (Fault). Power off and check SPI1 wiring to ICM-42688-P (PA4 CS, PA5 SCK, PA6 MISO, PA7 MOSI)
-4. STM32 immediately begins streaming MAVLink v2 on USART3 at 57600 baud — the Pi does not need to be ready yet, but has a **5-second window** before the heartbeat watchdog fires
+3. **Keep the craft STILL for the first second** — the IMU runs a gyro-bias calibration
+   (~0.6 s) at boot; motion during it degrades attitude for the whole session. If the IMU
+   fails (wiring fault) the flight build LED switches to **rapid strobe** (Fault) — check
+   SPI1 wiring (PA4 CS, PA5 SCK, PA6 MISO, MOSI = PA7 on FC / **PD7 on Nucleo**). Bench
+   `nucleo-vcp` builds warn and continue instead of faulting
+4. **If the compass is fitted:** rotate the craft in a slow figure-8 through all axes for
+   the 25 s calibration window, or heading (and GPS-mode arming) stays unavailable
+5. STM32 begins streaming MAVLink v2 on USART3 at 57600 baud — the Pi does not need to
+   be ready yet; the heartbeat watchdog only engages after the *first* Pi heartbeat
 
 ---
 
@@ -143,23 +154,27 @@ There are two independent arm paths. Use **one** — not both simultaneously.
 
 ### 6b · Arm via RC (field / manual-only flights)
 
-1. All checks from Section 5 complete
+1. All checks from Section 5 complete, **and the remove-before-flight pin is PULLED**
 2. Flip **arm switch (Ch5) UP**
 3. `arming_task` checks every 20 ms:
-   - Arm switch high
-   - Throttle < 5 %
-   - No failsafe
-   - Not in Fault state
-   - If mode is PositionHold / Auto / RTH: **3D GPS fix required** (harder check than MAVLink path)
+   - RBF pin removed (PA0 open)
+   - Arm switch high, throttle < 5 %, no failsafe, not in Fault state
+   - IMU healthy (plausibility gates)
+   - Any mode except Stabilise: **live barometer required**
+   - PositionHold / Auto / RTH: **nav-ready GPS** (3-D fix, ≤ 5 m accuracy) **and calibrated compass**
 4. LED switches to **double-pulse** (Armed)
 
 ### Arm rejected?
 
+Each denial is logged with its reason (defmt/RTT). Common causes:
+
 | Symptom | Cause |
 |---|---|
+| "remove-before-flight pin installed" | Pull the RBF jumper |
 | GCS ARM button stays grey | Not all 7 checklist items green |
 | GCS ARM pulses but never confirms | STM32 returned `MAV_RESULT_UNSUPPORTED` — throttle not at zero, failsafe active, or Fault state |
-| RC arm switch does nothing | Throttle not at zero, or no GPS fix in a GPS-dependent mode |
+| "mode requires a live barometer" | Baro absent/dead and mode ≠ Stabilise |
+| "mode requires nav-ready GPS" / "calibrated compass" | GPS-dependent mode without 3-D fix / mag figure-8 not done this boot |
 | LED stays slow-blink after arm | Fault state — check defmt RTT log for cause |
 
 ---
@@ -222,5 +237,6 @@ During landing:
 | GCS loses link mid-flight | Drone continues on last mode; RC has full override |
 | Pi heartbeat lost > 5 s | STM32 auto-forces Land, auto-disarms on ground |
 | Critical battery in air | STM32 auto-forces RTH (GPS) or Land (no GPS) |
-| IMU fault on power-on | LED strobes; power off, check SPI1 wiring |
-| ESCs don't beep on power-on | Check DSHOT wiring (PB0/1/4/5), verify DMAMUX_TIM3_UP value |
+| IMU fault on power-on | LED strobes; power off, check SPI1 wiring (MOSI: PA7 FC / PD7 Nucleo) |
+| ESCs don't beep on power-on | ESC power side (battery/connector) — beeps are battery-driven, not signal-driven |
+| ESC beeps but won't spin when armed | ESC never saw valid signal: check DShot ground continuity + 300 kbit rate (this ESC does not parse DShot600) |

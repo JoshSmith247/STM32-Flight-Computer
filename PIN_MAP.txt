@@ -4,7 +4,8 @@
  Generated from firmware source (src/main.rs + per-task drivers).
  MCU:    STM32H723ZGT6   SYSCLK 400 MHz / HCLK 200 MHz / APBx 100 MHz
  Logic:  3.3 V  (all signal pins are 3.3 V — do NOT feed 5 V into any GPIO)
- Status LED: PG7 (active-low)  slow 1 Hz = Idle/healthy, rapid strobe = Fault
+ Status LED: PG7 active-low (FC) / PE1=LD2 active-high (`nucleo` builds)
+             slow 1 Hz = Idle/healthy, rapid strobe = Fault
 --------------------------------------------------------------------------------
  IMPORTANT: this is the LOGICAL map (MCU pin -> function). Confirm the physical
  header/connector location of each Pxx pin against your board's reference card.
@@ -17,21 +18,25 @@
 
   SENSOR / DEVICE                  BUS        MCU PINS                  STATUS
   -------------------------------  ---------  ------------------------  --------
-  IMU   ICM-42688-P (6-axis)       SPI1       PA5 PA6 PA7 + PA4 (CS)    have it
-  Baro  MS5611                     SPI1       PA5 PA6 PA7 + PA8 (CS)    REFUNDED*
+  IMU   ICM-42688-P (6-axis)       SPI1       PA5 PA6 MOSI** + PA4(CS)  have it
+  Baro  MS5611                     SPI1       PA5 PA6 MOSI** + PA8(CS)  REFUNDED*
   Mag   QMC5883L                   I2C1       PB8(SCL) PB9(SDA)         on FC
   GPS   SEQURE M10-18              USART1     PA10(RX) PA9(TX)          have it
   RC    BETAFPV ELRS (SBUS)        USART2     PA3(RX, inverted)        have it
-  Flow  MTF-02P (flow+range)       UART4      PC11(RX only)            have it
+  Flow  MTF-02P (flow+range)       UART4      PC11(RX only)            cancelled
   Telem Raspberry Pi (MAVLink)     USART3     PB10(TX) PB11(RX)        on craft
   Batt  LiPo divider               ADC3       PC0                       wire it
-  Motors DYS X2807 x4 (DSHOT600)   TIM3       PB4 PB5 PB0 PB1           have it
+  Curr  ESC CUR pad                ADC3       PF3                       wire it
+  Motors DYS X2807 x4 (DSHOT300)   TIM3       PB4 PB5 PB0 PB1           WORKING
   Servos payload x4 (PWM)          TIM4       PD12 PD13 PD14 PD15       optional
-  LED   status                     GPIO       PG7                       on FC
+  RBF   remove-before-flight pin   GPIO       PA0 (jumper to GND)       wire it
+  Grip  jaw microswitch            GPIO       PC2 (switch to GND)       wire it
+  LED   status                     GPIO       PG7 (FC) / PE1 (Nucleo)   on FC
 
-  * Baro line shows a refund/return in the order history — if the MS5611 is going
-    back you'll have no barometer; baro_task simply no-ops (no Fault), but you
-    lose altitude hold until replaced.
+  *  Baro was refunded — no barometer until replaced. baro_task no-ops (no
+     Fault), but altitude modes are arm-blocked by the baro health gate.
+  ** SPI1 MOSI = PA7 on the custom FC, PD7 on `nucleo` builds (PA7 is wired to
+     the Nucleo's on-board Ethernet PHY and unusable there).
 
 
 +------------------------------------------------------------------------------+
@@ -39,12 +44,14 @@
 +------------------------------------------------------------------------------+
 
   --- PORT A ---------------------------------------------------------------
+  PA0   GPIO in       RBF pin        remove-before-flight jumper to GND
+                                     (pull-up; inserted = LOW = arm denied)
   PA2   USART2_TX     RC / SBUS      UNUSED (driver names it _tx_pin)
   PA3   USART2_RX     RC / SBUS  <-- receiver SBUS signal  (invert_rx = true)
   PA4   GPIO out      IMU            ICM-42688-P  chip select (active-low)
   PA5   SPI1_SCK      IMU + Baro     shared SPI clock          (AF5)
   PA6   SPI1_MISO     IMU + Baro     shared, sensor -> MCU     (AF5)
-  PA7   SPI1_MOSI     IMU + Baro     shared, MCU -> sensor     (AF5)
+  PA7   SPI1_MOSI     IMU + Baro     custom FC only — `nucleo` builds use PD7
   PA8   GPIO out      Baro           MS5611       chip select (active-low)
   PA9   USART1_TX     GPS        --> GPS module RX             (AF7)
   PA10  USART1_RX     GPS        <-- GPS module TX             (AF7)
@@ -61,19 +68,26 @@
 
   --- PORT C ---------------------------------------------------------------
   PC0   ADC3_INPx     Battery        voltage-divider midpoint (analog)
+  PC2   GPIO in       Grip switch    jaw microswitch to GND (pull-up;
+                                     closed = weed held = LOW)
   PC11  UART4_RX      Flow       <-- MTF-02P TX                (AF8)
 
   --- PORT D ---------------------------------------------------------------
+  PD7   SPI1_MOSI     IMU + Baro     `nucleo` builds only      (AF5)
   PD12  TIM4_CH1      Servo S1       50 Hz PWM                 (AF2)
   PD13  TIM4_CH2      Servo S2       50 Hz PWM                 (AF2)
   PD14  TIM4_CH3      Servo S3       50 Hz PWM                 (AF2)
   PD15  TIM4_CH4      Servo S4       50 Hz PWM                 (AF2)
 
-  --- PORT G ---------------------------------------------------------------
-  PG7   GPIO out      Status LED     active-low (set HIGH = off)
+  --- PORT E ---------------------------------------------------------------
+  PE1   GPIO out      Status LED     `nucleo` builds: LD2, active-high
 
-  NOTE: led.rs header comment still says "PC7" but main.rs drives PG7. PG7 is
-        authoritative — fix the comment when convenient.
+  --- PORT F ---------------------------------------------------------------
+  PF3   ADC3_INPx     Current        ESC CUR pad (analog; see battery.rs
+                                     CUR_SENSE_FITTED before trusting)
+
+  --- PORT G ---------------------------------------------------------------
+  PG7   GPIO out      Status LED     custom FC: active-low (set HIGH = off)
 
 
 +------------------------------------------------------------------------------+
@@ -87,7 +101,7 @@
    VCC / 3V3           ->  3.3 V      power at 3.3 V (not 5 V)
    GND                 ->  GND
    SCL / SCLK / SCK    ->  PA5        SPI1 clock
-   SDA / SDI / MOSI    ->  PA7        MCU -> sensor
+   SDA / SDI / MOSI    ->  PA7 (FC) / PD7 (Nucleo)   MCU -> sensor
    SDO / ADO / MISO    ->  PA6        sensor -> MCU
    NCS / CS            ->  PA4        dedicated wire (do NOT tie to GND)
    INT / FSYNC         ->  (n/c)      polled at 500 Hz, no interrupt used
@@ -100,7 +114,7 @@
    VCC                 ->  3.3 V
    GND                 ->  GND
    SCLK / SCL          ->  PA5        shared SPI clock
-   SDI / MOSI          ->  PA7        shared MOSI
+   SDI / MOSI          ->  PA7 (FC) / PD7 (Nucleo)   shared MOSI
    SDO / MISO          ->  PA6        shared MISO
    CSB / CS            ->  PA8        baro-only chip select (active-low)
    PS  (protocol sel)  ->  GND        tie LOW to force SPI mode on GY-63
@@ -167,7 +181,7 @@
    Critical-voltage logic -> RTH/Land then disarm+Fault on the ground.
 
 ------------------------------------------------------------------------------
- MOTORS  —  DYS X2807 x4, via 4-in-1 ESC            BUS: TIM3 DSHOT600 (AF2)
+ MOTORS  —  DYS X2807 x4, via 4-in-1 ESC            BUS: TIM3 DSHOT300 (AF2)
 ------------------------------------------------------------------------------
    ESC signal pad      ->  MCU pin    Quad-X position
    M1                  ->  PB4        TIM3_CH1   front-right (X layout)
@@ -175,10 +189,9 @@
    M3                  ->  PB0        TIM3_CH3   front-left
    M4                  ->  PB1        TIM3_CH4   rear-right
    ESC GND             ->  GND        share ground with FC
-   Uses DMA1 stream 4 (reserved). Verify spin direction/order on the bench
-   with props OFF.
-   *** PRE-SPIN CHECK: confirm DMAMUX_TIM3_UP = 22 vs RM0468 Table 105. ***
-       (wrong value = DMA never fires = motors silent — a safe failure)
+   Uses DMA1 stream 4 (reserved). DMAMUX_TIM3_UP = 27 (verified, RM0468
+   Table 105). This ESC only parses DShot300 (despite listing DShot600).
+   Verify spin direction/order on the bench with props OFF.
 
 ------------------------------------------------------------------------------
  SERVOS / PAYLOAD  —  optional 4ch                  BUS: TIM4 50 Hz PWM (AF2)
@@ -202,9 +215,9 @@
    USART2    RC / SBUS           DMA1_CH5 (RX)
    USART3    Telemetry           DMA1_CH3 (TX), DMA1_CH1 (RX)
    UART4     Flow                DMA1_CH2 (RX)
-   TIM3      Motors (DSHOT)      DMA1 stream 4  (DMAMUX req 22 = TIM3_UP)
+   TIM3      Motors (DSHOT)      DMA1 stream 4  (DMAMUX req 27 = TIM3_UP)
    TIM4      Servos (PWM)        none (no DMA)
-   ADC3      Battery             none (blocking read)
+   ADC3      Battery + current   none (blocking read; PC0 + PF3)
    I2C1      Mag                 none (blocking)
    IWDG1     Watchdog            2.0 s timeout, petted by control_task
 
@@ -213,9 +226,12 @@
 
 ================================================================================
  OUTSTANDING BEFORE FIRST ARMED FLIGHT:
-   [ ] Compass (QMC5883L) calibration
+   [ ] Executor cadence verified steady with all tasks on (DSHOT dbg line)
+   [ ] IMU on SPI1 verified (WHO_AM_I 0x47; Nucleo: MOSI on PD7)
+   [ ] Compass (QMC5883L) calibration + mounting away from power wiring
    [ ] V_DIVIDER verified against a multimeter
-   [ ] DMAMUX_TIM3_UP confirmed (= 22) vs RM0468 Table 105
    [ ] Motor order + spin direction verified, props OFF
-   [ ] Decide MS5611 keep-vs-return (altitude hold depends on it)
+   [ ] Replacement barometer fitted (altitude modes are arm-blocked without it)
+   [ ] RBF header (PA0) fitted; grip switch (PC2) fitted for weed missions
+   [x] DMAMUX_TIM3_UP = 27 verified; DShot300 confirmed spinning motors
 ================================================================================

@@ -35,7 +35,11 @@ enum WeedPhase {
     Stabilize,
     /// Servo deployed — hold position and altitude for WEED_PULL_MS.
     Extract,
-    /// Servo gripping — climb back to cruise altitude with weed.
+    /// Grip check failed — jaw reopened; hold for GRIP_RELEASE_MS, then
+    /// re-stabilise and try the grab again (up to MAX_GRIP_ATTEMPTS).
+    GripRelease,
+    /// Climb back to cruise altitude (gripping weed, or empty after an abort —
+    /// see `grip_confirmed`).
     Ascend,
     /// At cruise altitude — fly to home (bin receptacle) position.
     Dispose,
@@ -69,6 +73,9 @@ const WEED_ARRIVE_M:      f32  = 1.5;         // horizontal arrival radius (GPS-
 const WEED_ALT_BAND_M:    f32  = 0.15;        // "at extraction altitude" tolerance
 const WEED_STABILIZE_MS:  u64  = 1_000;       // hover at extraction alt before actuating
 const WEED_PULL_MS:       u64  = 500;         // servo hold duration
+// Grip-confirmation (`--features grip-sense`, microswitch on PC2→GND, closed = held):
+const MAX_GRIP_ATTEMPTS:  u8   = 3;           // grab tries before aborting this weed
+const GRIP_RELEASE_MS:    u64  = 400;         // jaw-reopen dwell before a retry
 const WEED_ASCEND_NEAR_M: f32  = 1.0;         // within this of approach alt → ascent complete
 const BIN_DROP_ALT_M:     f32  = 0.5;         // AGL to descend to over bin before releasing
 
@@ -237,8 +244,12 @@ fn land_step(target: &mut f32, alt_pid: &mut AltPid, baro_alt: f32, flow: &FlowD
 
 // ── Embassy task ──────────────────────────────────────────────────────────────
 
+/// `grip_pin`: gripper-jaw microswitch (PC2 → GND, internal pull-up; closed = weed
+/// held = LOW). Only consulted when built with `--features grip-sense` — without the
+/// feature the Extract phase trusts the WEED_PULL_MS timer as before, so benches and
+/// airframes without the switch fly unchanged.
 #[embassy_executor::task]
-pub async fn navigation_task() {
+pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
     let mut mission = Mission::new();
 
     // Altitude PID — shared across AltHold, PosHold, Auto, RTH, Land.
@@ -262,6 +273,8 @@ pub async fn navigation_task() {
     let mut weed_phase:       Option<WeedPhase>    = None;
     let mut weed_approach_alt: f32                 = 0.0;
     let mut weed_phase_timer: Option<Instant>      = None;
+    let mut grip_attempts:    u8                   = 0;
+    let mut grip_confirmed:   bool                 = false;
     let mut prev_mode:        FlightMode           = FlightMode::Stabilise;
     let mut home_set:         bool                 = false;
     let mut last_gps_ok:      Instant              = Instant::now();
@@ -555,6 +568,8 @@ pub async fn navigation_task() {
                         weed_approach_alt = baro.altitude_m;
                         weed_phase        = Some(WeedPhase::Approach);
                         weed_phase_timer  = None;
+                        grip_attempts     = 0;
+                        grip_confirmed    = false;
                         info!("Weed sequence start — approach alt {=f32}m", weed_approach_alt);
                     }
 
@@ -600,28 +615,84 @@ pub async fn navigation_task() {
                                          yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
                             }
 
-                            // ── Phase 4: servo deployed, hold for pull duration ──
+                            // ── Phase 4: servo deployed, hold for pull duration,
+                            //    then confirm the grab actually caught something ──
                             WeedPhase::Extract => {
                                 let elapsed = weed_phase_timer
                                     .map_or(0, |t| t.elapsed().as_millis() as u64);
                                 if elapsed >= WEED_PULL_MS {
-                                    // Keep s1 = 1.0 — maintain grip while ascending.
-                                    weed_phase       = Some(WeedPhase::Ascend);
-                                    weed_phase_timer = None;
-                                    info!("Weed grabbed — ascending to {=f32}m with payload",
-                                          weed_approach_alt);
+                                    // Grip check: jaw microswitch closes to GND when
+                                    // something is held (LOW = held). Without the
+                                    // grip-sense feature, trust the timer (legacy
+                                    // open-loop behaviour — no switch fitted).
+                                    #[cfg(feature = "grip-sense")]
+                                    let held = grip_pin.is_low();
+                                    #[cfg(not(feature = "grip-sense"))]
+                                    let held = { let _ = &grip_pin; true };
+
+                                    if held {
+                                        // Keep s1 = 1.0 — maintain grip while ascending.
+                                        grip_confirmed   = true;
+                                        weed_phase       = Some(WeedPhase::Ascend);
+                                        weed_phase_timer = None;
+                                        info!("Weed grabbed — ascending to {=f32}m with payload",
+                                              weed_approach_alt);
+                                    } else {
+                                        grip_attempts = grip_attempts.saturating_add(1);
+                                        STATE.servo_outputs.lock().await.s1 = 0.0;
+                                        if grip_attempts < MAX_GRIP_ATTEMPTS {
+                                            weed_phase       = Some(WeedPhase::GripRelease);
+                                            weed_phase_timer = Some(Instant::now());
+                                            defmt::warn!("Grip check FAILED (attempt {}/{}) — reopening for retry",
+                                                  grip_attempts, MAX_GRIP_ATTEMPTS);
+                                        } else {
+                                            // Out of attempts: climb away empty; the
+                                            // Ascend branch aborts instead of flying
+                                            // to the bin (grip_confirmed = false).
+                                            grip_confirmed   = false;
+                                            weed_phase       = Some(WeedPhase::Ascend);
+                                            weed_phase_timer = None;
+                                            defmt::warn!("Grip FAILED {} times — aborting this weed, ascending empty",
+                                                  MAX_GRIP_ATTEMPTS);
+                                        }
+                                    }
                                 }
                                 guide_to(weed.position, pos, weed.extract_alt_m, agl,
                                          yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
                             }
 
-                            // ── Phase 5: climb to cruise alt, still gripping ─────
+                            // ── Phase 4b: jaw reopened after a failed grab — dwell,
+                            //    then re-stabilise and try again ──────────────────
+                            WeedPhase::GripRelease => {
+                                let elapsed = weed_phase_timer
+                                    .map_or(0, |t| t.elapsed().as_millis() as u64);
+                                if elapsed >= GRIP_RELEASE_MS {
+                                    weed_phase       = Some(WeedPhase::Stabilize);
+                                    weed_phase_timer = Some(Instant::now());
+                                    info!("Jaw reopened — re-stabilising for grab attempt {}",
+                                          grip_attempts + 1);
+                                }
+                                guide_to(weed.position, pos, weed.extract_alt_m, agl,
+                                         yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
+                            }
+
+                            // ── Phase 5: climb to cruise alt (gripping, or empty
+                            //    after an aborted grab) ────────────────────────────
                             WeedPhase::Ascend => {
                                 if agl > weed_approach_alt - WEED_ASCEND_NEAR_M {
                                     nav_pid_n.reset(); nav_pid_e.reset();
-                                    weed_phase       = Some(WeedPhase::Dispose);
-                                    weed_phase_timer = None;
-                                    info!("At cruise alt — flying home to drop weed");
+                                    if grip_confirmed {
+                                        weed_phase       = Some(WeedPhase::Dispose);
+                                        weed_phase_timer = None;
+                                        info!("At cruise alt — flying home to drop weed");
+                                    } else {
+                                        // Nothing in the jaw — skip the bin run,
+                                        // drop this target, resume the mission.
+                                        STATE.weed_target.lock().await.valid = false;
+                                        weed_phase       = None;
+                                        weed_phase_timer = None;
+                                        defmt::warn!("Ascended empty — weed target dropped, resuming mission");
+                                    }
                                 }
                                 guide_to(weed.position, pos, weed_approach_alt, agl,
                                          yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)

@@ -97,6 +97,10 @@ pub struct BatteryData {
     pub voltage_v: f32,
     pub pct:       u8,      // 0–100 %
     pub critical:  bool,    // true when per-cell V < 3.50 V for ≥ 2.5 s
+    /// Measured pack current from the ESC's CUR pad (A). Negative = sensor not
+    /// fitted/calibrated — consumers (telemetry) then fall back to the
+    /// throttle-based estimate.
+    pub current_a: f32,
 }
 
 impl Default for BatteryData {
@@ -104,7 +108,7 @@ impl Default for BatteryData {
         // Pessimistic defaults: GCS shows 0 V / critical until battery_task
         // confirms healthy voltage (~2.5 s after boot). Prevents the operator
         // from receiving a false "battery OK" before the first ADC reading.
-        Self { voltage_v: 0.0, pct: 0, critical: true }
+        Self { voltage_v: 0.0, pct: 0, critical: true, current_a: -1.0 }
     }
 }
 
@@ -313,7 +317,7 @@ impl SharedState {
             nav_command:   Mutex::new(NavCommand { autonomous: false, attitude_setpoint: AttitudeSetpoint { roll:0.0, pitch:0.0, yaw_rate:0.0, throttle:0.0 }, target: LatLonAlt { lat_deg:0.0, lon_deg:0.0, alt_m:0.0 } }),
             motor_outputs: Mutex::new(MotorOutputs { m1:0.0, m2:0.0, m3:0.0, m4:0.0 }),
             gps_fix:       Mutex::new(GpsFix { lat_deg:0.0, lon_deg:0.0, alt_m:0.0, vel_n_ms:0.0, vel_e_ms:0.0, vel_d_ms:0.0, hacc_m:9999.0, fix_ok:false, fix_type:0 }),
-            battery:       Mutex::new(BatteryData { voltage_v:0.0, pct:0, critical:true }),
+            battery:       Mutex::new(BatteryData { voltage_v:0.0, pct:0, critical:true, current_a:-1.0 }),
             armed:         Mutex::new(false),
             flow:          Mutex::new(FlowData { quality:0, vel_x_mrad_s:0, vel_y_mrad_s:0, height_mm:-1, valid:false }),
             servo_outputs: Mutex::new(ServoOutputs { s1:0.0, s2:0.0, s3:0.0, s4:0.0 }),

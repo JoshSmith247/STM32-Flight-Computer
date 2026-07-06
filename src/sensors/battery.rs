@@ -33,6 +33,16 @@ const V_DIVIDER:  f32 = 5.7;        // (R1 + R2) / R2
 const VREF:       f32 = 3.3;        // STM32 VDDA
 const ADC_FULL:   f32 = 4095.0;     // 12-bit resolution
 
+// ── ESC current sense (CUR pad → PF3 / ADC3) ────────────────────────────────
+// ⚠ Flip to `true` only after the CUR pad is wired AND CUR_A_PER_V is calibrated
+// against a known load (e.g. bench supply current limit or a clamp meter).
+// While false, current_a publishes -1.0 and telemetry falls back to its
+// throttle-based estimate — a floating PF3 would otherwise report garbage amps.
+const CUR_SENSE_FITTED: bool = false;
+// A per volt at the CUR pad. 40 A/V (25 mV/A) is a common BLHeli_S 4-in-1 scale
+// (Betaflight "scale 250") — a starting guess ONLY; calibrate before trusting.
+const CUR_A_PER_V: f32 = 40.0;
+
 const V_CELL_FULL:  f32 = 4.20;     // 100 %
 const V_CELL_EMPTY: f32 = 3.00;     //   0 %
 const V_CELL_CRIT:  f32 = 3.50;     //  ~5 % — triggers safe abort
@@ -51,6 +61,7 @@ fn voltage_to_pct(v_total: f32) -> u8 {
 pub async fn battery_task(
     adc_peri: Peri<'static, peripherals::ADC3>,
     mut vbat_pin: Peri<'static, peripherals::PC0>,
+    mut cur_pin:  Peri<'static, peripherals::PF3>,
 ) {
     let mut adc = Adc::new(adc_peri);
 
@@ -69,6 +80,15 @@ pub async fn battery_task(
         let pct    = voltage_to_pct(v_batt);
         let low    = v_batt / (CELL_COUNT as f32) < V_CELL_CRIT;
 
+        // ESC CUR pad: real pack current when fitted; -1.0 = unknown, telemetry
+        // then falls back to its throttle-based estimate.
+        let current_a = if CUR_SENSE_FITTED {
+            let raw_c = adc.blocking_read(&mut cur_pin, SampleTime::Cycles645) as f32;
+            (raw_c / ADC_FULL * VREF) * CUR_A_PER_V
+        } else {
+            -1.0
+        };
+
         // Asymmetric hysteresis: 3 consecutive low samples (~1.5 s) to go
         // critical; 10 consecutive good samples (~5 s) without any low sample
         // to clear it. Any bad reading resets the recovery counter.
@@ -81,7 +101,7 @@ pub async fn battery_task(
         }
         let critical = consec_crit >= 3;
 
-        *STATE.battery.lock().await = BatteryData { voltage_v: v_batt, pct, critical };
+        *STATE.battery.lock().await = BatteryData { voltage_v: v_batt, pct, critical, current_a };
 
         if critical {
             warn!("CRITICAL BATTERY {=f32} V  ({=u8} %)", v_batt, pct);

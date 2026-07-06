@@ -1,5 +1,31 @@
 # Pi Setup
 
+## Pi 4 migration (one-time, on first boot of the Pi 4)
+
+The Pi 4 4GB replaces the Zero 2 W as the dev/bench unit (the Zero 2 W stays as the
+flight fallback — same OS, same GPIO/UART, image and config are portable). Everything
+in this README applies to both boards. Pi-4-specific steps:
+
+1. **Rename the hostname before both Pis ever share a network** — they both ship as
+   `raspberrypi.local`, which collides and makes the SSH host-key dance confusing:
+   ```bash
+   sudo hostnamectl set-hostname pi4-dev && sudo reboot
+   ```
+   Then use `ssh jsmith@pi4-dev.local` wherever this doc says `raspberrypi.local`.
+2. **Put the shell on Ethernet** — the point of the upgrade. Plug the Pi 4's Ethernet
+   into the GL.iNet's LAN port (or directly into the laptop; auto-MDIX + Bonjour make
+   `pi4-dev.local` resolve over a direct cable). SSH over Ethernet no longer fights
+   the camera stream for WiFi airtime.
+3. **`LAPTOP_IP` must be on the video path's network** — with the laptop on two
+   interfaces (Ethernet to the Pi's shell + WiFi), `ipconfig getifaddr en0` may return
+   the wrong one. Set `LAPTOP_IP` in `.env` to the laptop's IP on whichever network
+   the UDP video/telemetry should ride.
+4. **Use the 5 V/3 A USB-C supply** on the bench — the Pi 4 browns out on supplies that
+   were fine for the Zero 2 W (`vcgencmd get_throttled` ≠ `0x0` = undervoltage).
+5. **Optional:** with the shell off WiFi, `CAM_BITRATE` in `.env` can go well above the
+   800k cap that protected the Zero 2 W's single radio — raise it once the link is
+   proven stable.
+
 ## Host key changed (after reflashing)
 
 After reflashing the SD card, the Pi generates new SSH keys. Clear the old ones on your Mac:

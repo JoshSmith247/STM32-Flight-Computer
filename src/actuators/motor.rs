@@ -1,11 +1,8 @@
-//! Motor output — DSHOT300 (default) via TIM3 burst DMA. DSHOT600 available via
-//! `--features dshot600` for ESCs that support it — the fitted HGLRC 60A V2 4-in-1
-//! BLHeli_S ESC's target MCU cannot parse DShot600 despite the "DShot600/300" listing
-//! on the box, confirmed by bench test 2026-07-02, so DShot300 is the working default.
+//! Motor output — DSHOT300 (default) via TIM3 burst DMA. `--features dshot600`
+//! doubles the bit rate for ESCs that support it — the fitted HGLRC 60A V2
+//! BLHeli_S ESC only parses DShot300, despite its listing claiming both.
 //!
-//! TIM3 runs at 200 MHz (APB1=100 MHz × 2) with PSC=1 → 100 MHz timer clock,
-//! ARR=332 → 333-tick period = 3.33 µs = 300 kHz (DSHOT300). `dshot600` keeps PSC=0
-//! for the full 200 MHz → 1.667 µs = 600 kHz bit rate; duty ratios are unchanged.
+//! TIM3: 200 MHz timer clock, PSC=1 → 100 MHz, ARR=332 → 3.33 µs/bit (300 kHz).
 //! DMA1 stream 4 writes 72 u16 values to TIM3_DMAR on each timer update event.
 //! Each update event distributes 4 CCR values (one per motor) via TIM3's burst DMA,
 //! advancing through 16 data bits + 2 reset slots = 18 timer periods per DSHOT frame.
@@ -59,17 +56,13 @@ const SPIN_ALL_ARM_SECS:  u64 = 5;    // continuous-zero arming window before ea
 #[cfg(feature = "spin-all")]
 const SPIN_ALL_ON_SECS:   u64 = 5;    // throttle burst length before returning to zeros
 #[cfg(feature = "spin-all")]
-const SPIN_ALL_THROTTLE:  f32 = 0.30; // props-off bench test: above BLHeli_S startup/low-RPM threshold (was 0.12)
+const SPIN_ALL_THROTTLE:  f32 = 0.30; // must exceed BLHeli_S startup/low-RPM threshold
 
-// TIM3_DMAR (the burst register the DMA writes to) is derived from the PAC at runtime in
-// dshot_init via `pac::TIM3.dmar()` — NOT hardcoded. A previous hardcoded 0x4000_404C was
-// wrong (TIM3 base is 0x4000_0400, so DMAR = 0x4000_044C): the DMA shipped every frame to the
-// wrong peripheral, TIM3's CCRs never updated, the pins free-ran a static PWM, and the stray
-// writes raised FEIF on every frame. Deriving it from the PAC makes that class of bug impossible.
+// The DMA's peripheral address is derived from `pac::TIM3.dmar()` in dshot_init —
+// never hardcode it: a wrong address silently ships every frame to a different
+// peripheral while the pins free-run whatever PWM was last latched.
 
-// DMAMUX1 request ID for TIM3_UP on STM32H723.
-// Verified = 27 (RM0468 Table 105 / embassy stm32h723zg DMA bindings:
-// `dma_trait_impl!(UpDma, TIM3, DMA1_CH4, 27u8)`). Was 22 — wrong, DMA never fired.
+// DMAMUX1 request ID for TIM3_UP (RM0468 Table 105; embassy: `dma_trait_impl!(UpDma, TIM3, DMA1_CH4, 27u8)`).
 const DMAMUX_TIM3_UP: u8 = 27;
 
 // ── DSHOT frame encoding ─────────────────────────────────────────────────────
@@ -211,11 +204,8 @@ unsafe fn dshot_init() {
         gp.afr(0).modify(|w| w.set_afr(pin, 2)); // AF2 = TIM3
     }
 
-    // Configure TIM3 for the DSHOT bit rate. Default = DShot300 (PSC=1, confirmed
-    // working on the fitted ESC 2026-07-02). `--features dshot600` selects PSC=0 for
-    // ESCs that support it — the same ARR/T1H/T0H tick values then yield 1.667 µs bits
-    // instead of 3.33 µs; duty ratios are identical across DShot speeds, so nothing
-    // else in the TX path changes.
+    // DSHOT bit rate: only the prescaler differs between 300 and 600 — duty
+    // ratios are speed-independent, so ARR/T1H/T0H are shared.
     let tim = pac::TIM3;
     #[cfg(not(feature = "dshot600"))]
     tim.psc().write(|w| *w = 1u16);              // prescaler = 1 → 100 MHz → 300 kbit/s
@@ -278,16 +268,12 @@ unsafe fn dshot_init() {
 
     s.par().write(|w| *w = pac::TIM3.dmar().as_ptr() as u32); // fixed peripheral address (from PAC)
 
-    // TIM_DMAR delivery: NO burst, HALFWORD transfers, DIRECT mode (no FIFO).
-    //  • No burst: TIM3 (DCR.DBL=3) does the CCR1..CCR4 fan-out itself by re-asserting the
-    //    request, so the DMA only needs plain single transfers.
-    //  • Halfword (16-bit): TIM3's DMAR is a 16-bit register (`Reg<DmarGp16>` in the PAC).
-    //    A previous "word/32-bit" attempt wrote 32-bit transfers into the 16-bit DMAR, which
-    //    corrupted the fan-out and raised FEIF on every frame.
-    //  • Direct mode: with single same-size transfers the FIFO buys nothing and is the source
-    //    of the FEIF — disabling it removes that failure mode entirely.
+    // TIM_DMAR delivery constraints: NO burst (TIM3's DCR.DBL=3 does the CCR1..CCR4
+    // fan-out itself by re-asserting the request), HALFWORD transfers (DMAR is a
+    // 16-bit register — 32-bit writes corrupt the fan-out), DIRECT mode (a FIFO buys
+    // nothing for single same-size transfers and only adds a FEIF failure mode).
     s.fcr().write(|w| {
-        w.set_dmdis(Dmdis::Enabled);        // direct mode — no FIFO, so no FIFO error possible
+        w.set_dmdis(Dmdis::Enabled); // direct mode — no FIFO
     });
 
     s.cr().write(|w| {
@@ -549,9 +535,8 @@ pub async fn motor_task(
         dshot_send();
     }
 
-    // ⚠ BENCH (`--features dshot-debug`): dump the TX-path config once. Placed AFTER the
-    // first dshot_send so M0AR is populated — dumping before it (as the first cut did)
-    // misreports m0ar=0/match=false. A dead bench can now be triaged from defmt alone.
+    // ⚠ BENCH (`--features dshot-debug`): dump the TX-path config once. Must run AFTER
+    // the first dshot_send — M0AR is unpopulated before it and misreports as a mismatch.
     #[cfg(feature = "dshot-debug")]
     unsafe { dshot_debug_dump() };
 
@@ -677,14 +662,11 @@ pub async fn motor_task(
             #[cfg(feature = "dshot-debug")]
             if !_sent { dbg.skipped += 1; }
 
-            // Keep the CPU awake until this frame has drained onto the wire, THEN yield.
-            // Root cause (proven by the dshot-debug timing probe): a full frame completes
-            // in ~30 µs when the core stays awake, but the executor sleeps (WFE) on the
-            // `ticker.next().await` below — on H7 that clock-gates the TIM3/DMA path, so a
-            // yield right after enabling the DMA strands the frame ~8 transfers in and it
-            // only dribbles forward when an IRQ briefly wakes the core. Spinning here (the
-            // frame is ~30 µs; ~1.5 % CPU at 500 Hz) guarantees a clean, fully-paced DSHOT
-            // frame every tick. Bounded so a genuinely stuck DMA can't wedge the executor.
+            // Keep the CPU awake until this frame drains onto the wire, THEN yield.
+            // On H7 the executor's WFE idle-sleep clock-gates the TIM3/DMA path, so
+            // yielding right after enabling the DMA strands the frame mid-transfer.
+            // ~30 µs spin (~1.5 % CPU at 500 Hz); bounded so a stuck DMA can't wedge
+            // the executor.
             let st = pac::DMA1.st(4);
             let mut guard = 0u32;
             while st.cr().read().en() && guard < 20_000 {

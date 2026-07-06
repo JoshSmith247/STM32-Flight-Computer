@@ -36,6 +36,10 @@ const BARO_SPIKE_M: f32 = 20.0;
 pub async fn health_task() {
     let mut ticker = Ticker::every(Duration::from_hz(RATE_HZ));
     let mut last_baro_alt: Option<f32> = None;
+    // Liveness latch: a dead/absent baro publishes a constant (0.0) that is finite
+    // and spike-free, so it would otherwise read as healthy. A real baro jitters by
+    // centimetres every sample — require at least one observed change since boot.
+    let mut baro_seen_change = false;
     let mut prev = SensorHealth::default();
 
     info!("Health monitor started ({=u64} Hz)", RATE_HZ);
@@ -54,9 +58,15 @@ pub async fn health_task() {
             && g.y.abs() < GYRO_SAT_RAD_S
             && g.z.abs() < GYRO_SAT_RAD_S;
 
-        // ── Baro: finite + no implausible single-tick spike ─────────────────────
+        // ── Baro: finite + no implausible single-tick spike + actually alive ────
         let alt = STATE.baro_data.lock().await.altitude_m;
+        if let Some(prev_alt) = last_baro_alt {
+            if alt.is_finite() && (alt - prev_alt).abs() > 0.001 {
+                baro_seen_change = true;
+            }
+        }
         let baro_ok = alt.is_finite()
+            && baro_seen_change
             && last_baro_alt.map_or(true, |prev_alt| (alt - prev_alt).abs() < BARO_SPIKE_M);
         if alt.is_finite() {
             last_baro_alt = Some(alt);
