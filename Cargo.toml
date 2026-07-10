@@ -75,6 +75,25 @@ grip-sense = []
 # applies as normal, including mid-flight link-loss motor cut. Bench and
 # low-hover use only — build without this feature once the radio is replaced.
 rc-optional = []
+# RANGE-ALT (no barometer fitted): the MTF-02P rangefinder substitutes as the
+# altitude source whenever the baro is unhealthy — satisfies the baro pre-arm
+# gate, feeds every altitude PID, and enforces a hard ceiling: all altitude
+# targets are clamped to RANGE_ALT_CEILING_M (3 m, inside the rangefinder's
+# 4 m trust range) incl. RTH cruise; TAKEOFF_ALT_M drops 2.0→1.2 m. Brief
+# rangefinder dropouts hold the last reading; a >1 s loss mid-flight forces
+# Land (or Stabilise if an RC link exists). A HEALTHY baro still wins when
+# present. Low-altitude (≤3 m) operations only.
+range-alt = []
+# ⚠ NO-BATT (no voltage divider wired): battery sensing DISABLED — battery_task
+# publishes "unknown but OK" so the arming gate and voltage failsafes stand
+# down. The ONLY pack protection is navigation's flight timer: exceeding
+# FLIGHT_TIME_LIMIT_S (180 s) of armed time forces RTH/Land (latched), and any
+# failsafe landing disarms + Faults at touchdown — re-arm requires a power
+# cycle (= pack swap, since the BEC feeds the FC). Tune the limit BELOW your
+# measured hover endurance: over-discharge permanently damages LiPos and makes
+# them a fire risk on recharge. Stopgap for low-hover ops, not a substitute
+# for real voltage sensing.
+no-batt = []
 # PID-tuning "blackbox": stream ~50 Hz setpoint/measured/gyro/output over RTT defmt for
 # capture + plotting during tuning (`cargo run --features tune-log`). Off by default.
 tune-log = []

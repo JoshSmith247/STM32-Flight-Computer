@@ -26,6 +26,11 @@ Usage:
     python3 motor_test.py -m 1                       # M1 @ default 0.08, autodetect port
     python3 motor_test.py -m 3 -t 0.10 -p /dev/tty.usbmodem1403
     python3 motor_test.py -m 2 -p /dev/serial0       # from the Pi
+    python3 motor_test.py --sequence                 # all 4 in order: motor ORDER + DIRECTION check
+    python3 motor_test.py --self-level               # ⚠ ARMS (props off): tilt frame, watch outputs
+
+--self-level needs a firmware built with rc-optional (no RC on the bench) and,
+with no battery divider wired, no-batt: `--features nucleo-vcp,rc-optional,no-batt`.
 """
 
 import argparse
@@ -35,9 +40,8 @@ import sys
 import threading
 import time
 
-# The flight-controller RX parser is MAVLink v2 ONLY (it syncs on 0xFD). pymavlink
-# can default to v1 (0xFE), which the FC silently ignores → no ACK. Force v2 here,
-# BEFORE importing pymavlink (the env var is read at import time).
+# The FC RX parser is MAVLink v2 ONLY; pymavlink can default to v1, which the FC
+# silently ignores. Force v2 BEFORE importing pymavlink (env var read at import).
 os.environ.setdefault('MAVLINK20', '1')
 
 try:
@@ -48,12 +52,138 @@ except ImportError:
 THROTTLE_MAX = 0.20   # matches the firmware clamp in telemetry.rs (cmd 209)
 HEARTBEAT_HZ = 4      # < the FC's 5 s Pi-loss watchdog timeout
 
+# Quad-X layout per the firmware mixer (pid.rs), viewed from above:
+# front M2(CCW) M1(CW), back M4(CW) M3(CCW).
+MOTOR_POSITIONS = {
+    1: ("FRONT-RIGHT", "CW"),
+    2: ("FRONT-LEFT",  "CCW"),
+    3: ("BACK-RIGHT",  "CCW"),
+    4: ("BACK-LEFT",   "CW"),
+}
+
 
 def autodetect_port() -> str | None:
     """Best-effort guess at the FC serial port for bench use (ST-LINK VCP)."""
     candidates = sorted(glob.glob('/dev/tty.usbmodem*')   # macOS
                         + glob.glob('/dev/ttyACM*'))       # Linux
     return candidates[0] if candidates else None
+
+
+def spin_and_ack(master, lock: threading.Lock, motor: int, throttle: float) -> bool:
+    """Send DO_MOTOR_TEST for one motor and wait for the ACK. True = accepted."""
+    with lock:
+        master.mav.command_long_send(
+            1, 1, mavutil.mavlink.MAV_CMD_DO_MOTOR_TEST, 0,
+            float(motor), float(throttle), 0, 0, 0, 0, 0)
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        msg = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=1.0)
+        if msg and msg.command == mavutil.mavlink.MAV_CMD_DO_MOTOR_TEST:
+            ok = msg.result == mavutil.mavlink.MAV_RESULT_ACCEPTED
+            if not ok:
+                name = mavutil.mavlink.enums['MAV_RESULT'][msg.result].name
+                print(f"  M{motor} REJECTED ({name}) — FC must be disarmed + Idle (not Fault)")
+            return ok
+    print(f"  M{motor}: no ACK — link/baud/FC-running?")
+    return False
+
+
+def run_sequence(master, lock: threading.Lock, throttle: float) -> None:
+    """Motor ORDER + DIRECTION check: spin M1..M4 one at a time, record a
+    per-motor verdict, and print a pass/fail scoreboard with exact fixes."""
+    print("\n⚠ PROPS OFF — motor order + direction check.")
+    print("Orient the frame so you know which corner is FRONT, viewed from above.")
+    print("Direction tip: a bit of tape on the motor bell makes the spin obvious.\n")
+    input("Props removed and frame secured? Press Enter to start… ")
+
+    results = {}
+    for m in (1, 2, 3, 4):
+        pos, rot = MOTOR_POSITIONS[m]
+        while True:
+            print(f"\n→ M{m}: expect the {pos} motor spinning {rot} (viewed from above), 2 s…")
+            if not spin_and_ack(master, lock, m, throttle):
+                results[m] = "no spin / rejected"
+                break
+            time.sleep(2.6)  # let the 2 s spin finish + margin
+            ans = input(f"  Verdict — [Enter]={pos} spun {rot} ✓   [c]=wrong corner   "
+                        f"[d]=right corner, wrong direction   [r]=repeat spin: ").strip().lower()
+            if ans == 'r':
+                continue
+            results[m] = {'': 'ok', 'y': 'ok',
+                          'c': 'WRONG CORNER',
+                          'd': 'WRONG DIRECTION'}.get(ans, f"unrecognised: {ans!r}")
+            break
+
+    print("\n── Scoreboard ──")
+    all_ok = True
+    for m in (1, 2, 3, 4):
+        pos, rot = MOTOR_POSITIONS[m]
+        res = results.get(m, '?')
+        ok = res == 'ok'
+        all_ok &= ok
+        print(f"  {'✓' if ok else '✗'}  M{m}  {pos:<11s} {rot:<3s} — {'verified' if ok else res}")
+    if all_ok:
+        print("\nALL FOUR VERIFIED — motor order AND direction are props-on ready.")
+    else:
+        print("\nFixes, then RE-RUN until all four verify:")
+        print("  WRONG CORNER     → update MOTOR_SLOT in src/actuators/motor.rs to match")
+        print("                     (or physically swap those ESC signal wires).")
+        print("  WRONG DIRECTION  → flip that motor in BLHeli configurator, or swap any")
+        print("                     two of its three phase wires at the ESC.")
+
+
+def run_self_level(master, lock: threading.Lock) -> None:
+    """⚠ ARMS the craft (motors at 4 % idle). Live motor outputs + attitude so
+    tilting the frame shows the control loop responding. Ctrl-C disarms."""
+    print("\n⚠⚠ SELF-LEVEL CHECK — this ARMS the flight controller.")
+    print("   All four motors will spin at the 4 % idle floor the moment it arms.")
+    if input("   Type PROPS OFF to confirm: ").strip().upper() != "PROPS OFF":
+        print("   Not confirmed — aborting.")
+        return
+
+    with lock:
+        master.mav.command_long_send(
+            1, 1, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
+            1, 0, 0, 0, 0, 0, 0)
+    deadline = time.time() + 3.0
+    armed = False
+    while time.time() < deadline:
+        msg = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=1.0)
+        if msg and msg.command == mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM:
+            armed = msg.result == mavutil.mavlink.MAV_RESULT_ACCEPTED
+            break
+    if not armed:
+        print("Arm REJECTED or no ACK. Checklist: firmware built with rc-optional")
+        print("(+ no-batt if no divider), IMU healthy, not Fault. See defmt/journal for the reason.")
+        return
+
+    print("ARMED — motors at idle. Tilt the frame and watch which outputs rise:")
+    print("  tilt RIGHT  → M1 + M3 rise      tilt NOSE-DOWN → M1 + M2 rise")
+    print("Ctrl-C to disarm.\n")
+    r2d = 57.2958
+    m = [0, 0, 0, 0]
+    roll = pitch = 0.0
+    try:
+        while True:
+            msg = master.recv_match(type=['SERVO_OUTPUT_RAW', 'ATTITUDE'],
+                                    blocking=True, timeout=1.0)
+            if msg is None:
+                continue
+            if msg.get_type() == 'ATTITUDE':
+                roll, pitch = msg.roll * r2d, msg.pitch * r2d
+            else:
+                m = [msg.servo1_raw, msg.servo2_raw, msg.servo3_raw, msg.servo4_raw]
+            print(f"\r  M1 {m[0]:4d}  M2 {m[1]:4d}  M3 {m[2]:4d}  M4 {m[3]:4d} µs"
+                  f"  |  roll {roll:+6.1f}°  pitch {pitch:+6.1f}°   ",
+                  end='', flush=True)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        with lock:
+            master.mav.command_long_send(
+                1, 1, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
+                0, 0, 0, 0, 0, 0, 0)
+        print("\nDisarm sent.")
 
 
 def heartbeat_loop(master, stop: threading.Event, lock: threading.Lock) -> None:
@@ -81,12 +211,19 @@ def main() -> None:
     ap.add_argument('--listen', action='store_true',
                     help="link diagnostic: receive + count frames FROM the FC for 6 s, "
                          "send nothing, then exit (no motor command)")
+    ap.add_argument('--sequence', action='store_true',
+                    help="⚠ PROPS OFF: spin M1..M4 one at a time with position/direction "
+                         "prompts — the motor ORDER + DIRECTION acceptance check")
+    ap.add_argument('--self-level', dest='self_level', action='store_true',
+                    help="⚠⚠ PROPS OFF, ARMS THE FC: motors at 4%% idle, live "
+                         "SERVO_OUTPUT_RAW + ATTITUDE readout while you tilt the frame; "
+                         "Ctrl-C disarms (needs rc-optional firmware)")
     args = ap.parse_args()
 
     if not 0.0 <= args.throttle <= THROTTLE_MAX:
         ap.error(f"throttle must be within 0.0..{THROTTLE_MAX} (firmware safety clamp)")
-    if not args.listen and args.motor is None:
-        ap.error("--motor is required (or use --listen for the link diagnostic)")
+    if not (args.listen or args.sequence or args.self_level) and args.motor is None:
+        ap.error("--motor is required (or use --listen / --sequence / --self-level)")
 
     port = args.port or autodetect_port()
     if not port:
@@ -97,8 +234,8 @@ def main() -> None:
     master = mavutil.mavlink_connection(port, baud=args.baud,
                                         source_system=10, source_component=1)
 
-    # Link diagnostic: just read frames coming FROM the FC. FC→host is whole-frame
-    # DMA, so a healthy count here while host→FC commands fail isolates the fault to
+    # Link diagnostic: just read frames coming FROM the FC. FC->host is whole-frame
+    # DMA, so a healthy count here while host->FC commands fail isolates the fault to
     # the FC's RX path (dropped bytes) rather than baud/link.
     if args.listen:
         print("Listening 6 s for frames from the FC (sending nothing)…")
@@ -120,6 +257,20 @@ def main() -> None:
                           name='heartbeat', daemon=True)
     hb.start()
     time.sleep(0.5)   # let a couple of heartbeats land before commanding
+
+    if args.sequence:
+        try:
+            run_sequence(master, send_lock, args.throttle)
+        finally:
+            stop.set()
+        return
+
+    if args.self_level:
+        try:
+            run_self_level(master, send_lock)
+        finally:
+            stop.set()
+        return
 
     print(f"⚠ PROPS OFF — spinning M{args.motor} @ {args.throttle:.2f} for 2 s")
     with send_lock:

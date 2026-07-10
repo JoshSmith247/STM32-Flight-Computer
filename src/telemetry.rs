@@ -1,9 +1,6 @@
-//! MAVLink v2 telemetry — USART3 full-duplex at 57600 baud.
-//!
-//! TX: 7 messages staggered across 10 Hz ticks (see reading/mavlink_design.md)
-//!     + MISSION_REQUEST_INT / MISSION_ACK for mission upload handshake
-//! RX: MAVLink v2 frame parser — HEARTBEAT watchdog, COMMAND_LONG dispatcher,
-//!     MISSION_COUNT + MISSION_ITEM_INT for MAVLink mission protocol
+//! MAVLink v2 telemetry - USART3 full-duplex at 57600 baud.
+//! TX: staggered periodic messages (see reading/mavlink_design.md); RX: frame
+//! parser with HEARTBEAT watchdog, COMMAND_LONG dispatch, mission protocol.
 
 use core::cell::Cell;
 
@@ -54,17 +51,17 @@ const MAV_RESULT_TEMPORARILY_REJECTED: u8 = 1;
 const MAV_RESULT_UNSUPPORTED:          u8 = 3;
 const MAV_MISSION_ACCEPTED:            u8 = 0;
 
-// Battery pack series-cell count — used only to derive a per-cell voltage for
+// Battery pack series-cell count - used only to derive a per-cell voltage for
 // the BATTERY_STATUS GCS display. Set to match the fitted pack.
 const BATT_CELLS: usize = 4;
 
-// Current / capacity estimation — tune for your motor and pack combination.
-// EST_MAX_CURRENT_A: estimated draw at 100 % throttle across all motors.
-// PACK_CAPACITY_MAH: nominal pack capacity used for time-remaining calculation.
+// Estimated draw at 100% throttle across all motors - tune to the fitted setup.
 const EST_MAX_CURRENT_A:  f32 = 20.0;
-const PACK_CAPACITY_MAH:  f32 = 1500.0;
+// Fitted pack (4S 4000 mAh, confirmed 2026-07-09). If flying mixed pack sizes,
+// set to the SMALLEST so time-remaining errs conservative.
+const PACK_CAPACITY_MAH:  f32 = 4000.0;
 
-// ── Frame builder ─────────────────────────────────────────────────────────────
+// Frame builder
 
 fn write_frame(buf: &mut [u8], seq: u8, msg_id: u32, payload: &[u8], crc_extra: u8) -> usize {
     let n = payload.len();
@@ -95,7 +92,7 @@ fn mavlink_crc(data: &[u8], extra: u8) -> u16 {
     crc
 }
 
-// ── Byte helpers ──────────────────────────────────────────────────────────────
+// Byte helpers
 
 fn f32_le(d: &[u8], off: usize) -> f32 {
     f32::from_le_bytes([d[off], d[off+1], d[off+2], d[off+3]])
@@ -107,7 +104,7 @@ fn i32_le(d: &[u8], off: usize) -> i32 {
     i32::from_le_bytes([d[off], d[off+1], d[off+2], d[off+3]])
 }
 
-// ── Euler conversion ──────────────────────────────────────────────────────────
+// Euler conversion
 
 fn quat_to_euler(q: crate::types::Quaternion) -> (f32, f32, f32) {
     let roll  = libm::atan2f(2.0*(q.w*q.x + q.y*q.z), 1.0 - 2.0*(q.x*q.x + q.y*q.y));
@@ -116,20 +113,18 @@ fn quat_to_euler(q: crate::types::Quaternion) -> (f32, f32, f32) {
     (roll, pitch, yaw)
 }
 
-// ── TX payload builders ───────────────────────────────────────────────────────
+// TX payload builders
 
-// custom_mode layout (autopilot-defined u32):
-//   bits  [7:0]  = FlightMode  (0=Stab … 5=Land)
-//   bits [15:8]  = FlightState (0=Idle … 5=Fault)
-//   bits [31:16] = payload_flags (bit 16 = servo bus, …)
+// custom_mode (autopilot-defined u32): bits [7:0]=FlightMode, [15:8]=FlightState,
+// [31:16]=payload_flags.
 fn build_heartbeat(flight_state: u8, mode: FlightMode, payload_flags: u32) -> [u8; 9] {
     let custom = (mode as u32)
         | ((flight_state as u32) << 8)
         | ((payload_flags & 0xFFFF) << 16);
     let mav_state = match flight_state {
-        3 | 4 => 4, // Flying / Landing → MAV_STATE_ACTIVE
-        5     => 5, // Fault            → MAV_STATE_CRITICAL
-        _     => 3, // Idle / Arming / Armed → MAV_STATE_STANDBY
+        3 | 4 => 4, // Flying / Landing -> MAV_STATE_ACTIVE
+        5     => 5, // Fault -> MAV_STATE_CRITICAL
+        _     => 3, // Idle / Arming / Armed -> MAV_STATE_STANDBY
     };
     let is_armed = matches!(flight_state, 2 | 3 | 4);
     [
@@ -142,9 +137,8 @@ fn build_heartbeat(flight_state: u8, mode: FlightMode, payload_flags: u32) -> [u
     ]
 }
 
-// SYS_STATUS #1 — 31 bytes: 3×u32, 9×u16/i16, 1×i8
-// health: MAV_SYS_STATUS_SENSOR bitmask of sensors that passed their runtime checks.
-//   gyro=0x01, accel=0x02, mag=0x04, baro=0x08, GPS=0x20
+// SYS_STATUS #1 - health: MAV_SYS_STATUS_SENSOR bitmask
+// (gyro=0x01, accel=0x02, mag=0x04, baro=0x08, GPS=0x20).
 fn build_sys_status(voltage_mv: u16, pct: u8, health: u32, current_ca: i16) -> [u8; 31] {
     let mut p = [0u8; 31];
     let present: u32 = 0x2F; // sensors fitted and enabled (constant)
@@ -157,7 +151,7 @@ fn build_sys_status(voltage_mv: u16, pct: u8, health: u32, current_ca: i16) -> [
     p
 }
 
-// GPS_RAW_INT #24 — 30 bytes: u64, 3×i32, 4×u16, 2×u8
+// GPS_RAW_INT #24 - 30 bytes: u64, 3xi32, 4xu16, 2xu8
 fn build_gps_raw(gps: &crate::types::GpsFix, time_ms: u32) -> [u8; 30] {
     let mut p = [0u8; 30];
     let time_us: u64 = (time_ms as u64) * 1000;
@@ -176,7 +170,7 @@ fn build_gps_raw(gps: &crate::types::GpsFix, time_ms: u32) -> [u8; 30] {
     p
 }
 
-// GLOBAL_POSITION_INT #33 — 28 bytes: u32, 3×i32, i32, 3×i16, u16
+// GLOBAL_POSITION_INT #33 - 28 bytes: u32, 3xi32, i32, 3xi16, u16
 fn build_global_position_int(
     time_ms: u32,
     gps: &crate::types::GpsFix,
@@ -198,7 +192,7 @@ fn build_global_position_int(
     p
 }
 
-// ATTITUDE #30 — 28 bytes (all f32)
+// ATTITUDE #30 - 28 bytes (all f32)
 fn build_attitude(
     time_ms: u32, roll: f32, pitch: f32, yaw: f32,
     rs: f32, ps: f32, ys: f32,
@@ -214,7 +208,7 @@ fn build_attitude(
     p
 }
 
-// SERVO_OUTPUT_RAW #36 — 21 bytes: u32, 8×u16, u8
+// SERVO_OUTPUT_RAW #36 - 21 bytes: u32, 8xu16, u8
 fn build_servo_output(time_ms: u32, motors: [f32; 4], servos: [f32; 4]) -> [u8; 21] {
     let mut p = [0u8; 21];
     p[0..4].copy_from_slice(&time_ms.to_le_bytes());
@@ -224,7 +218,7 @@ fn build_servo_output(time_ms: u32, motors: [f32; 4], servos: [f32; 4]) -> [u8; 
     p
 }
 
-// VFR_HUD #74 — 20 bytes: 4×f32, i16, u16
+// VFR_HUD #74 - 20 bytes: 4xf32, i16, u16
 fn build_vfr_hud(baro_alt: f32, gnd_spd: f32, yaw_rad: f32, throttle: f32, climb: f32) -> [u8; 20] {
     let mut p = [0u8; 20];
     p[0..4].copy_from_slice(&0.0f32.to_bits().to_le_bytes()); // airspeed (no sensor)
@@ -237,10 +231,8 @@ fn build_vfr_hud(baro_alt: f32, gnd_spd: f32, yaw_rad: f32, throttle: f32, climb
     p
 }
 
-// BATTERY_STATUS #147 — 40 bytes (36 standard + 4-byte time_remaining extension)
-// current_ca: instantaneous current in centiamperes (10 mA units)
-// mah_consumed: integrated charge drawn since boot in mAh
-// time_remaining_s: estimated seconds to empty at current draw (0 = unknown)
+// BATTERY_STATUS #147 - 36 standard bytes + 4-byte time_remaining extension.
+// current_ca is centiamperes; time_remaining_s 0 = unknown.
 fn build_battery_status(voltage_v: f32, pct: u8,
                         current_ca: i16, mah_consumed: i32,
                         time_remaining_s: i32) -> [u8; 40] {
@@ -258,7 +250,7 @@ fn build_battery_status(voltage_v: f32, pct: u8,
     p
 }
 
-// COMMAND_ACK #77 — 3 bytes (truncated; trailing extensions are zero)
+// COMMAND_ACK #77 - 3 bytes (truncated; trailing extensions are zero)
 fn build_command_ack(cmd: u16, result: u8) -> [u8; 3] {
     let mut p = [0u8; 3];
     p[0..2].copy_from_slice(&cmd.to_le_bytes());
@@ -266,9 +258,7 @@ fn build_command_ack(cmd: u16, result: u8) -> [u8; 3] {
     p
 }
 
-// SCALED_IMU #26 — 24 bytes: u32, 10×i16
-// xmag/ymag/zmag are in mgauss (QMC5883L 8 G range: 3000 LSB/gauss = 3 LSB/mgauss).
-// Sending raw ADC counts divided by 3 gives a good approximation for calibration purposes.
+// SCALED_IMU #26 - mag fields in mgauss (QMC5883L 8 G range: 3 LSB/mgauss).
 fn build_scaled_imu(
     time_ms: u32,
     imu: &crate::types::ImuData,
@@ -288,12 +278,12 @@ fn build_scaled_imu(
     p[16..18].copy_from_slice(&to_mgauss(mag.x).to_le_bytes());
     p[18..20].copy_from_slice(&to_mgauss(mag.y).to_le_bytes());
     p[20..22].copy_from_slice(&to_mgauss(mag.z).to_le_bytes());
-    // temperature field (cdegC) — unused extension, set to i16::MIN to signal invalid
+    // temperature field (cdegC) - unused extension, set to i16::MIN to signal invalid
     p[22..24].copy_from_slice(&i16::MIN.to_le_bytes());
     p
 }
 
-// MISSION_REQUEST_INT #51 — 4 bytes: seq(u16), target_sys(u8), target_comp(u8)
+// MISSION_REQUEST_INT #51 - 4 bytes: seq(u16), target_sys(u8), target_comp(u8)
 fn build_mission_request_int(seq: u16) -> [u8; 4] {
     let mut p = [0u8; 4];
     p[0..2].copy_from_slice(&seq.to_le_bytes());
@@ -302,14 +292,13 @@ fn build_mission_request_int(seq: u16) -> [u8; 4] {
     p
 }
 
-// MISSION_ACK #47 — 3 bytes: target_sys(u8), target_comp(u8), type(u8)
+// MISSION_ACK #47 - 3 bytes: target_sys(u8), target_comp(u8), type(u8)
 fn build_mission_ack(result: u8) -> [u8; 3] {
     [255, 0, result]
 }
 
-// STATUSTEXT #253 — severity(u8) + text[50]. Used (only under `dshot-debug`) to surface
-// the DSHOT TX-path counters to the GCS, so the bench is diagnosable over the Pi serial
-// link with no probe-rs/RTT attached. Trailing id/chunk_seq extensions left zero.
+// STATUSTEXT #253 - surfaces the DSHOT TX-path counters to the GCS so the bench
+// is diagnosable with no probe-rs/RTT attached (dshot-debug only).
 #[cfg(feature = "dshot-debug")]
 struct FixedBuf { buf: [u8; 50], len: usize }
 
@@ -342,16 +331,14 @@ fn build_statustext_dshot() -> [u8; 51] {
     p
 }
 
-// ── Command dispatcher ────────────────────────────────────────────────────────
+// Command dispatcher
 
 async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
     match cmd {
         400 => {
             if param1 >= 0.5 {
-                // Same pre-arm gates as the RC path, plus the RC arm switch
-                // must be ON — arming_task disarms within 20 ms if it's low.
-                // RC gates are waived while rc_gates_active() is false
-                // (`rc-optional` build with no SBUS link ever seen).
+                // Same pre-arm gates as the RC path, plus the RC arm switch must be ON.
+                // RC gates are waived while rc_gates_active() is false.
                 let rc = *STATE.rc_input.lock().await;
                 let rc_gates = crate::rc_gates_active();
                 if rc_gates && !rc.arm {
@@ -372,10 +359,8 @@ async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
                     MAV_RESULT_ACCEPTED
                 }
             } else {
-                // Reject in-air disarm unless the GCS supplies the MAVLink
-                // force magic (param2 == 21196). Stops a stray/duplicated
-                // COMMAND_LONG from cutting motors in flight, while still
-                // allowing a deliberate emergency kill.
+                // Reject in-air disarm unless the GCS supplies the force magic
+                // (param2 == 21196) - a stray COMMAND_LONG must not cut motors in flight.
                 let in_air = matches!(state::get(),
                     FlightState::Flying | FlightState::Landing);
                 if in_air && param2 != 21196.0 {
@@ -383,8 +368,7 @@ async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
                     MAV_RESULT_TEMPORARILY_REJECTED
                 } else {
                     *STATE.armed.lock().await = false;
-                    // A latched Fault stays latched (same rule as the RC disarm
-                    // path in arming_task) — recovery is owned by the fault source.
+                    // A latched Fault stays latched - recovery is owned by the fault source.
                     if state::get() != FlightState::Fault {
                         state::set(FlightState::Idle);
                     }
@@ -395,7 +379,7 @@ async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
         }
         183 => {
             let norm = (param2.clamp(1000.0, 2000.0) - 1000.0) / 1000.0;
-            // Mutate under one lock — a read/modify/write across two lock takes
+            // Mutate under one lock - a read/modify/write across two lock takes
             // can revert a concurrent navigation grip actuation.
             let mut s = STATE.servo_outputs.lock().await;
             match param1 as u8 {
@@ -406,11 +390,8 @@ async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
             MAV_RESULT_ACCEPTED
         }
         209 => {
-            // MAV_CMD_DO_MOTOR_TEST — bench bring-up only. ⚠ PROPS OFF.
-            //   param1 = motor index 1..4 (firmware M1..M4 per the pid.rs mixer)
-            //   param2 = throttle 0.0..1.0 (clamped to 0.20 here)
-            // Spins ONE motor for 2 s, then motor_task auto-stops it. Refused
-            // unless disarmed and on the ground, so it can never fire in flight.
+            // MAV_CMD_DO_MOTOR_TEST - bench bring-up only. WARNING: PROPS OFF. Spins ONE motor
+            // for 2 s; refused unless disarmed and Idle, so it can never fire in flight.
             let idx = param1 as u8;
             if !(1..=4).contains(&idx) {
                 return MAV_RESULT_UNSUPPORTED;
@@ -425,9 +406,8 @@ async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
             info!("MOTOR_TEST: M{} @ {} for 2 s", idx, throttle);
             MAV_RESULT_ACCEPTED
         }
-        // Mode commands write STATE.mode_override, NOT rc_input.mode (rc_task
-        // rewrites rc_input.mode from the switch every SBUS frame). The
-        // override holds until the pilot moves the mode switch.
+        // Mode commands write STATE.mode_override, NOT rc_input.mode (rc_task rewrites
+        // that every SBUS frame). The override holds until the pilot moves the switch.
         20  => {
             *STATE.mode_override.lock().await = Some(FlightMode::ReturnToHome);
             info!("MAVLink: mode override -> ReturnToHome");
@@ -439,7 +419,7 @@ async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
             MAV_RESULT_ACCEPTED
         }
         179 => {
-            // MAV_CMD_DO_SET_HOME — param1=1 means use current GPS position.
+            // MAV_CMD_DO_SET_HOME - param1=1 means use current GPS position.
             // param1=0 (explicit lat/lon) is not supported via this handler.
             if param1 >= 0.5 {
                 let gps = *STATE.gps_fix.lock().await;
@@ -457,7 +437,7 @@ async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
         }
         176 => {
             // param2 = FlightMode discriminant, same numbering HEARTBEAT
-            // custom_mode reports (0=Stab … 6=FollowMe).
+            // custom_mode reports (0=Stab ... 6=FollowMe).
             let mode = match param2 as u8 {
                 0 => FlightMode::Stabilise,    1 => FlightMode::AltitudeHold,
                 2 => FlightMode::PositionHold, 3 => FlightMode::Auto,
@@ -473,11 +453,10 @@ async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
     }
 }
 
-// ── Embassy task ──────────────────────────────────────────────────────────────
+// Embassy task
 
-// MAVLink USART3 pins. Default = Pi header (PB10/PB11). The `nucleo-vcp` feature
-// swaps to the Nucleo ST-Link VCP pins (PD8/PD9) for prop-off bench testing over
-// USB with no Pi attached — both are valid USART3 RX/TX alternate functions.
+// MAVLink USART3 pins: Pi header (PB10/PB11) by default; `nucleo-vcp` swaps to
+// the ST-Link VCP pins (PD8/PD9) for bench testing over USB.
 #[cfg(not(feature = "nucleo-vcp"))]
 type MavRxPin = peripherals::PB11;
 #[cfg(not(feature = "nucleo-vcp"))]
@@ -503,16 +482,16 @@ pub async fn telemetry_task(
     let (mut tx, rx) = uart.split();
 
     // Ring-buffered DMA RX: the DMA fills this buffer continuously so no inbound
-    // bytes are lost while the executor is busy. 512 B ≈ 89 ms of slack @ 57600.
+    // bytes are lost while the executor is busy. 512 B ~ 89 ms of slack @ 57600.
     let mut rx_ring = [0u8; 512];
     let mut rx = rx.into_ring_buffered(&mut rx_ring);
 
     info!("Telemetry: MAVLink v2 @ 57600 baud, 7-msg TX, mission protocol RX");
 
-    // Inter-loop shared state (single-core cooperative — Cell is sufficient)
+    // Inter-loop shared state (single-core cooperative - Cell is sufficient)
     let pi_ever_seen:        Cell<bool>              = Cell::new(false);
     let last_pi_hb:          Cell<Instant>           = Cell::new(Instant::now());
-    // True only while the current Fault was raised by the Pi watchdog below —
+    // True only while the current Fault was raised by the Pi watchdog below -
     // gates auto-recovery so IMU/battery faults stay latched.
     let pi_faulted:          Cell<bool>              = Cell::new(false);
     let pending_ack:         Cell<Option<(u16, u8)>> = Cell::new(None);
@@ -523,25 +502,25 @@ pub async fn telemetry_task(
     let pending_mission_req: Cell<Option<u16>>        = Cell::new(None);
     let pending_mission_ack: Cell<Option<u8>>         = Cell::new(None);
 
-    // ── TX loop ───────────────────────────────────────────────────────────────
+    // TX loop
     let tx_fut = async {
         let mut seq:     u8  = 0;
         let mut tick:    u8  = 0;
         let mut buf = [0u8; 64];
         let mut ticker = Ticker::every(Duration::from_hz(10));
 
-        // Throttle-integrated mAh estimate — accumulated at 10 Hz.
+        // Throttle-integrated mAh estimate - accumulated at 10 Hz.
         let est_mah: Cell<f32> = Cell::new(0.0);
 
         loop {
             ticker.next().await;
             let time_ms = Instant::now().as_millis() as u32;
 
-            // Pi heartbeat watchdog — triggers regardless of armed state so the
+            // Pi heartbeat watchdog - triggers regardless of armed state so the
             // operator cannot arm into a dead-Pi configuration.
             if pi_ever_seen.get() && last_pi_hb.get().elapsed() > PI_HEARTBEAT_TIMEOUT {
                 // Only raise (and tag) a Pi-loss Fault if nothing else has
-                // already faulted — an existing IMU/battery Fault must win.
+                // already faulted - an existing IMU/battery Fault must win.
                 if state::get() != FlightState::Fault {
                     warn!("Pi heartbeat lost — forcing Fault");
                     state::set(FlightState::Fault);
@@ -551,11 +530,8 @@ pub async fn telemetry_task(
                 && state::get() == FlightState::Fault
                 && !*STATE.armed.lock().await
             {
-                // Recover only from a Pi-loss Fault, and only once the link is
-                // back and the aircraft is safely disarmed on the ground, so the
-                // operator can re-arm without a power cycle. Faults raised by the
-                // IMU or battery tasks are left latched — those require operator
-                // intervention (hardware fix / pack swap), not a reconnect.
+                // Recover only from a Pi-loss Fault, and only disarmed on the ground.
+                // IMU/battery Faults stay latched - those need operator intervention.
                 info!("Pi link restored — Fault cleared");
                 state::set(FlightState::Idle);
                 pi_faulted.set(false);
@@ -564,12 +540,11 @@ pub async fn telemetry_task(
             let quat = *STATE.attitude.lock().await;
             let imu  = *STATE.imu_data.lock().await;
             let (roll, pitch, _yaw_nwu) = quat_to_euler(quat);
-            // MAVLink heading fields are NED — never the raw (NWU) Madgwick yaw.
+            // MAVLink heading fields are NED - never the raw (NWU) Madgwick yaw.
             let yaw = crate::ahrs::ned_yaw(&quat);
 
-            // Accumulate mAh: 10 Hz tick = 0.1 s = 0.1/3600 h. Prefer the measured
-            // pack current (ESC CUR pad, battery_task) when fitted (current_a >= 0);
-            // otherwise integrate the throttle-based estimate as before.
+            // Accumulate mAh at 10 Hz. Prefer measured pack current (current_a >= 0);
+            // otherwise integrate the throttle-based estimate.
             {
                 let measured = STATE.battery.lock().await.current_a;
                 let amps = if measured >= 0.0 {
@@ -580,7 +555,7 @@ pub async fn telemetry_task(
                 est_mah.set(est_mah.get() + amps * (100.0 / 3600.0));
             }
 
-            // Every tick — ATTITUDE #30 @ 10 Hz
+            // Every tick - ATTITUDE #30 @ 10 Hz
             {
                 let p = build_attitude(time_ms, roll, pitch, yaw,
                                        imu.gyro.x, imu.gyro.y, imu.gyro.z);
@@ -589,9 +564,8 @@ pub async fn telemetry_task(
                 seq = seq.wrapping_add(1);
             }
 
-            // Even ticks @ 5 Hz — VFR_HUD #74 + SERVO_OUTPUT_RAW #36 +
-            // GLOBAL_POSITION_INT #33 (5 Hz needed: the GCS computes weed/follow
-            // offsets against the drone's last reported position).
+            // Even ticks @ 5 Hz - VFR_HUD, SERVO_OUTPUT_RAW, GLOBAL_POSITION_INT
+            // (the GCS computes weed/follow offsets against the last reported position).
             if tick % 2 == 0 {
                 let baro   = *STATE.baro_data.lock().await;
                 let rc     = *STATE.rc_input.lock().await;
@@ -643,7 +617,7 @@ pub async fn telemetry_task(
                 2 => {
                     let bat = *STATE.battery.lock().await;
                     let gps = *STATE.gps_fix.lock().await;
-                    // Same health_task flags that gate arming — GCS lamps must
+                    // Same health_task flags that gate arming - GCS lamps must
                     // agree with what the firmware will actually arm.
                     let h = *STATE.sensor_health.lock().await;
                     let mut health: u32 = 0;
@@ -683,7 +657,7 @@ pub async fn telemetry_task(
                     // Remaining capacity from voltage-based pct; time = capacity / rate.
                     let remaining  = PACK_CAPACITY_MAH * bat.pct as f32 / 100.0;
                     let time_s     = if current_a > 0.5 {
-                        (remaining * 3.6 / current_a) as i32 // mAh × 3.6 / A = seconds
+                        (remaining * 3.6 / current_a) as i32 // mAh x 3.6 / A = seconds
                     } else { 0 };
                     let p = build_battery_status(bat.voltage_v, bat.pct,
                                                  current_ca, mah, time_s);
@@ -691,7 +665,7 @@ pub async fn telemetry_task(
                     tx.write(&buf[..n]).await.ok();
                     seq = seq.wrapping_add(1);
                 }
-                // #4: DSHOT TX-path counters → GCS as a 1 Hz STATUSTEXT (bench builds only).
+                // #4: DSHOT TX-path counters -> GCS as a 1 Hz STATUSTEXT (bench builds only).
                 #[cfg(feature = "dshot-debug")]
                 3 => {
                     let p = build_statustext_dshot();
@@ -733,7 +707,7 @@ pub async fn telemetry_task(
         }
     };
 
-    // ── RX loop ───────────────────────────────────────────────────────────────
+    // RX loop
     let rx_fut = async {
         let mut sm:      u8        = 0; // 0=SYNC 1=HDR 2=PAY 3=CRC 4=SIGN
         let mut hdr      = [0u8; 9];
@@ -773,9 +747,8 @@ pub async fn telemetry_task(
                     crc_idx += 1;
                     if crc_idx < 2 { continue; }
 
-                    // Signed frames (incompat flag 0x01) carry a 13-byte
-                    // signature after the CRC; consume it so the byte stream
-                    // stays frame-aligned instead of desyncing on the signature.
+                    // Signed frames (incompat flag 0x01) carry a 13-byte signature
+                    // after the CRC; consume it so the stream stays frame-aligned.
                     if hdr[1] & 0x01 != 0 { sm = 4; sig_idx = 0; } else { sm = 0; }
 
                     let pay_len = hdr[0] as usize;
@@ -812,15 +785,13 @@ pub async fn telemetry_task(
                         continue;
                     }
 
-                    // MAVLink v2 truncates trailing zero bytes of the payload;
-                    // zero-pad the remainder so the fixed-offset field reads
-                    // below see the real (zero) values rather than stale bytes
-                    // left over from a previous frame.
+                    // MAVLink v2 truncates trailing zero payload bytes; zero-pad so
+                    // fixed-offset reads don't see stale bytes from a previous frame.
                     for pad in &mut payload[pay_len..] { *pad = 0; }
 
                     match msg_id {
                         0 => {
-                            // HEARTBEAT — update Pi watchdog
+                            // HEARTBEAT - update Pi watchdog
                             if !pi_ever_seen.get() {
                                 info!("Pi connected (USART3)");
                                 pi_ever_seen.set(true);
@@ -829,10 +800,7 @@ pub async fn telemetry_task(
                         }
 
                         44 => {
-                            // MISSION_COUNT — begin upload handshake
-                            // Wire: count(u16 @ 0), target_sys(u8 @ 2), target_comp(u8 @ 3)
-                            // (payload is zero-padded above, so truncated trailing
-                            // fields read as zero rather than being dropped.)
+                            // MISSION_COUNT - begin upload handshake. Wire: count(u16 @ 0).
                             let count = u16_le(&payload, 0) as usize;
                             dl_count.set(count as u16);
                             dl_next.set(0);
@@ -854,18 +822,14 @@ pub async fn telemetry_task(
                         }
 
                         73 => {
-                            // MISSION_ITEM_INT — store waypoint, request next or finalize
-                            // Wire: 4×f32(0-15), x=i32(16), y=i32(20), z=f32(24),
-                            //       seq=u16(28), cmd=u16(30), target_sys(32),
-                            //       target_comp(33), frame(34), current(35), autocont(36)
+                            // MISSION_ITEM_INT - store waypoint, request next or finalize.
+                            // Wire: params 4xf32(0), x=i32(16), y=i32(20), z=f32(24), seq=u16(28), cmd=u16(30).
                             let wp_seq = u16_le(&payload, 28) as usize;
                             let command = u16_le(&payload, 30);
                             let hold_s = f32_le(&payload, 0).max(0.0); // param1 = hold time
 
-                            // Only NAV_WAYPOINT (16) creates a flight waypoint.
-                            // Store contiguously from index 0, ignoring seq gaps from
-                            // non-NAV items (TAKEOFF, RTL, etc.) so navigation always
-                            // starts at waypoints[0] and count reflects real WP count.
+                            // Only NAV_WAYPOINT (16) creates a flight waypoint; store
+                            // contiguously so seq gaps from non-NAV items are ignored.
                             if command == 16 {
                                 let wc = wp_count.get() as usize;
                                 if wc < MAX_WAYPOINTS {
@@ -886,7 +850,7 @@ pub async fn telemetry_task(
                             if next < dl_count.get() {
                                 pending_mission_req.set(Some(next));
                             } else {
-                                // All items received — mark ready
+                                // All items received - mark ready
                                 {
                                     let mut pm = navigation::PENDING_MISSION.lock().await;
                                     pm.count = wp_count.get() as usize;
@@ -908,14 +872,11 @@ pub async fn telemetry_task(
                         }
 
                         84 => {
-                            // SET_POSITION_TARGET_LOCAL_NED — weed pull target from Pi
-                            // MAVLink v2 wire layout (largest fields first):
-                            //   time_boot_ms(u32@0), x(f32@4), y(f32@8), z(f32@12),
-                            //   vx..yaw_rate(f32@16..44), type_mask(u16@48),
-                            //   target_sys(u8@50), target_comp(u8@51), frame(u8@52)
+                            // SET_POSITION_TARGET_LOCAL_NED - weed pull target from Pi.
+                            // Wire: time_boot_ms(u32@0), x(f32@4), y(f32@8), z(f32@12).
                             let ned_n = f32_le(&payload,  4); // North metres (x in NED)
-                            let ned_e = f32_le(&payload,  8); // East metres  (y in NED)
-                            let ned_d = f32_le(&payload, 12); // Down metres  (z in NED)
+                            let ned_e = f32_le(&payload,  8); // East metres (y in NED)
+                            let ned_d = f32_le(&payload, 12); // Down metres (z in NED)
 
                             // Reject NaN/Inf and physically implausible offsets.
                             // 50 m covers any realistic weed-target radius from the drone.
@@ -938,9 +899,8 @@ pub async fn telemetry_task(
                                 let target_lon = gps.lon_deg
                                     + (ned_e as f64) / (111_320.0 * libm::cosf(lat_rad) as f64);
                                 let target_alt = gps.alt_m - ned_d;
-                                // Extraction altitude in baro AGL: current AGL minus the
-                                // requested downward offset. Clamped to 0.1 m so the drone
-                                // can never be commanded into the ground by a bad ned_d.
+                                // Extraction altitude in baro AGL, clamped to 0.1 m so a bad
+                                // ned_d can never command the drone into the ground.
                                 let extract_alt_m = (baro.altitude_m - ned_d).max(0.1);
                                 let mut wt = STATE.weed_target.lock().await;
                                 wt.position = LatLonAlt {

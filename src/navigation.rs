@@ -1,14 +1,5 @@
-//! Autonomous navigation — flight mode logic and waypoint sequencer.
-//!
-//! Runs at 100 Hz. Writes attitude setpoints to STATE.nav_command.
-//!
-//! Modes:
-//!   Stabilise    — RC direct control (nav_command.autonomous = false)
-//!   AltitudeHold — baro altitude lock; RC roll/pitch/yaw pass-through
-//!   PositionHold — GPS + baro lock; RC yaw pass-through
-//!   Auto         — fly a MAVLink mission loaded via PENDING_MISSION
-//!   ReturnToHome — fly to home at safe altitude, then descend
-//!   Land         — rate-controlled descent; rangefinder-assisted touch-down
+//! Autonomous navigation - flight mode logic and waypoint sequencer.
+//! Runs at 100 Hz; writes attitude setpoints to STATE.nav_command.
 
 use defmt::{info, warn};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
@@ -22,7 +13,7 @@ use crate::{
     STATE,
 };
 
-// ── Weed extraction phases ────────────────────────────────────────────────────
+// Weed extraction phases
 
 /// Seven-phase sequence executed each time a weed target is received in Auto mode.
 #[derive(Clone, Copy, PartialEq)]
@@ -33,40 +24,49 @@ enum WeedPhase {
     Descend,
     /// Hold at extraction altitude for WEED_STABILIZE_MS before actuating.
     Stabilize,
-    /// Servo deployed — hold position and altitude for WEED_PULL_MS.
+    /// Servo deployed - hold position and altitude for WEED_PULL_MS.
     Extract,
-    /// Grip check failed — jaw reopened; hold for GRIP_RELEASE_MS, then
-    /// re-stabilise and try the grab again (up to MAX_GRIP_ATTEMPTS).
+    /// Grip check failed - jaw reopened; dwell, then retry (up to MAX_GRIP_ATTEMPTS).
     GripRelease,
-    /// Climb back to cruise altitude (gripping weed, or empty after an abort —
-    /// see `grip_confirmed`).
+    /// Climb back to cruise altitude (gripping weed, or empty after an abort).
     Ascend,
-    /// At cruise altitude — fly to home (bin receptacle) position.
+    /// At cruise altitude - fly to home (bin receptacle) position.
     Dispose,
-    /// Over the bin — descend to BIN_DROP_ALT_M and release.
+    /// Over the bin - descend to BIN_DROP_ALT_M and release.
     DisposeDescend,
 }
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+// Constants
 
 pub const MAX_WAYPOINTS: usize = 32;
 
 const WAYPOINT_RADIUS_M: f32 = 2.0;
+#[cfg(not(feature = "range-alt"))]
 const TAKEOFF_ALT_M:     f32 = 2.0;          // auto-takeoff climb height (baro, AGL)
+#[cfg(feature = "range-alt")]
+const TAKEOFF_ALT_M:     f32 = 1.2;          // low-hover ops: stay well inside rangefinder range
+/// range-alt: hard ceiling on every commanded altitude target - the MTF-02P
+/// rangefinder is only trusted to ~4 m (FLOW_MAX_HEIGHT_MM); 3 m leaves margin.
+#[cfg(feature = "range-alt")]
+const RANGE_ALT_CEILING_M: f32 = 3.0;
+/// no-batt: armed-time limit standing in for battery sensing. MUST be tuned
+/// BELOW measured hover endurance - start conservative, measure, adjust.
+#[cfg(feature = "no-batt")]
+const FLIGHT_TIME_LIMIT_S: u64 = 180;
 const TAKEOFF_BAND_M:    f32 = 0.3;          // "reached takeoff altitude" tolerance
 const GEOFENCE_MAX_ALT_M:    f32 = 120.0;    // altitude ceiling, AGL (~400 ft)
 const GEOFENCE_MAX_RADIUS_M: f32 = 300.0;    // max horizontal distance from home
 const LAND_DESCENT_MPS:  f32 = 0.5;          // m/s target descent rate
 // Low-battery RTH threshold. Must sit ABOVE battery.rs V_CELL_CRIT's pct
-// equivalent (3.30 V ≈ 25 %) or this stage can never fire before critical.
+// equivalent (3.30 V ~ 25 %) or this stage can never fire before critical.
 const BATT_LOW_PCT:      u8  = 30;
 const CRUISE_SPEED_MPS:  f32 = 5.0;          // nominal cruise (sets error cap)
-const NAV_ERR_CAP_M:     f32 = CRUISE_SPEED_MPS * 4.0; // 20 m — clamps PID input on long legs
-const MAX_TILT_RAD:      f32 = 0.436;         // 25°
+const NAV_ERR_CAP_M:     f32 = CRUISE_SPEED_MPS * 4.0; // 20 m - clamps PID input on long legs
+const MAX_TILT_RAD:      f32 = 0.436;         // 25 deg
 const RTH_MIN_ALT_M:     f32 = 15.0;         // RTH cruise altitude floor
-const HOME_ARRIVE_M:     f32 = 5.0;          // switch RTH → descend within this radius
+const HOME_ARRIVE_M:     f32 = 5.0;          // switch RTH -> descend within this radius
 const YAW_TRACK_KP:      f32 = 0.8;          // rad/s per rad heading error
-const FLOW_DAMP_KP:       f32 = 0.3;          // rad/(m/s) — velocity damping gain in PositionHold
+const FLOW_DAMP_KP:       f32 = 0.3;          // rad/(m/s) - velocity damping gain in PositionHold
 const FLOW_MAX_HEIGHT_MM: i32 = 5_000;        // MTF-02P reliable range ceiling (5 m)
 const DT:                 f32 = 1.0 / 100.0;
 
@@ -75,13 +75,13 @@ const WEED_ARRIVE_M:      f32  = 1.5;         // horizontal arrival radius (GPS-
 const WEED_ALT_BAND_M:    f32  = 0.15;        // "at extraction altitude" tolerance
 const WEED_STABILIZE_MS:  u64  = 1_000;       // hover at extraction alt before actuating
 const WEED_PULL_MS:       u64  = 500;         // servo hold duration
-// Grip-confirmation (`--features grip-sense`, microswitch on PC2→GND, closed = held):
+// Grip-confirmation (`--features grip-sense`, microswitch on PC2->GND, closed = held):
 const MAX_GRIP_ATTEMPTS:  u8   = 3;           // grab tries before aborting this weed
 const GRIP_RELEASE_MS:    u64  = 400;         // jaw-reopen dwell before a retry
-const WEED_ASCEND_NEAR_M: f32  = 1.0;         // within this of approach alt → ascent complete
+const WEED_ASCEND_NEAR_M: f32  = 1.0;         // within this of approach alt -> ascent complete
 const BIN_DROP_ALT_M:     f32  = 0.5;         // AGL to descend to over bin before releasing
 
-// ── Public types ──────────────────────────────────────────────────────────────
+// Public types
 
 #[derive(Clone, Copy, Default)]
 pub struct Waypoint {
@@ -113,7 +113,7 @@ impl MissionUpload {
 pub static PENDING_MISSION: Mutex<CriticalSectionRawMutex, MissionUpload> =
     Mutex::new(MissionUpload::new());
 
-// ── Internal mission sequencer ────────────────────────────────────────────────
+// Internal mission sequencer
 
 struct Mission {
     waypoints: [Waypoint; MAX_WAYPOINTS],
@@ -150,7 +150,7 @@ impl Mission {
     fn is_complete(&self) -> bool { self.current >= self.count }
 }
 
-// ── Geo helpers ───────────────────────────────────────────────────────────────
+// Geo helpers
 
 pub fn haversine_m(a: LatLonAlt, b: LatLonAlt) -> f32 {
     const R: f32 = 6_371_000.0;
@@ -170,7 +170,17 @@ fn wrap_pi(a: f32) -> f32 {
     if a > PI { a - TAU } else if a < -PI { a + TAU } else { a }
 }
 
-// ── Guidance ──────────────────────────────────────────────────────────────────
+/// Clamp an altitude target to the rangefinder ceiling under `range-alt`;
+/// identity without the feature.
+#[inline]
+fn cap_alt(alt: f32) -> f32 {
+    #[cfg(feature = "range-alt")]
+    return alt.min(RANGE_ALT_CEILING_M);
+    #[cfg(not(feature = "range-alt"))]
+    alt
+}
+
+// Guidance
 
 /// Fly toward `target` using NED position PIDs + altitude PID.
 /// Yaws toward the target bearing when more than 3 m away.
@@ -184,6 +194,9 @@ fn guide_to(
     pid_e:       &mut PosPid,
     alt_pid:     &mut AltPid,
 ) -> NavCommand {
+    // range-alt ceiling on every commanded altitude (no-op without the feature) -
+    // covers mission waypoint altitudes, RTH cruise, and weed approach in one place.
+    let target_alt = cap_alt(target_alt);
     let lat_rad = (pos.lat_deg as f32).to_radians();
     let raw_n = ((target.lat_deg - pos.lat_deg) * 111_320.0) as f32;
     let raw_e = ((target.lon_deg - pos.lon_deg) * 111_320.0
@@ -196,7 +209,7 @@ fn guide_to(
     let right_m = -err_n * sinf(yaw) + err_e * cosf(yaw);
 
     let dist     = sqrtf(raw_n * raw_n + raw_e * raw_e);
-    let bearing  = atan2f(raw_e, raw_n); // NED: 0=North, +90°=East
+    let bearing  = atan2f(raw_e, raw_n); // NED: 0=North, +90 deg=East
     let yaw_rate = if dist > 3.0 {
         (YAW_TRACK_KP * wrap_pi(bearing - yaw)).clamp(-1.0, 1.0)
     } else {
@@ -215,11 +228,8 @@ fn guide_to(
     }
 }
 
-/// Controlled descent: ramps a target altitude down at LAND_DESCENT_MPS,
-/// held by the shared alt PID. Touch-down (throttle cut, LATCHED) on either:
-///   • AGL < 0.15 m (rangefinder when in range, else baro), or
-///   • target pinned at 0 for TARGET_ZERO_GRACE — the descent profile has
-///     fully played out, so we're down even if the altitude reading disagrees.
+/// Controlled descent at LAND_DESCENT_MPS. Touch-down (throttle cut, LATCHED)
+/// on AGL < 0.15 m, or target pinned at 0 for TARGET_ZERO_GRACE.
 struct Lander {
     target:     f32,
     zero_since: Option<Instant>,
@@ -265,17 +275,15 @@ impl Lander {
     }
 }
 
-// ── Embassy task ──────────────────────────────────────────────────────────────
+// Embassy task
 
-/// `grip_pin`: gripper-jaw microswitch (PC2 → GND, internal pull-up; closed = weed
-/// held = LOW). Only consulted when built with `--features grip-sense` — without the
-/// feature the Extract phase trusts the WEED_PULL_MS timer as before, so benches and
-/// airframes without the switch fly unchanged.
+/// `grip_pin`: gripper-jaw microswitch (PC2 -> GND, pull-up; LOW = held).
+/// Only consulted under `grip-sense`; without it the Extract phase trusts the timer.
 #[embassy_executor::task]
 pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
     let mut mission = Mission::new();
 
-    // Altitude PID — shared across AltHold, PosHold, Auto, RTH, Land.
+    // Altitude PID - shared across AltHold, PosHold, Auto, RTH, Land.
     // Reset on every mode change so the I-term doesn't carry stale state.
     let mut alt_pid   = AltPid::new();
 
@@ -307,18 +315,24 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
     let mut prev_mode:        FlightMode           = FlightMode::Stabilise;
     let mut home_set:         bool                 = false;
     let mut last_gps_ok:      Instant              = Instant::now();
-    // Latched failsafe response (geofence / battery). Held until disarm — a
-    // breach that "recovers" must not bounce the craft back onto the mission
-    // at the fence line, and load-sagging battery pct must not toggle RTH.
+    // Latched failsafe response (geofence / battery), held until disarm so a
+    // recovering breach or load-sagging battery pct can't toggle modes.
     let mut failsafe_forced:  Option<FlightMode>   = None;
-    // Altitude latched at GPS loss so Auto/FollowMe hold height (not sticks-
-    // at-zero manual) during the window before the >5 s AltitudeHold demotion.
+    // Altitude latched at GPS loss so Auto/FollowMe hold height until the AltitudeHold demotion.
     let mut gps_loss_alt:     Option<f32>          = None;
+    // range-alt: last good rangefinder reading, held across brief dropouts.
+    #[cfg(feature = "range-alt")]
+    let mut range_last:       Option<(f32, Instant)> = None;
+    // no-batt: armed-time tracking for the flight-timer failsafe.
+    #[cfg(feature = "no-batt")]
+    let mut armed_since:      Option<Instant>        = None;
     let mut prev_armed:       bool                 = false;
     let mut takeoff_done:     bool                 = false;
     let mut takeoff_target_alt: f32               = 0.0;
 
     info!("Navigation task started (100 Hz)");
+    #[cfg(feature = "range-alt")]
+    defmt::warn!("range-alt build: rangefinder substitutes for a dead baro — altitude targets capped at {} m", RANGE_ALT_CEILING_M);
     let mut ticker = Ticker::every(Duration::from_hz(100));
 
     loop {
@@ -343,17 +357,50 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
         // NED heading (0 = N, CW positive); never use raw Madgwick yaw in NED math.
         let yaw = crate::ahrs::ned_yaw(&attitude);
 
-        // Auto-takeoff bookkeeping: on the disarmed→armed edge, capture the takeoff
+        // Effective altitude: baro normally; under `range-alt` the rangefinder
+        // substitutes while the baro is unhealthy (>1 s loss clears alt_source_ok).
+        #[cfg(feature = "range-alt")]
+        let (alt_now, alt_source_ok) = {
+            let range_agl = if flow.usable() && flow.height_mm > 0
+                && flow.height_mm <= FLOW_MAX_HEIGHT_MM
+            {
+                Some(flow.height_mm as f32 / 1000.0)
+            } else {
+                None
+            };
+            if health.baro_ok {
+                (baro.altitude_m, true)
+            } else if let Some(h) = range_agl {
+                range_last = Some((h, Instant::now()));
+                (h, true)
+            } else if let Some((h, t)) = range_last {
+                (h, t.elapsed() < Duration::from_secs(1))
+            } else {
+                (baro.altitude_m, false)
+            }
+        };
+        #[cfg(not(feature = "range-alt"))]
+        let (alt_now, alt_source_ok) = (baro.altitude_m, health.baro_ok);
+
+        // Auto-takeoff bookkeeping: on the disarmed->armed edge, capture the takeoff
         // target (current baro + climb height) and require a fresh climb next mission.
         if is_armed && !prev_armed {
-            takeoff_target_alt = baro.altitude_m + TAKEOFF_ALT_M;
+            takeoff_target_alt = cap_alt(alt_now + TAKEOFF_ALT_M);
             takeoff_done = false;
+            #[cfg(feature = "no-batt")]
+            {
+                armed_since = Some(Instant::now());
+            }
         }
         prev_armed = is_armed;
 
         if !is_armed {
             STATE.nav_command.lock().await.autonomous = false;
             failsafe_forced = None; // latched failsafe responses end at disarm
+            #[cfg(feature = "no-batt")]
+            {
+                armed_since = None;
+            }
             continue;
         }
 
@@ -364,8 +411,7 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
             info!("Home set: lat={=f64} lon={=f64}", gps.lat_deg, gps.lon_deg);
         }
 
-        // Apply a DO_SET_HOME override from the GCS (MAV_CMD_DO_SET_HOME / cmd 179).
-        // Overwrites the auto-captured home, allowing the operator to reset RTH origin mid-flight.
+        // DO_SET_HOME override from the GCS - operator can reset RTH origin mid-flight.
         if let Some(new_home) = STATE.home_override.lock().await.take() {
             mission.home = new_home;
             home_set = true;
@@ -377,7 +423,7 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
             let agl = if flow.usable() && flow.height_mm > 0 && flow.height_mm <= FLOW_MAX_HEIGHT_MM {
                 flow.height_mm as f32 / 1000.0
             } else {
-                baro.altitude_m
+                alt_now
             };
             if agl < 0.15 {
                 *STATE.armed.lock().await = false;
@@ -385,17 +431,22 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
             }
         }
 
-        // Failsafe triggers (geofence / battery) LATCH their response until
-        // disarm — re-evaluated per tick they oscillate at the fence line and
-        // on load-sagging battery pct. Skipped while the pilot is already
-        // flying a recovery mode (Land / RTH).
+        // Failsafe triggers LATCH their response until disarm (per-tick re-evaluation
+        // oscillates at the fence line). Skipped while already in Land/RTH.
         if failsafe_forced.is_none()
             && !matches!(mode, FlightMode::Land | FlightMode::ReturnToHome)
         {
-            // (reason, set Landing state?) — low battery is a routine RTH, not a
+            // no-batt: armed-time limit is the stand-in for battery sensing.
+            #[cfg(feature = "no-batt")]
+            let timer_expired = armed_since
+                .map_or(false, |t| t.elapsed() >= Duration::from_secs(FLIGHT_TIME_LIMIT_S));
+            #[cfg(not(feature = "no-batt"))]
+            let timer_expired = false;
+
+            // (reason, set Landing state?) - low battery is a routine RTH, not a
             // landing-in-progress, so it leaves the flight state alone.
             let trigger = if home_set
-                && (baro.altitude_m > GEOFENCE_MAX_ALT_M
+                && (alt_now > GEOFENCE_MAX_ALT_M
                     || (gps_ok && haversine_m(pos, mission.home) > GEOFENCE_MAX_RADIUS_M))
             {
                 Some(("Geofence breach", true))
@@ -403,6 +454,8 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
                 Some(("Critical battery", true))
             } else if battery.voltage_v > 0.0 && battery.pct < BATT_LOW_PCT {
                 Some(("Low battery", false))
+            } else if timer_expired {
+                Some(("Flight time limit", true))
             } else {
                 None
             };
@@ -426,24 +479,29 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
             None => mode,
         };
 
-        // Resolve effective mode: Fault → Land; sensor-loss demotions apply
-        // only to pilot modes — a latched RTH/Land handles its own GPS loss
-        // (RTH without a usable fix descends via the Lander).
+        // Resolve effective mode: Fault -> Land; sensor-loss demotions apply only
+        // to pilot modes (a latched RTH/Land handles its own GPS loss).
         let effective_mode = if state::get() == state::FlightState::Fault {
             FlightMode::Land
         } else if failsafe_forced.is_some() {
             base_mode
-        } else if !health.baro_ok
+        } else if !alt_source_ok
             && matches!(base_mode, FlightMode::AltitudeHold | FlightMode::PositionHold
                              | FlightMode::Auto | FlightMode::FollowMe)
         {
-            // Dead baro mid-flight: every altitude PID would hold a frozen
-            // reading at constant throttle — hand the sticks back to the pilot.
-            // (Checked before the GPS-loss demotion, which lands on AltHold.)
-            if prev_mode != FlightMode::Stabilise {
-                warn!("Baro unhealthy — forcing Stabilise (manual throttle)");
+            // Altitude source dead mid-flight: hand back manual throttle if a pilot
+            // is on the sticks; with no RC link force Land (Stabilise = zero throttle).
+            if crate::rc_gates_active() {
+                if prev_mode != FlightMode::Stabilise {
+                    warn!("Altitude source lost — forcing Stabilise (manual throttle)");
+                }
+                FlightMode::Stabilise
+            } else {
+                if prev_mode != FlightMode::Land {
+                    warn!("Altitude source lost, no RC — forcing Land");
+                }
+                FlightMode::Land
             }
-            FlightMode::Stabilise
         } else if last_gps_ok.elapsed() > Duration::from_secs(5)
             && matches!(base_mode, FlightMode::PositionHold | FlightMode::Auto
                              | FlightMode::ReturnToHome | FlightMode::FollowMe)
@@ -456,7 +514,7 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
             base_mode
         };
 
-        // Mode-entry initialisation — runs on the first tick of each new mode
+        // Mode-entry initialisation - runs on the first tick of each new mode
         if effective_mode != prev_mode {
             alt_pid.reset();
             nav_pid_n.reset(); nav_pid_e.reset();
@@ -477,11 +535,11 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
 
             match effective_mode {
                 FlightMode::AltitudeHold => {
-                    hold_alt = baro.altitude_m;
+                    hold_alt = cap_alt(alt_now);
                     info!("AltHold: target={=f32}m", hold_alt);
                 }
                 FlightMode::PositionHold => {
-                    hold_alt = baro.altitude_m;
+                    hold_alt = cap_alt(alt_now);
                     hold_pos_set = gps_ok;
                     if gps_ok { hold_pos = pos; }
                     pos_pid_n.reset(); pos_pid_e.reset();
@@ -489,14 +547,16 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
                           hold_alt, pos.lat_deg, pos.lon_deg, gps_ok);
                 }
                 FlightMode::ReturnToHome => {
-                    rth_cruise_alt = baro.altitude_m.max(RTH_MIN_ALT_M);
+                    // cap_alt: under range-alt the RTH cruise floor (15 m) is far
+                    // above the rangefinder - clamp to the ceiling instead.
+                    rth_cruise_alt = cap_alt(alt_now.max(RTH_MIN_ALT_M));
                     info!("RTH: climbing to {=f32}m then homing", rth_cruise_alt);
                 }
                 FlightMode::Land => {
-                    lander = Some(Lander::begin(baro.altitude_m));
+                    lander = Some(Lander::begin(alt_now));
                 }
                 FlightMode::FollowMe => {
-                    hold_alt = baro.altitude_m;
+                    hold_alt = cap_alt(alt_now);
                     hold_pos_set = gps_ok;
                     if gps_ok { hold_pos = pos; }
                     STATE.weed_target.lock().await.valid = false;
@@ -507,20 +567,20 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
         }
 
         let cmd = match effective_mode {
-            // ── Stabilise: RC direct, no autonomous override ───────────────────
+            // Stabilise: RC direct, no autonomous override
             FlightMode::Stabilise => {
                 NavCommand { autonomous: false, ..Default::default() }
             }
 
-            // ── AltitudeHold: lock altitude, pass RC roll/pitch/yaw ────────────
+            // AltitudeHold: lock altitude, pass RC roll/pitch/yaw
             FlightMode::AltitudeHold => {
                 let rc = *STATE.rc_input.lock().await;
                 let mut sp = rc.to_attitude_setpoint();
-                sp.throttle = alt_pid.update(hold_alt, baro.altitude_m);
+                sp.throttle = alt_pid.update(hold_alt, alt_now);
                 NavCommand { autonomous: true, attitude_setpoint: sp, target: Default::default() }
             }
 
-            // ── PositionHold: lock GPS + baro, RC yaw pass-through ────────────
+            // PositionHold: lock GPS + baro, RC yaw pass-through
             FlightMode::PositionHold => {
                 let rc = *STATE.rc_input.lock().await;
 
@@ -544,8 +604,7 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
                     let mut roll  =  pos_pid_e.update(right_m);
 
                     // Optical-flow velocity damping: oppose measured body-frame drift.
-                    // vel_x/y are body-frame drone velocity (positive = forward/right).
-                    // Polarity may need sign reversal depending on sensor mounting orientation.
+                    // Polarity may need sign reversal depending on sensor mounting.
                     if flow.usable() && flow.height_mm > 0 && flow.height_mm <= FLOW_MAX_HEIGHT_MM {
                         let h_m          = flow.height_mm as f32 / 1000.0;
                         let vel_fwd_ms   = flow.vel_x_mrad_s as f32 * h_m / 1_000_000.0;
@@ -575,13 +634,13 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
                         roll:     roll_sp,
                         pitch:    pitch_sp,
                         yaw_rate: rc.yaw * core::f32::consts::PI, // RC yaw pass-through
-                        throttle: alt_pid.update(hold_alt, baro.altitude_m),
+                        throttle: alt_pid.update(hold_alt, alt_now),
                     },
                     target: hold_pos,
                 }
             }
 
-            // ── Auto: fly MAVLink mission waypoints; weed targets take priority ──
+            // Auto: fly MAVLink mission waypoints; weed targets take priority
             FlightMode::Auto => {
                 // Load any freshly uploaded mission
                 {
@@ -597,20 +656,16 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
                 }
 
                 if !gps_ok {
-                    // Airborne with GPS gone but not yet demoted (>5 s →
-                    // AltitudeHold): hold the altitude where the fix died with
-                    // RC attitude live. Dropping to manual here means near-zero
-                    // throttle while the pilot's stick is parked. On the ground
-                    // (not Flying) manual passthrough stays — an altitude-hold
-                    // command there would spool up to hover throttle.
+                    // Airborne with GPS gone but not yet demoted: hold the altitude where
+                    // the fix died. On the ground keep manual passthrough (alt-hold would spool up).
                     if state::get() == state::FlightState::Flying {
                         if gps_loss_alt.is_none() {
                             warn!("Auto: GPS fix lost — holding altitude");
                         }
-                        let alt = *gps_loss_alt.get_or_insert(baro.altitude_m);
+                        let alt = *gps_loss_alt.get_or_insert(cap_alt(alt_now));
                         let rc = *STATE.rc_input.lock().await;
                         let mut sp = rc.to_attitude_setpoint();
-                        sp.throttle = alt_pid.update(alt, baro.altitude_m);
+                        sp.throttle = alt_pid.update(alt, alt_now);
                         NavCommand { autonomous: true, attitude_setpoint: sp,
                                      target: Default::default() }
                     } else {
@@ -620,23 +675,21 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
                         NavCommand { autonomous: false, ..Default::default() }
                     }
                 } else if !takeoff_done {
-                    // ── AUTO-TAKEOFF: climb to TAKEOFF_ALT_M before running the mission.
-                    // Level attitude + alt PID to the captured target. NOTE: autonomous
-                    // flight still requires an RC link up — control_task zeros motors on
-                    // RC failsafe, so this assumes a safety-pilot link is present.
+                    // AUTO-TAKEOFF: climb to the captured target before running the mission.
+                    // NOTE: control_task still zeros motors on RC failsafe.
                     let climb = NavCommand {
                         autonomous: true,
                         attitude_setpoint: AttitudeSetpoint {
                             roll: 0.0, pitch: 0.0, yaw_rate: 0.0,
-                            throttle: alt_pid.update(takeoff_target_alt, baro.altitude_m),
+                            throttle: alt_pid.update(takeoff_target_alt, alt_now),
                         },
                         target: Default::default(),
                     };
-                    if baro.altitude_m >= takeoff_target_alt - TAKEOFF_BAND_M {
+                    if alt_now >= takeoff_target_alt - TAKEOFF_BAND_M {
                         takeoff_done = true;
                         nav_pid_n.reset();
                         nav_pid_e.reset();
-                        info!("Auto: takeoff complete at {=f32} m — starting mission", baro.altitude_m);
+                        info!("Auto: takeoff complete at {=f32} m — starting mission", alt_now);
                     }
                     climb
                 } else {
@@ -645,17 +698,16 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
                                 && flow.height_mm <= FLOW_MAX_HEIGHT_MM {
                         flow.height_mm as f32 / 1000.0
                     } else {
-                        baro.altitude_m
+                        alt_now
                     };
 
-                    // New target → LATCH into active_weed and start Approach.
-                    // Every phase flies the latched copy; a target arriving
-                    // mid-sequence must not re-aim a live descent/extract.
+                    // New target -> LATCH into active_weed; a target arriving mid-sequence
+                    // must not re-aim a live descent/extract.
                     if weed_phase.is_none() {
                         let weed = *STATE.weed_target.lock().await;
                         if weed.valid {
                             active_weed       = weed;
-                            weed_approach_alt = baro.altitude_m;
+                            weed_approach_alt = cap_alt(alt_now);
                             weed_phase        = Some(WeedPhase::Approach);
                             weed_phase_timer  = None;
                             grip_attempts     = 0;
@@ -667,21 +719,21 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
 
                     if let Some(phase) = weed_phase {
                         let cmd = match phase {
-                            // ── Phase 1: fly to weed lat/lon at cruise altitude ──
+                            // Phase 1: fly to weed lat/lon at cruise altitude
                             WeedPhase::Approach => {
                                 let dist = haversine_m(pos, weed.position);
                                 if dist < WEED_ARRIVE_M {
-                                    alt_pid.reset(); // altitude reference switches baro→AGL
+                                    alt_pid.reset(); // altitude reference switches baro->AGL
                                     weed_phase       = Some(WeedPhase::Descend);
                                     weed_phase_timer = None;
                                     info!("Weed overhead (dist={=f32}m) — descending to {=f32}m AGL",
                                           dist, weed.extract_alt_m);
                                 }
-                                guide_to(weed.position, pos, weed_approach_alt, baro.altitude_m,
+                                guide_to(weed.position, pos, weed_approach_alt, alt_now,
                                          yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
                             }
 
-                            // ── Phase 2: descend to extraction altitude ──────────
+                            // Phase 2: descend to extraction altitude
                             WeedPhase::Descend => {
                                 if agl < weed.extract_alt_m + WEED_ALT_BAND_M {
                                     weed_phase       = Some(WeedPhase::Stabilize);
@@ -693,7 +745,7 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
                                          yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
                             }
 
-                            // ── Phase 3: hold for oscillations to damp out ───────
+                            // Phase 3: hold for oscillations to damp out
                             WeedPhase::Stabilize => {
                                 let elapsed = weed_phase_timer
                                     .map_or(0, |t| t.elapsed().as_millis() as u64);
@@ -707,23 +759,21 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
                                          yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
                             }
 
-                            // ── Phase 4: servo deployed, hold for pull duration,
-                            //    then confirm the grab actually caught something ──
+                            // Phase 4: servo deployed, hold for pull duration,
+                            // then confirm the grab actually caught something
                             WeedPhase::Extract => {
                                 let elapsed = weed_phase_timer
                                     .map_or(0, |t| t.elapsed().as_millis() as u64);
                                 if elapsed >= WEED_PULL_MS {
-                                    // Grip check: jaw microswitch closes to GND when
-                                    // something is held (LOW = held). Without the
-                                    // grip-sense feature, trust the timer (legacy
-                                    // open-loop behaviour — no switch fitted).
+                                    // Grip check: microswitch LOW = held; without
+                                    // grip-sense, trust the timer (open-loop).
                                     #[cfg(feature = "grip-sense")]
                                     let held = grip_pin.is_low();
                                     #[cfg(not(feature = "grip-sense"))]
                                     let held = { let _ = &grip_pin; true };
 
                                     if held {
-                                        // Keep s1 = 1.0 — maintain grip while ascending.
+                                        // Keep s1 = 1.0 - maintain grip while ascending.
                                         grip_confirmed   = true;
                                         weed_phase       = Some(WeedPhase::Ascend);
                                         weed_phase_timer = None;
@@ -738,9 +788,8 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
                                             defmt::warn!("Grip check FAILED (attempt {}/{}) — reopening for retry",
                                                   grip_attempts, MAX_GRIP_ATTEMPTS);
                                         } else {
-                                            // Out of attempts: climb away empty; the
-                                            // Ascend branch aborts instead of flying
-                                            // to the bin (grip_confirmed = false).
+                                            // Out of attempts: climb away empty; Ascend
+                                            // aborts instead of flying to the bin.
                                             grip_confirmed   = false;
                                             weed_phase       = Some(WeedPhase::Ascend);
                                             weed_phase_timer = None;
@@ -753,8 +802,8 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
                                          yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
                             }
 
-                            // ── Phase 4b: jaw reopened after a failed grab — dwell,
-                            //    then re-stabilise and try again ──────────────────
+                            // Phase 4b: jaw reopened after a failed grab - dwell,
+                            // then re-stabilise and try again
                             WeedPhase::GripRelease => {
                                 let elapsed = weed_phase_timer
                                     .map_or(0, |t| t.elapsed().as_millis() as u64);
@@ -768,8 +817,8 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
                                          yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
                             }
 
-                            // ── Phase 5: climb to cruise alt (gripping, or empty
-                            //    after an aborted grab) ────────────────────────────
+                            // Phase 5: climb to cruise alt (gripping, or empty
+                            // after an aborted grab)
                             WeedPhase::Ascend => {
                                 if agl > weed_approach_alt - WEED_ASCEND_NEAR_M {
                                     nav_pid_n.reset(); nav_pid_e.reset();
@@ -778,7 +827,7 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
                                         weed_phase_timer = None;
                                         info!("At cruise alt — flying home to drop weed");
                                     } else {
-                                        // Nothing in the jaw — skip the bin run,
+                                        // Nothing in the jaw - skip the bin run,
                                         // drop this target, resume the mission.
                                         STATE.weed_target.lock().await.valid = false;
                                         weed_phase       = None;
@@ -790,7 +839,7 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
                                          yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
                             }
 
-                            // ── Phase 6: fly to home (bin) at cruise altitude ────
+                            // Phase 6: fly to home (bin) at cruise altitude
                             WeedPhase::Dispose => {
                                 let dist_home = haversine_m(pos, mission.home);
                                 if dist_home < WEED_ARRIVE_M {
@@ -803,7 +852,7 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
                                          yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
                             }
 
-                            // ── Phase 7: descend over bin, release, done ──────────
+                            // Phase 7: descend over bin, release, done
                             WeedPhase::DisposeDescend => {
                                 if agl < BIN_DROP_ALT_M + WEED_ALT_BAND_M {
                                     STATE.servo_outputs.lock().await.s1 = 0.0;
@@ -821,10 +870,10 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
                         // Hold the LATCHED completion point (target = current would drift).
                         let hold = *mission_done_pos.get_or_insert_with(|| {
                             info!("Mission complete — holding lat={=f64} lon={=f64} alt={=f32}m",
-                                  pos.lat_deg, pos.lon_deg, baro.altitude_m);
-                            LatLonAlt { alt_m: baro.altitude_m, ..pos }
+                                  pos.lat_deg, pos.lon_deg, cap_alt(alt_now));
+                            LatLonAlt { alt_m: cap_alt(alt_now), ..pos }
                         });
-                        guide_to(hold, pos, hold.alt_m, baro.altitude_m,
+                        guide_to(hold, pos, hold.alt_m, alt_now,
                                  yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
                     } else if let Some(wp) = mission.current_wp() {
                         let dist = haversine_m(pos, wp.position);
@@ -845,7 +894,7 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
                             wp_arrived_at = None;
                         }
 
-                        guide_to(wp.position, pos, wp.position.alt_m, baro.altitude_m,
+                        guide_to(wp.position, pos, wp.position.alt_m, alt_now,
                                  yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
                     } else {
                         // Unreachable: !is_complete() guarantees current < count.
@@ -854,7 +903,7 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
                 }
             }
 
-            // ── FollowMe: continuously track GCS person position at fixed alt ──
+            // FollowMe: continuously track GCS person position at fixed alt
             FlightMode::FollowMe => {
                 if !gps_ok {
                     // Same GPS-loss altitude hold as Auto (see comment there).
@@ -862,10 +911,10 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
                         if gps_loss_alt.is_none() {
                             warn!("FollowMe: GPS fix lost — holding altitude");
                         }
-                        let alt = *gps_loss_alt.get_or_insert(baro.altitude_m);
+                        let alt = *gps_loss_alt.get_or_insert(cap_alt(alt_now));
                         let rc = *STATE.rc_input.lock().await;
                         let mut sp = rc.to_attitude_setpoint();
-                        sp.throttle = alt_pid.update(alt, baro.altitude_m);
+                        sp.throttle = alt_pid.update(alt, alt_now);
                         NavCommand { autonomous: true, attitude_setpoint: sp,
                                      target: Default::default() }
                     } else {
@@ -889,44 +938,56 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
                             wt.valid = false;
                         }
                     }
-                    guide_to(hold_pos, pos, hold_alt, baro.altitude_m,
+                    guide_to(hold_pos, pos, hold_alt, alt_now,
                              yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
                 }
             }
 
-            // ── ReturnToHome: climb to safe alt, fly home, descend ────────────
+            // ReturnToHome: climb to safe alt, fly home, descend
             FlightMode::ReturnToHome => {
                 if !home_set || !gps_ok {
                     if !rth_landing {
                         warn!("RTH: no home/usable GPS — landing");
-                        lander = Some(Lander::begin(baro.altitude_m));
+                        lander = Some(Lander::begin(alt_now));
                         rth_landing = true;
                     }
-                    lander.get_or_insert_with(|| Lander::begin(baro.altitude_m))
-                        .step(&mut alt_pid, baro.altitude_m, &flow)
+                    lander.get_or_insert_with(|| Lander::begin(alt_now))
+                        .step(&mut alt_pid, alt_now, &flow)
                 } else {
                     let dist = haversine_m(pos, mission.home);
                     if rth_landing || dist < HOME_ARRIVE_M {
                         if !rth_landing {
-                            lander = Some(Lander::begin(baro.altitude_m));
+                            lander = Some(Lander::begin(alt_now));
                             rth_landing = true;
                             info!("RTH: home reached — descending");
                         }
-                        lander.get_or_insert_with(|| Lander::begin(baro.altitude_m))
-                            .step(&mut alt_pid, baro.altitude_m, &flow)
+                        lander.get_or_insert_with(|| Lander::begin(alt_now))
+                            .step(&mut alt_pid, alt_now, &flow)
                     } else {
-                        guide_to(mission.home, pos, rth_cruise_alt, baro.altitude_m,
+                        guide_to(mission.home, pos, rth_cruise_alt, alt_now,
                                  yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
                     }
                 }
             }
 
-            // ── Land: rate-controlled descent with rangefinder touch-down ──────
+            // Land: rate-controlled descent with rangefinder touch-down
             FlightMode::Land => {
-                lander.get_or_insert_with(|| Lander::begin(baro.altitude_m))
-                    .step(&mut alt_pid, baro.altitude_m, &flow)
+                lander.get_or_insert_with(|| Lander::begin(alt_now))
+                    .step(&mut alt_pid, alt_now, &flow)
             }
         };
+
+        // Failsafe-forced landings disarm + Fault-latch at touchdown: motors must not
+        // idle indefinitely, and the pack must not be re-armable without a power cycle.
+        if is_armed
+            && failsafe_forced.is_some()
+            && matches!(effective_mode, FlightMode::Land | FlightMode::ReturnToHome)
+            && lander.as_ref().map_or(false, |l| l.touched)
+        {
+            *STATE.armed.lock().await = false;
+            state::set(state::FlightState::Fault);
+            warn!("Failsafe landing complete — disarmed, Fault latched (power-cycle to reset)");
+        }
 
         *STATE.nav_command.lock().await = cmd;
         prev_mode = effective_mode;

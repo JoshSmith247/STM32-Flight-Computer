@@ -1,10 +1,5 @@
-//! Madgwick AHRS filter.
-//!
-//! Fuses gyroscope and accelerometer data into a unit quaternion attitude
-//! estimate. At 2000 Hz with beta ≈ 0.1 the filter converges in ~2 s.
-//!
-//! Reference: Madgwick, S. (2010). "An efficient orientation filter for
-//! inertial and inertial/magnetic sensor arrays."
+//! Madgwick AHRS filter: fuses gyro + accel (+ optional mag) into a unit
+//! quaternion attitude estimate. Reference: Madgwick 2010.
 
 use libm::{fabsf, sqrtf};
 
@@ -17,12 +12,12 @@ pub struct MadgwickFilter {
 }
 
 impl MadgwickFilter {
-    /// `beta` ≈ 0.1 for IMU-only; `dt` = 1.0 / sample_rate_hz.
+    /// `beta` ~ 0.1 for IMU-only; `dt` = 1.0 / sample_rate_hz.
     pub fn new(beta: f32, dt: f32) -> Self {
         Self { beta, dt, q: Quaternion::default() }
     }
 
-    /// Update filter with gyro (rad/s) and accel (m/s² or any unit — normalised internally).
+    /// Update filter with gyro (rad/s) and accel (m/s² or any unit - normalised internally).
     /// Returns updated attitude quaternion.
     pub fn update(&mut self, gyro: Vec3, accel: Vec3) -> Quaternion {
         let (mut q0, mut q1, mut q2, mut q3) = (self.q.w, self.q.x, self.q.y, self.q.z);
@@ -65,12 +60,8 @@ impl MadgwickFilter {
         self.q
     }
 
-    /// Update filter with gyro (rad/s), accel, and magnetometer readings (9-DOF).
-    /// Adds a magnetic field gradient correction to the gravity correction so
-    /// heading converges to compass North rather than drifting with gyro bias.
-    /// Falls back to 6-DOF if the magnetometer vector is zero or denormal.
-    ///
-    /// Reference: Madgwick 2010, Section 7.1 — gradient for combined gravity+mag objective.
+    /// 9-DOF update: adds a magnetic-field gradient correction so heading converges
+    /// to compass North. Falls back to 6-DOF on a zero/denormal mag vector.
     pub fn update_with_mag(&mut self, gyro: Vec3, accel: Vec3, mag: Vec3) -> Quaternion {
         let (mut q0, mut q1, mut q2, mut q3) = (self.q.w, self.q.x, self.q.y, self.q.z);
 
@@ -79,12 +70,12 @@ impl MadgwickFilter {
         if !a_norm.is_finite() || fabsf(a_norm) < 1e-10 { return self.q; }
         let (ax, ay, az) = (accel.x * a_norm, accel.y * a_norm, accel.z * a_norm);
 
-        // Normalise magnetometer — fall back to 6-DOF if invalid
+        // Normalise magnetometer - fall back to 6-DOF if invalid
         let m_norm = 1.0 / sqrtf(mag.x*mag.x + mag.y*mag.y + mag.z*mag.z);
         if !m_norm.is_finite() || fabsf(m_norm) < 1e-10 { return self.update(gyro, accel); }
         let (mx, my, mz) = (mag.x * m_norm, mag.y * m_norm, mag.z * m_norm);
 
-        // Earth frame magnetic field h = q ⊗ m_body ⊗ q*
+        // Earth frame magnetic field h = q * m_body * q*
         let hx = 2.0*mx*(0.5 - q2*q2 - q3*q3) + 2.0*my*(q1*q2 - q0*q3) + 2.0*mz*(q1*q3 + q0*q2);
         let hy = 2.0*mx*(q0*q3 + q1*q2) + 2.0*my*(0.5 - q1*q1 - q3*q3) + 2.0*mz*(q2*q3 - q0*q1);
         let hz = 2.0*mx*(q1*q3 - q0*q2) + 2.0*my*(q0*q1 + q2*q3) + 2.0*mz*(0.5 - q1*q1 - q2*q2);
@@ -94,17 +85,17 @@ impl MadgwickFilter {
         let bx = sqrtf(hx*hx + hy*hy);
         let bz = hz;
 
-        // Gravity objective function  fg = f(q, g_ref) - a_measured
+        // Gravity objective function fg = f(q, g_ref) - a_measured
         let fg0 = 2.0*(q1*q3 - q0*q2) - ax;
         let fg1 = 2.0*(q0*q1 + q2*q3) - ay;
         let fg2 = 2.0*(0.5 - q1*q1 - q2*q2) - az;
 
-        // Magnetic objective function  fb = f(q, b_ref) - m_measured
+        // Magnetic objective function fb = f(q, b_ref) - m_measured
         let fb0 = 2.0*bx*(0.5 - q2*q2 - q3*q3) + 2.0*bz*(q1*q3 - q0*q2) - mx;
         let fb1 = 2.0*bx*(q1*q2 - q0*q3)        + 2.0*bz*(q0*q1 + q2*q3) - my;
         let fb2 = 2.0*bx*(q0*q2 + q1*q3)        + 2.0*bz*(0.5 - q1*q1 - q2*q2) - mz;
 
-        // Combined gradient  s = J_g^T * fg + J_b^T * fb
+        // Combined gradient s = J_g^T * fg + J_b^T * fb
         let s0 = (-2.0*q2*fg0 + 2.0*q1*fg1)
                + (-2.0*bz*q2*fb0 + (-2.0*bx*q3 + 2.0*bz*q1)*fb1 + 2.0*bx*q2*fb2);
         let s1 = (2.0*q3*fg0 + 2.0*q0*fg1 - 4.0*q1*fg2)
@@ -136,9 +127,8 @@ impl MadgwickFilter {
         self.q
     }
 
-    /// Convert current quaternion to Euler angles (roll, pitch, yaw) in radians.
-    /// NOTE: `yaw` here is in the filter's native (Z-up / NWU) convention —
-    /// positive CCW from North. For NED navigation/telemetry use [`ned_yaw`].
+    /// Euler angles in radians. NOTE: `yaw` is in the filter's native NWU
+    /// convention (CCW-positive) - for NED navigation/telemetry use [`ned_yaw`].
     pub fn euler(&self) -> Euler {
         let q = &self.q;
         Euler {
@@ -149,16 +139,9 @@ impl MadgwickFilter {
     }
 }
 
-/// NED heading from the attitude quaternion, radians (-π, π]: 0 = North,
-/// positive CLOCKWISE from above.
-///
-/// The Madgwick objectives above define a Z-up NWU world (rest accel =
-/// (0,0,+1); mag pins world X to magnetic North), so the raw ZYX yaw is CCW-
-/// positive — NED heading is its negation. Every NED consumer MUST use this
-/// helper; never hand-roll atan2 on the quaternion.
-///
-/// ⚠ BRING-UP: rotate the airframe clockwise (from above) and confirm this
-/// INCREASES and matches the compass before trusting any GPS mode.
+/// NED heading, radians: 0 = North, positive CLOCKWISE from above (negation of
+/// the CCW-positive Madgwick yaw). Every NED consumer MUST use this helper.
+/// WARNING: BRING-UP: rotate the airframe clockwise and confirm this INCREASES.
 pub fn ned_yaw(q: &crate::types::Quaternion) -> f32 {
     -libm::atan2f(2.0*(q.w*q.z + q.x*q.y), 1.0 - 2.0*(q.y*q.y + q.z*q.z))
 }

@@ -91,7 +91,7 @@ class PersonTracker:
     def set_frame_size(self, w: int, h: int) -> None:
         self._frame_size = (w, h)
 
-    # ── Worker subprocess ──────────────────────────────────────────────────────
+    # Worker subprocess
 
     def _start_worker(self) -> None:
         """Spawn the YOLO subprocess and block until it signals ready.
@@ -110,14 +110,14 @@ class PersonTracker:
         # blocked on readline() waiting for the worker to finish loading.
         with self._proc_lock:
             if self._proc is not None and self._proc.poll() is None:
-                proc.kill()   # lost the race — another thread won
+                proc.kill()   # lost the race - another thread won
                 return
             self._proc = proc
 
-        # Block here (no lock held) — may take tens of seconds if downloading.
+        # Block here (no lock held) - may take tens of seconds if downloading.
         line = proc.stdout.readline().decode().strip()
         if not line:
-            return  # pipe closed — parent is shutting down
+            return  # pipe closed - parent is shutting down
         if line != 'ready':
             proc.kill()
             raise RuntimeError(f"YOLO worker failed to init: {line!r}")
@@ -150,7 +150,7 @@ class PersonTracker:
                     self._proc.kill()
                 self._proc = None
 
-    # ── Background inference loop ──────────────────────────────────────────────
+    # Background inference loop
 
     def _inference_loop(self) -> None:
         while not self._stop_infer:
@@ -197,7 +197,7 @@ class PersonTracker:
                         pass
                     self._proc = None
 
-    # ── Per-frame API (non-blocking) ──────────────────────────────────────────
+    # Per-frame API (non-blocking)
 
     def process_frame(self, frame: np.ndarray) -> list:
         """Queue frame for async YOLO inference; return last available detections.
@@ -257,7 +257,7 @@ class PersonTracker:
                 self._pos_history.clear()
                 print("Follow: target lost — deselected", flush=True)
 
-    # ── Click handling ────────────────────────────────────────────────────────
+    # Click handling
 
     def queue_click(self, x: int, y: int) -> None:
         self._pending_click = (x, y)
@@ -289,7 +289,7 @@ class PersonTracker:
                 print(f"Follow: target acquired  ({loc})", flush=True)
                 return
 
-    # ── World position & velocity ─────────────────────────────────────────────
+    # World position & velocity
 
     def get_world_pos(self) -> tuple[float, float] | None:
         if self._tracked is None or self._frame_size is None:
@@ -330,7 +330,7 @@ class PersonTracker:
     def ground_speed_ms(self) -> float:
         return math.hypot(*self._world_vel)
 
-    # ── Rendering ─────────────────────────────────────────────────────────────
+    # Rendering
 
     def draw(self, frame: np.ndarray, detections: list) -> np.ndarray:
         out = frame.copy()

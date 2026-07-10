@@ -1,30 +1,7 @@
-//! u-blox M10 GPS (SEQURE M10-18) — UBX NAV-PVT parser on USART1 (PA10 RX, PA9 TX).
-//!
-//! The M10 chip replaced the M8N's CFG-PRT / CFG-MSG protocol with UBX-CFG-VALSET.
-//! Baud: the SEQURE M10-18 ships at 115200 with UBX output enabled (vendor spec
-//! sheet, confirmed 2026-07-09). Generic u-blox M10 default is 38400.
-//!
-//! Startup sequence:
-//!   1. UBX-CFG-VALSET — enable NAV-PVT output on UART1
-//!      (module typically ships with NMEA enabled; we add UBX NAV-PVT on top)
-//!   2. UBX-CFG-VALSET — CFG-RATE-MEAS = 200 ms → 5 Hz navigation rate
-//!
-//! Then loops reading NAV-PVT frames (92-byte payload) and writing STATE.gps_fix.
-//! Non-NAV-PVT frames (NMEA or other UBX) are drained and discarded.
-//!
-//! If the module doesn't respond, verify the baud rate with a logic analyzer
-//! on PA10 — try 38400 (generic u-blox default) if 115200 is silent.
-//!
-//! NAV-PVT payload offsets used here:
-//!   byte 20      fixType  (3 = 3-D fix)
-//!   byte 21      flags    (bit 0 = gnssFixOK)
-//!   bytes 24–27  lon      (i32, 1e-7 °)
-//!   bytes 28–31  lat      (i32, 1e-7 °)
-//!   bytes 36–39  hMSL     (i32, mm above MSL)
-//!   bytes 40–43  hAcc     (u32, mm)
-//!   bytes 48–51  velN     (i32, mm/s)
-//!   bytes 52–55  velE     (i32, mm/s)
-//!   bytes 56–59  velD     (i32, mm/s)
+//! u-blox M10 GPS (SEQURE M10-18) - UBX NAV-PVT parser on USART1 (PA10 RX, PA9 TX).
+//! Configured via UBX-CFG-VALSET (NAV-PVT on UART1, 5 Hz); writes STATE.gps_fix.
+//! Ships at 115200 baud (vendor spec, confirmed 2026-07-09); generic M10 default
+//! is 38400 - try that if the module is silent.
 
 use defmt::{info, warn};
 use embassy_stm32::{
@@ -36,15 +13,10 @@ use embassy_time::{Duration, Timer};
 
 use crate::{types::GpsFix, Irqs, STATE};
 
-// ── UBX configuration frame (checksum pre-computed) ────────────────────────
+// UBX configuration frame (checksum pre-computed)
 
 /// UBX-CFG-VALSET (M10): enable NAV-PVT output (1 per nav epoch) on UART1.
-///
-/// Payload (9 bytes):
-///   version=0x00, layers=0x01 (RAM), reserved=0x00 0x00,
-///   key=0x20910007 (CFG-MSGOUT-UBX_NAV_PVT_UART1, type U1), value=0x01
-///
-/// Checksum covers class+id+len+payload: CK_A=0x53, CK_B=0x48.
+/// Checksum pre-computed over class+id+len+payload.
 const CFG_VALSET_NAV_PVT: &[u8] = &[
     0xB5, 0x62,              // sync chars
     0x06, 0x8A,              // class=CFG, id=VALSET
@@ -58,11 +30,7 @@ const CFG_VALSET_NAV_PVT: &[u8] = &[
 ];
 
 /// UBX-CFG-VALSET (M10): 5 Hz navigation rate (CFG-RATE-MEAS = 200 ms).
-/// Position-hold needs ≥5 Hz — the estimator gains and PosPid assume it.
-///
-/// Payload (10 bytes):
-///   version=0x00, layers=0x01 (RAM), reserved=0x00 0x00,
-///   key=0x30210001 (CFG-RATE-MEAS, type U2), value=200 (ms)
+/// Position-hold needs >=5 Hz - the estimator gains and PosPid assume it.
 const CFG_VALSET_RATE_5HZ: &[u8] = &[
     0xB5, 0x62,              // sync chars
     0x06, 0x8A,              // class=CFG, id=VALSET
@@ -71,11 +39,11 @@ const CFG_VALSET_RATE_5HZ: &[u8] = &[
     0x01,                    // layers: RAM
     0x00, 0x00,              // reserved
     0x01, 0x00, 0x21, 0x30, // key: CFG-RATE-MEAS (U2, ms)
-    0xC8, 0x00,              // value: 200 ms → 5 Hz
+    0xC8, 0x00,              // value: 200 ms -> 5 Hz
     0xB5, 0x81,              // CK_A, CK_B
 ];
 
-// ── Helpers ─────────────────────────────────────────────────────────────────
+// Helpers
 
 /// Fletcher-8 checksum over a sequence of byte slices (concatenated).
 fn ubx_cksum_parts(a_slice: &[u8], b_slice: &[u8]) -> (u8, u8) {
@@ -111,7 +79,7 @@ fn parse_pvt(payload: &[u8; 92]) -> GpsFix {
     }
 }
 
-// ── Task ─────────────────────────────────────────────────────────────────────
+// Task
 
 #[embassy_executor::task]
 pub async fn gps_task(
@@ -124,7 +92,7 @@ pub async fn gps_task(
 ) {
     let mut cfg = Config::default();
     // SEQURE M10-18 vendor default (spec sheet). Generic u-blox M10 modules
-    // ship at 38400 — fall back to that if this module is silent.
+    // ship at 38400 - fall back to that if this module is silent.
     cfg.baudrate = 115200;
 
     let uart = Uart::new(uart_peri, rx_pin, tx_pin, tx_dma, rx_dma, irqs, cfg)
@@ -138,9 +106,8 @@ pub async fn gps_task(
     Timer::after(Duration::from_millis(50)).await;
     tx.write(CFG_VALSET_RATE_5HZ).await.ok();
 
-    // Ring-buffered DMA RX so the interleaved NMEA/UBX stream isn't dropped between
-    // reads — one-shot byte reads lose bytes under load and corrupt UBX frames.
-    // 512 B ≈ 44 ms of slack @ 115200 baud.
+    // Ring-buffered DMA RX - one-shot byte reads lose bytes under load and
+    // corrupt UBX frames. 512 B is ~44 ms of slack at 115200 baud.
     let mut rx_ring = [0u8; 512];
     let mut rx = rx.into_ring_buffered(&mut rx_ring);
 
@@ -155,23 +122,22 @@ pub async fn gps_task(
     let mut last_log  = embassy_time::Instant::now();
 
     loop {
-        // ── sync char 1 ────────────────────────────────────────────────────
+        // sync char 1
         if super::read_exact_ring(&mut rx, &mut byte).await.is_err() { continue; }
         if byte[0] != 0xB5 { continue; }
 
-        // ── sync char 2 ────────────────────────────────────────────────────
+        // sync char 2
         if super::read_exact_ring(&mut rx, &mut byte).await.is_err() { continue; }
         if byte[0] != 0x62 { continue; }
 
-        // ── class / id / length (4 bytes) ──────────────────────────────────
+        // class / id / length (4 bytes)
         if super::read_exact_ring(&mut rx, &mut hdr).await.is_err() { continue; }
         let class = hdr[0];
         let id    = hdr[1];
         let len   = u16::from_le_bytes([hdr[2], hdr[3]]) as usize;
 
-        // Guard against a false 0xB5 0x62 sync match yielding a bogus length: real UBX
-        // messages here are small (NAV-PVT = 92). A huge len would make the drain below
-        // block for thousands of bytes, stalling parsing — treat it as noise and resync.
+        // Guard against a false sync match yielding a bogus length that would
+        // stall the drain below for thousands of bytes - treat as noise, resync.
         const MAX_UBX_LEN: usize = 512;
         if len > MAX_UBX_LEN { continue; }
 
@@ -183,10 +149,10 @@ pub async fn gps_task(
             continue;
         }
 
-        // ── payload ────────────────────────────────────────────────────────
+        // payload
         if super::read_exact_ring(&mut rx, &mut payload).await.is_err() { continue; }
 
-        // ── checksum ───────────────────────────────────────────────────────
+        // checksum
         if super::read_exact_ring(&mut rx, &mut ckbuf).await.is_err() { continue; }
         let (ck_a, ck_b) = ubx_cksum_parts(&hdr, &payload);
         if ck_a != ckbuf[0] || ck_b != ckbuf[1] {
@@ -195,12 +161,11 @@ pub async fn gps_task(
         }
 
         let fix = parse_pvt(&payload);
-        let num_sv = payload[23]; // numSV — satellites used in the nav solution
+        let num_sv = payload[23]; // numSV - satellites used in the nav solution
         *STATE.gps_fix.lock().await = fix;
 
-        // Log on the no-fix→fix edge, then at most every 5 s. While there is
-        // NO fix, still log at 5 s so the bench can tell "wired + parsing,
-        // waiting for satellites" apart from dead wiring (which is silent).
+        // Log on the no-fix->fix edge, then every 5 s. No-fix also logs at 5 s so
+        // the bench can tell "parsing, waiting for sats" from dead wiring.
         if fix.fix_ok && (!had_fix || last_log.elapsed() > Duration::from_secs(5)) {
             info!("GPS 3D fix  lat={=f64}  lon={=f64}  alt={=f32}m  hacc={=f32}m  sats={=u8}",
                   fix.lat_deg, fix.lon_deg, fix.alt_m, fix.hacc_m, num_sv);

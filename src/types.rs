@@ -3,13 +3,8 @@
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 use embassy_time::Instant;
 
-// ---------------------------------------------------------------------------
-// Sensor freshness
-// ---------------------------------------------------------------------------
-//
-// Sensor structs carry `stamp_ms` (0 = never written). Consumers MUST gate on
-// the `usable()`/`is_fresh()` helpers, never a bare `valid`/`fix_ok` flag —
-// a dead sensor task leaves its last snapshot in STATE forever.
+// Sensor freshness: consumers MUST gate on the `usable()`/`is_fresh()` helpers,
+// never a bare `valid` flag - a dead task leaves its last snapshot in STATE forever.
 
 pub const GPS_FRESH_MS: u64 = 2_500;  // nominal 5 Hz
 pub const FLOW_FRESH_MS: u64 = 300;   // continuous stream
@@ -26,9 +21,7 @@ fn is_fresh(stamp_ms: u64, limit_ms: u64) -> bool {
     stamp_ms != 0 && Instant::now().as_millis().saturating_sub(stamp_ms) <= limit_ms
 }
 
-// ---------------------------------------------------------------------------
 // Basic geometric types
-// ---------------------------------------------------------------------------
 
 /// Roll / pitch / yaw in radians.
 #[derive(Clone, Copy, Default, defmt::Format)]
@@ -96,16 +89,14 @@ impl GpsFix {
         LatLonAlt { lat_deg: self.lat_deg, lon_deg: self.lon_deg, alt_m: self.alt_m }
     }
 
-    /// gnssFixOK + 3-D fix AND fresh. Never trust `fix_ok` alone — a dead GPS
+    /// gnssFixOK + 3-D fix AND fresh. Never trust `fix_ok` alone - a dead GPS
     /// leaves the last fix_ok=true snapshot in STATE forever.
     pub fn usable(&self) -> bool {
         self.fix_ok && is_fresh(self.stamp_ms, GPS_FRESH_MS)
     }
 }
 
-// ---------------------------------------------------------------------------
 // Sensor data
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Default, defmt::Format)]
 pub struct ImuData {
@@ -126,15 +117,14 @@ pub struct BaroData {
     pub altitude_m:  f32,   // derived via ISA model
 }
 
-/// Battery state — updated at 2 Hz by battery_task.
+/// Battery state - updated at 2 Hz by battery_task.
 #[derive(Clone, Copy, defmt::Format)]
 pub struct BatteryData {
     pub voltage_v: f32,
-    pub pct:       u8,      // 0–100 %
+    pub pct:       u8,      // 0-100 %
     pub critical:  bool,    // true when per-cell V < V_CELL_CRIT for 3 samples (~1.5 s)
     /// Measured pack current from the ESC's CUR pad (A). Negative = sensor not
-    /// fitted/calibrated — consumers (telemetry) then fall back to the
-    /// throttle-based estimate.
+    /// fitted/calibrated; consumers fall back to the throttle-based estimate.
     pub current_a: f32,
 }
 
@@ -145,24 +135,22 @@ impl Default for BatteryData {
     }
 }
 
-// ---------------------------------------------------------------------------
 // RC / pilot input
-// ---------------------------------------------------------------------------
 
 /// Normalised RC channels in [-1.0, 1.0] (throttle 0..1).
 #[derive(Clone, Copy, Default, defmt::Format)]
 pub struct RcInput {
-    pub throttle: f32,      // 0.0 – 1.0
-    pub roll:     f32,      // ±1.0
-    pub pitch:    f32,      // ±1.0
-    pub yaw:      f32,      // ±1.0
+    pub throttle: f32,      // 0.0 - 1.0
+    pub roll:     f32,      // +/-1.0
+    pub pitch:    f32,      // +/-1.0
+    pub yaw:      f32,      // +/-1.0
     pub arm:      bool,
     pub mode:     FlightMode,
     pub failsafe: bool,
 }
 
 impl RcInput {
-    /// Convert raw stick positions to an attitude setpoint (radians / rad·s⁻¹).
+    /// Convert raw stick positions to an attitude setpoint (radians / rad*s⁻¹).
     pub fn to_attitude_setpoint(&self) -> AttitudeSetpoint {
         const MAX_ANGLE: f32 = 0.5236; // 30 deg
         const MAX_RATE:  f32 = 3.1416; // 180 deg/s yaw
@@ -187,16 +175,14 @@ pub enum FlightMode {
     FollowMe,       // Continuous person tracking via GCS YOLOv8; discriminant = 6
 }
 
-// ---------------------------------------------------------------------------
 // Control setpoints
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Default, defmt::Format)]
 pub struct AttitudeSetpoint {
     pub roll:     f32,      // rad
     pub pitch:    f32,      // rad
     pub yaw_rate: f32,      // rad/s
-    pub throttle: f32,      // 0.0 – 1.0
+    pub throttle: f32,      // 0.0 - 1.0
 }
 
 #[derive(Clone, Copy, Default, defmt::Format)]
@@ -206,15 +192,10 @@ pub struct NavCommand {
     pub target:            LatLonAlt,
 }
 
-// ---------------------------------------------------------------------------
-// Motor outputs (DSHOT / PWM normalised 0.0 – 1.0)
-// ---------------------------------------------------------------------------
+// Motor outputs (DSHOT / PWM normalised 0.0 - 1.0)
 
-/// Motor mixer output for a quad in X configuration. Fields map to:
-///   m1 front-right (CW)    m2 front-left (CCW)
-///   m3 back-right  (CCW)   m4 back-left  (CW)
-/// Diagonal pairs share rotation direction: {m1,m4} CW, {m2,m3} CCW.
-/// Spin direction must still be verified on the bench before first spin-up.
+/// Quad-X mixer output: m1 front-right CW, m2 front-left CCW, m3 back-right CCW,
+/// m4 back-left CW. Verify spin direction on the bench before first spin-up.
 #[derive(Clone, Copy, Default, defmt::Format)]
 pub struct MotorOutputs {
     pub m1: f32,
@@ -224,24 +205,22 @@ pub struct MotorOutputs {
 }
 
 /// Bench motor test (MAV_CMD_DO_MOTOR_TEST 209). Honoured ONLY while disarmed
-/// + Idle, auto-expires at `until`. ⚠ PROPS OFF.
+/// + Idle, auto-expires at `until`. WARNING: PROPS OFF.
 #[derive(Clone, Copy)]
 pub struct MotorTest {
-    pub idx:      u8,       // 1..=4 → firmware M1..M4
+    pub idx:      u8,       // 1..=4 -> firmware M1..M4
     pub throttle: f32,      // 0.0..=1.0, clamped low at the command site
     pub until:    Instant,  // spin stops once Instant::now() >= until
 }
 
-// ---------------------------------------------------------------------------
 // Global shared state (Embassy async mutexes, ISR-safe)
-// ---------------------------------------------------------------------------
 
 /// Optical flow + rangefinder data from MTF-02P, updated by flow_task.
 #[derive(Clone, Copy, Default, defmt::Format)]
 pub struct FlowData {
-    pub quality:      u8,    // 0–255
-    pub vel_x_mrad_s: i32,   // body-frame X angular flow rate (µrad/s)
-    pub vel_y_mrad_s: i32,   // body-frame Y angular flow rate (µrad/s)
+    pub quality:      u8,    // 0-255
+    pub vel_x_mrad_s: i32,   // body-frame X angular flow rate (urad/s)
+    pub vel_y_mrad_s: i32,   // body-frame Y angular flow rate (urad/s)
     pub height_mm:    i32,   // rangefinder reading in mm; -1 = no data
     pub valid:        bool,  // quality > 50 and height > 0 in the last frame
     pub stamp_ms:     u64,   // Instant ms when flow_task last wrote this; 0 = never
@@ -252,22 +231,20 @@ impl FlowData {
 }
 
 /// Fused NED position/velocity estimate, updated by estimator_task (~150 Hz).
-/// Position is metres relative to the NED origin (first valid GPS fix / home);
-/// velocity is m/s in NED. `valid` becomes true once the origin is captured.
+/// Position is metres relative to the NED origin (first valid GPS fix / home).
 #[derive(Clone, Copy, Default, defmt::Format)]
 pub struct PosEstimate {
     pub pos_n: f32,    // North position (m, relative to origin)
-    pub pos_e: f32,    // East  position (m)
-    pub pos_d: f32,    // Down  position (m, +down)
+    pub pos_e: f32,    // East position (m)
+    pub pos_d: f32,    // Down position (m, +down)
     pub vel_n: f32,    // North velocity (m/s)
-    pub vel_e: f32,    // East  velocity (m/s)
-    pub vel_d: f32,    // Down  velocity (m/s)
+    pub vel_e: f32,    // East velocity (m/s)
+    pub vel_d: f32,    // Down velocity (m/s)
     pub valid: bool,   // true once the NED origin has been set from GPS
 }
 
-/// Per-sensor health/plausibility flags, updated by health_task (~20 Hz). Each flag is
-/// true only when that sensor is producing physically plausible, usable data. Consumed
-/// by the pre-arm checks in arming_task (and available for future failsafe logic).
+/// Per-sensor health/plausibility flags from health_task (~20 Hz); consumed by
+/// the pre-arm checks in arming_task.
 #[derive(Clone, Copy, Default, defmt::Format)]
 pub struct SensorHealth {
     pub imu_ok:  bool,   // accel magnitude near 1 g + gyro not saturated + finite
@@ -292,7 +269,7 @@ impl MagData {
 }
 
 /// Normalised servo positions [0.0, 1.0] written by navigation/ground station.
-/// 0.0 = 1000 µs (min), 1.0 = 2000 µs (max). Defaults to 0.0 (retracted).
+/// 0.0 = 1000 us (min), 1.0 = 2000 us (max). Defaults to 0.0 (retracted).
 #[derive(Clone, Copy, Default, defmt::Format)]
 pub struct ServoOutputs {
     pub s1: f32,
@@ -307,7 +284,7 @@ pub struct ServoOutputs {
 pub struct WeedTarget {
     pub position:     LatLonAlt,
     /// Barometer AGL altitude (metres) to descend to for extraction.
-    /// Computed in telemetry_task as baro.altitude_m − ned_d at receive time.
+    /// Computed in telemetry_task as baro.altitude_m - ned_d at receive time.
     pub extract_alt_m: f32,
     pub valid:        bool,
 }
@@ -318,10 +295,10 @@ impl Default for WeedTarget {
     }
 }
 
-/// Payload presence flags — set by each payload task on successful hardware init.
+/// Payload presence flags - set by each payload task on successful hardware init.
 /// Packed into HEARTBEAT custom_mode bits [31:16] and forwarded to the GCS.
 pub mod payload_flags {
-    pub const SERVO_OUTPUTS: u32 = 1 << 0;  // TIM4 servo bus (4 channels, PD12–PD15)
+    pub const SERVO_OUTPUTS: u32 = 1 << 0;  // TIM4 servo bus (4 channels, PD12-PD15)
 }
 
 pub struct SharedState {
@@ -346,9 +323,8 @@ pub struct SharedState {
     pub home_override:  Mutex<CriticalSectionRawMutex, Option<LatLonAlt>>,
     /// Bench motor-test override (MAV_CMD_DO_MOTOR_TEST). None = no test active.
     pub motor_test:     Mutex<CriticalSectionRawMutex, Option<MotorTest>>,
-    /// Flight-mode override commanded over MAVLink (DO_SET_MODE / RTL / LAND).
-    /// Wins over the RC mode switch until the pilot MOVES the switch (rc_task
-    /// clears it on any physical switch transition).
+    /// MAVLink-commanded mode override; wins over the RC mode switch until the
+    /// pilot MOVES the switch (rc_task clears it on any transition).
     pub mode_override:  Mutex<CriticalSectionRawMutex, Option<FlightMode>>,
 }
 

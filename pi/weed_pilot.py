@@ -42,24 +42,22 @@ SERIAL_BAUD      = int(os.environ.get('STM32_BAUD',    '57600'))
 LAPTOP_IP        = sys.argv[1] if len(sys.argv) > 1 else os.environ.get('LAPTOP_IP', '192.168.4.2')
 GCS_PORT         = int(os.environ.get('GCS_PORT',        '14550'))
 WEED_TARGET_PORT = int(os.environ.get('WEED_TARGET_PORT', '5700'))
-# Event log lives in /tmp with a FIXED name, so it can't fill the SD card and a
-# crash-loop won't spawn a new file every 3 s. /tmp is cleared on reboot.
-# Override with WEED_LOG=/dev/shm/... for guaranteed RAM-backing.
+# Event log in /tmp with a FIXED name so it can't fill the SD card and a
+# crash-loop won't spawn new files. Override with WEED_LOG=/dev/shm/... for RAM-backing.
 WEED_LOG_PATH    = os.environ.get('WEED_LOG', '/tmp/weed_events.jsonl')
 
 # MAVLink v2 constants for the Pi GCS component
 PI_SYS_ID        = 10   # distinct from drone's sys_id=1
 PI_COMP_ID       = 1
-HEARTBEAT_HZ     = 4    # send heartbeat at 4 Hz — many retries within the FC's 5 s Pi-loss watchdog
+HEARTBEAT_HZ     = 4    # send heartbeat at 4 Hz - many retries within the FC's 5 s Pi-loss watchdog
 
 # Shared monotonic sequence number for all frames sent from PI_SYS_ID/PI_COMP_ID.
 # Lock required: heartbeat and weed-target threads both increment it.
 _seq_lock = threading.Lock()
 _seq      = 0
 
-# Source-IP allowlist rejections, announced once per offending IP. Silent drops
-# cost real debugging time on a dual-homed laptop (Pi 4 setup: shell on Ethernet
-# + video on WiFi) — commands can arrive from the "other" interface's IP.
+# Source-IP allowlist rejections, announced once per offending IP - silent drops
+# cost real debugging time on a dual-homed laptop.
 _dropped_ips: set = set()
 
 
@@ -86,9 +84,7 @@ def _time_boot_ms() -> int:
     return int((time.monotonic() - _BOOT_TIME) * 1000) & 0xFFFFFFFF
 
 
-# ---------------------------------------------------------------------------
-# MAVLink v2 frame builder (minimal — HEARTBEAT only)
-# ---------------------------------------------------------------------------
+# MAVLink v2 frame builder (minimal - HEARTBEAT only)
 
 def _mavlink_crc(data: bytes, extra: int) -> int:
     crc = 0xFFFF
@@ -110,14 +106,14 @@ def _build_set_position_target_local_ned(seq: int, north_m: float, east_m: float
     # MAVLink v2 wire format: fields sorted largest-first (all floats before u16/u8)
     payload = struct.pack(
         '<IfffffffffffHBBB',
-        _time_boot_ms(),                                    # time_boot_ms          @0
-        float(north_m), float(east_m), float(down_m),      # x(N), y(E), z(D)     @4,8,12
-        0.0, 0.0, 0.0,                                      # vx, vy, vz (ignored)  @16,20,24
-        0.0, 0.0, 0.0,                                      # afx, afy, afz         @28,32,36
-        0.0, 0.0,                                           # yaw, yaw_rate         @40,44
-        0x0FF8,                                             # type_mask: pos only   @48
-        1,                                                  # target_system         @50
-        1,                                                  # target_component      @51
+        _time_boot_ms(),                                    # time_boot_ms @0
+        float(north_m), float(east_m), float(down_m),      # x(N), y(E), z(D) @4,8,12
+        0.0, 0.0, 0.0,                                      # vx, vy, vz (ignored) @16,20,24
+        0.0, 0.0, 0.0,                                      # afx, afy, afz @28,32,36
+        0.0, 0.0,                                           # yaw, yaw_rate @40,44
+        0x0FF8,                                             # type_mask: pos only @48
+        1,                                                  # target_system @50
+        1,                                                  # target_component @51
         7,                                                  # MAV_FRAME_LOCAL_OFFSET_NED @52
     )
     n = len(payload)  # 53
@@ -143,9 +139,7 @@ def _build_heartbeat(seq: int) -> bytes:
     return bytes([0xFD]) + header + payload + struct.pack('<H', crc)
 
 
-# ---------------------------------------------------------------------------
-# Event log — JSONL, one record per line for easy grep / replay
-# ---------------------------------------------------------------------------
+# Event log - JSONL, one record per line for easy grep / replay
 
 _log_lock = threading.Lock()
 
@@ -160,9 +154,7 @@ def _log_event(**kw: object) -> None:
         print(f"log write: {exc}", flush=True)
 
 
-# ---------------------------------------------------------------------------
 # Threads
-# ---------------------------------------------------------------------------
 
 def _serial_to_udp(ser, sock: socket.socket) -> None:
     """Forward raw telemetry bytes from STM32 → ground station."""
@@ -252,9 +244,7 @@ def _weed_target_listener(ser, ser_lock: threading.Lock) -> None:
             print(f"weed listener: {exc}", flush=True)
 
 
-# ---------------------------------------------------------------------------
 # Main
-# ---------------------------------------------------------------------------
 
 def main() -> None:
     try:

@@ -1,16 +1,5 @@
-//! QMC5883L magnetometer driver — I2C1 blocking, 25 Hz output.
-//!
-//! I2C address: 0x0D
-//! Pinout: PB8 = SCL, PB9 = SDA (I2C1 AF4)
-//!
-//! Init sequence:
-//!   1. Soft reset (CR2 = 0x80), wait 10 ms
-//!   2. Set/Reset Period register = 0x01 (required by datasheet)
-//!   3. CR2 = 0x00 (clear)
-//!   4. CR1 = 0x19 — continuous mode, 100 Hz ODR, 8 G range, OSR=512
-//!
-//! Each 25 Hz tick: poll DRDY (status bit 0), read 6 raw bytes, apply
-//! tilt compensation using the current AHRS quaternion, write STATE.mag_data.
+//! QMC5883L magnetometer driver - I2C1 blocking (PB8 SCL, PB9 SDA), 25 Hz.
+//! Polls DRDY, applies tilt compensation from the AHRS quaternion, writes STATE.mag_data.
 
 use core::f32::consts::TAU;
 
@@ -35,27 +24,20 @@ const REG_PERIOD:  u8 = 0x0B;
 const REG_CHIP_ID: u8 = 0x0D;
 
 // CR1: OSR=512 | RNG=8G | ODR=100Hz | Mode=Continuous
-// bits [7:6]=00  [5:4]=01  [3:2]=10  [1:0]=01  → 0b00_01_10_01 = 0x19
+// bits [7:6]=00 [5:4]=01 [3:2]=10 [1:0]=01 -> 0b00_01_10_01 = 0x19
 const CR1_VALUE: u8 = 0x19;
 
-// ── Runtime magnetometer calibration ──────────────────────────────────────────
-// Boot-time hard-iron + diagonal soft-iron cal; NO flash persistence — must be
-// redone every power cycle (intentional).
-//
-// >>> ROTATE THE DRONE (slow figure-8, every axis ±) for the whole window,
-// >>> or the cal fails and GPS-mode arming stays blocked. <<<
+// Boot-time hard-iron + soft-iron cal, redone every power cycle (no flash persistence).
+// ROTATE THE DRONE (slow figure-8) for the whole window or GPS-mode arming stays blocked.
 
-/// How long the rotate-the-drone calibration window lasts. The user must keep
-/// rotating the airframe through all orientations for this whole duration.
+/// Rotate-the-drone calibration window duration.
 const CAL_WINDOW_SECS: u64 = 25;
 
-/// Set to `false` to skip calibration entirely (publish raw, no offset/scale).
-/// Useful on the bench when no field rotation is possible.
+/// Set to `false` to skip calibration entirely (bench use - publish raw).
 const CAL_ENABLED: bool = true;
 
-/// Per-axis range below this (in LSB) means the user almost certainly did NOT
-/// rotate the drone; we then fall back to identity scale to avoid blowing up a
-/// near-zero range into a huge scale factor.
+/// Per-axis range below this (LSB) means the drone wasn't rotated; fall back to
+/// identity scale rather than blowing up a near-zero range.
 const MIN_VALID_RANGE: f32 = 50.0;
 
 /// Hard-iron offset (subtracted) and diagonal soft-iron scale (multiplied)
@@ -82,11 +64,8 @@ impl MagCal {
     }
 }
 
-/// Hard-iron offset + diagonal soft-iron scale from per-axis min/max.
-/// Returns `(cal, ok)`. Any axis range too small = drone wasn't rotated →
-/// FULL identity (a stationary min/max midpoint equals the ambient field, and
-/// subtracting it reduces readings to noise) and ok=false, which keeps the
-/// mag_ok pre-arm gate closed.
+/// Hard-iron offset + diagonal soft-iron scale from per-axis min/max. Any axis
+/// range too small = not rotated -> identity + ok=false (keeps the pre-arm gate closed).
 fn compute_cal(min: [f32; 3], max: [f32; 3]) -> (MagCal, bool) {
     let mut offset = [0.0f32; 3];
     let mut range  = [0.0f32; 3];
@@ -178,9 +157,8 @@ pub async fn mag_task(
 
     let mut ticker = Ticker::every(Duration::from_hz(25));
 
-    // ── Calibration window ─────────────────────────────────────────────────────
-    // NOT persisted to flash — recalibrated every boot, by design. `cal_ok`
-    // gates the published `valid` flag (and therefore GPS-mode arming).
+    // Calibration window - recalibrated every boot by design; `cal_ok` gates
+    // the published `valid` flag (and therefore GPS-mode arming).
     let (cal, cal_ok) = if CAL_ENABLED {
         warn!(
             "Mag: CALIBRATION STARTING — ROTATE THE DRONE through ALL orientations \

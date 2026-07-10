@@ -1,21 +1,12 @@
-//! PID controller cascade: rate → attitude → [altitude/position].
-//!
-//! The drone uses a two-stage angular cascade:
-//!   Outer loop (attitude):  setpoint angle → desired body rate
-//!   Inner loop (rate):      desired body rate → motor torque demand
-//!
-//! All loops run at 500 Hz from `control_task` in main.rs.
+//! PID controller cascade: outer attitude loop (angle to desired body rate) feeding
+//! an inner rate loop (rate to torque demand), 500 Hz from `control_task`.
 
 use crate::types::{AttitudeSetpoint, Euler, MotorOutputs, Vec3};
 
-// ---------------------------------------------------------------------------
 // Gyro low-pass filter (PT1)
-// ---------------------------------------------------------------------------
 
-/// First-order (PT1) low-pass on a 3-axis signal, applied to the gyro before the rate
-/// PID to attenuate motor-induced noise — especially on the D-term, which otherwise
-/// heats the motors and wrecks the tune. `cutoff_hz` trades noise rejection against
-/// added phase lag; ~80–100 Hz is typical for a 7" quad at a 500 Hz loop.
+/// First-order (PT1) low-pass applied to the gyro before the rate PID to attenuate
+/// motor noise on the D-term. cutoff_hz trades noise rejection against phase lag.
 #[derive(Clone, Copy)]
 pub struct LowPass3 {
     alpha: f32,
@@ -37,9 +28,7 @@ impl LowPass3 {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Single-axis PID state
-// ---------------------------------------------------------------------------
 
 pub struct Pid {
     kp: f32,
@@ -61,12 +50,9 @@ impl Pid {
                i_limit, output_limit }
     }
 
-    /// Run one PID step. `dt` in seconds.
-    ///
-    /// D acts on -Δmeasurement (no setpoint D-kick), recomputed only when the
-    /// measurement CHANGES (averaged over the static ticks) and held between —
-    /// loops often outrun their measurement source (100 Hz on 5 Hz GPS / 25 Hz
-    /// baro) and per-tick differencing would spike `step/dt` on each new sample.
+    /// Run one PID step. D acts on -d(measurement) (no setpoint kick), recomputed
+    /// only when the measurement changes and held between - per-tick differencing
+    /// would spike on slow sources (5 Hz GPS, 25 Hz baro).
     pub fn update(&mut self, setpoint: f32, measurement: f32, dt: f32) -> f32 {
         let error = setpoint - measurement;
 
@@ -89,7 +75,7 @@ impl Pid {
             self.prev_derivative = d;
             d
         } else {
-            // Measurement unchanged — hold the last derivative.
+            // Measurement unchanged - hold the last derivative.
             self.stale_ticks = self.stale_ticks.saturating_add(1);
             self.prev_derivative
         };
@@ -107,23 +93,20 @@ impl Pid {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Full three-axis PID cascade
-// ---------------------------------------------------------------------------
 
-/// Conservative first-flight starting values for a mid-size quad (~5", ~500 g).
-/// Tuning order: raise rate_Kp until oscillation, back off 30%, then add rate_Kd
-/// to damp, then rate_Ki for steady-state, then repeat for attitude loop.
+/// Conservative first-flight starting values for a mid-size quad. Tuning order:
+/// rate_Kp until oscillation, back off 30%, then rate_Kd, rate_Ki, then attitude.
 const DT: f32 = 1.0 / 500.0;
-const RATE_OUTPUT_LIMIT: f32 = 500.0; // rate PID ceiling; also used to normalise to ±1.0
+const RATE_OUTPUT_LIMIT: f32 = 500.0; // rate PID ceiling; also used to normalise to +/-1.0
 
 pub struct FlightPids {
-    // Outer attitude loop (angle → rate setpoint)
+    // Outer attitude loop (angle -> rate setpoint)
     pub att_roll:  Pid,
     pub att_pitch: Pid,
     pub att_yaw:   Pid,
 
-    // Inner rate loop (rate → torque)
+    // Inner rate loop (rate -> torque)
     pub rate_roll:  Pid,
     pub rate_pitch: Pid,
     pub rate_yaw:   Pid,
@@ -132,16 +115,14 @@ pub struct FlightPids {
 impl Default for FlightPids {
     fn default() -> Self {
         Self {
-            // Outer loop: angle error (rad) → rate setpoint (rad/s).
-            // Ki/Kd left at zero — P-only is sufficient for the attitude shell.
+            // Outer loop: angle error (rad) -> rate setpoint (rad/s).
+            // Ki/Kd left at zero - P-only is sufficient for the attitude shell.
             att_roll:   Pid::new(4.0, 0.0, 0.0, 100.0, 400.0),
             att_pitch:  Pid::new(4.0, 0.0, 0.0, 100.0, 400.0),
             att_yaw:    Pid::new(3.0, 0.0, 0.0, 100.0, 400.0),
 
-            // Inner loop: rate error (rad/s) → torque demand (→ normalised ±1.0).
-            // Kd on yaw omitted — gyro noise on z-axis amplifies into yaw chatter.
-            // i_limit = output_limit / Ki so the I-term alone cannot saturate the
-            // output (Ki × i_limit ≤ output_limit), preventing slow integral unwind.
+            // Inner loop: rate error -> torque demand. Kd on yaw omitted (z-gyro noise);
+            // i_limit = output_limit / Ki so the I-term alone can't saturate the output.
             rate_roll:  Pid::new(50.0, 30.0, 2.0,  16.0, RATE_OUTPUT_LIMIT),
             rate_pitch: Pid::new(50.0, 30.0, 2.0,  16.0, RATE_OUTPUT_LIMIT),
             rate_yaw:   Pid::new(70.0, 20.0, 0.0,  25.0, RATE_OUTPUT_LIMIT),
@@ -150,21 +131,20 @@ impl Default for FlightPids {
 }
 
 impl FlightPids {
-    /// Full cascade: attitude setpoint + current attitude + body rates → motor mix inputs.
-    ///
-    /// Returns (roll_torque, pitch_torque, yaw_torque) normalised ±1.0.
+    /// Full cascade: attitude setpoint + current attitude + body rates -> motor mix inputs.
+    /// Returns (roll_torque, pitch_torque, yaw_torque) normalised +/-1.0.
     pub fn update(
         &mut self,
         setpoint: &AttitudeSetpoint,
         attitude: &Euler,
         body_rate: Vec3,
     ) -> (f32, f32, f32) {
-        // --- Outer loop: angle error → rate setpoint ---
+        // --- Outer loop: angle error -> rate setpoint ---
         let roll_rate_sp  = self.att_roll.update(setpoint.roll,  attitude.roll,  DT);
         let pitch_rate_sp = self.att_pitch.update(setpoint.pitch, attitude.pitch, DT);
         let yaw_rate_sp   = setpoint.yaw_rate; // direct rate control on yaw
 
-        // --- Inner loop: rate error → torque demand ---
+        // --- Inner loop: rate error -> torque demand ---
         let roll_out  = self.rate_roll.update( roll_rate_sp,  body_rate.x, DT);
         let pitch_out = self.rate_pitch.update(pitch_rate_sp, body_rate.y, DT);
         let yaw_out   = self.rate_yaw.update(  yaw_rate_sp,   body_rate.z, DT);
@@ -178,18 +158,14 @@ impl FlightPids {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Altitude-hold PID — 100 Hz from navigation_task
-// ---------------------------------------------------------------------------
+// Altitude-hold PID - 100 Hz from navigation_task
 
 pub struct AltPid(Pid);
 
 impl AltPid {
     pub fn new() -> Self {
-        // 1 m error → 0.05 throttle nudge; slow integrator for steady hover.
-        // i_limit clamps the INTEGRAL (error·s), not the I output: Ki × 40
-        // = 0.2 throttle of I authority, enough to trim a hover-throttle
-        // mismatch from the 0.55 assumption without saturating the output.
+        // 1 m error -> 0.05 throttle nudge. i_limit clamps the INTEGRAL, not the
+        // I output: Ki x 40 = 0.2 throttle of I authority for hover-throttle trim.
         Self(Pid::new(0.05, 0.005, 0.10, 40.0, 0.4))
     }
 
@@ -203,23 +179,18 @@ impl AltPid {
     pub fn reset(&mut self) { self.0.reset(); }
 }
 
-// ---------------------------------------------------------------------------
-// Position-hold PID — one per horizontal axis (N and E), 100 Hz
-// ---------------------------------------------------------------------------
+// Position-hold PID - one per horizontal axis (N and E), 100 Hz
 
 pub struct PosPid(Pid);
 
 impl PosPid {
     pub fn new() -> Self {
-        // 1 m position error → 0.05 rad lean (~3°).  Gentle I term corrects
-        // slow wind drift; D damps oscillation around the hold point.
-        // Output is clamped to ±25° (0.436 rad = MAX_TILT_RAD in navigation).
-        // i_limit clamps the INTEGRAL: Ki × 75 = 0.15 rad (~8.6°) of I
-        // authority — enough to stand against steady wind.
+        // 1 m error -> 0.05 rad lean, clamped to MAX_TILT_RAD. i_limit clamps the
+        // INTEGRAL: Ki x 75 = 0.15 rad of I authority against steady wind.
         Self(Pid::new(0.05, 0.002, 0.08, 75.0, 0.436))
     }
 
-    /// `err_m`: (target − current) in metres along one NED body-frame axis.
+    /// `err_m`: (target - current) in metres along one NED body-frame axis.
     /// Returns a lean angle in radians; sign convention: positive = lean positive.
     pub fn update(&mut self, err_m: f32) -> f32 {
         const DT: f32 = 1.0 / 100.0;
@@ -231,20 +202,8 @@ impl PosPid {
     pub fn reset(&mut self) { self.0.reset(); }
 }
 
-// ---------------------------------------------------------------------------
-// Motor mixer — quad X configuration
-// ---------------------------------------------------------------------------
-//
-//   Front
-//  2(CCW) 1(CW)
-//  4(CW)  3(CCW)
-//   Back
-//
-//   Motor  Roll  Pitch  Yaw
-//     1    -1    +1     -1   (front-right, CW)
-//     2    +1    +1     +1   (front-left,  CCW)
-//     3    -1    -1     +1   (back-right,  CCW)
-//     4    +1    -1     -1   (back-left,   CW)
+// Motor mixer - quad X: M1 front-right CW, M2 front-left CCW,
+// M3 back-right CCW, M4 back-left CW.
 
 pub fn mix_quad_x(throttle: f32, roll: f32, pitch: f32, yaw: f32) -> MotorOutputs {
     let r1 = throttle - roll + pitch - yaw;

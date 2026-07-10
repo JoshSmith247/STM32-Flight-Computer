@@ -23,9 +23,7 @@ use types::FlightMode;
 use defmt::info;
 use {defmt_rtt as _};
 
-// ── Hardware watchdog ─────────────────────────────────────────────────────────
-// IWDG1 base: 0x5800_4800. LSI ≈ 32 kHz, prescaler /256 → ~125 Hz.
-// Reload 250 → timeout 2.0 s. Petted by control_task every 250 ticks (0.5 s).
+// Hardware watchdog (IWDG1): 2.0 s timeout, petted by control_task every 0.5 s.
 // Any hang longer than 2 s triggers a hardware reset.
 fn init_watchdog() {
     unsafe {
@@ -50,16 +48,12 @@ pub static STATE: types::SharedState = types::SharedState::new();
 pub static SAFETY_PIN_INSTALLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(true);
 
-/// Remove-before-flight pin gate — DISABLED 2026-07-09 for bench bring-up (no
-/// jumper hardware fitted). Set true and fit the PA0→GND jumper before field
-/// flights: jumper OUT (pin open/high) = clear to arm.
+/// Remove-before-flight pin gate - DISABLED 2026-07-09 for bench bring-up.
+/// WARNING: Set true and fit the PA0->GND jumper before field flights.
 pub const SAFETY_PIN_ENABLED: bool = false;
 
-/// Whether the RC gates (arm switch, throttle-low, failsafe kill) are in
-/// force. Always true in normal builds. Under `rc-optional` (radio lost),
-/// false until an SBUS link has been seen this boot — an absent receiver
-/// cannot gate MAVLink arming or kill motors, but one that HAS been seen
-/// keeps full authority, including mid-flight link-loss motor cut.
+/// Whether the RC gates (arm switch, throttle-low, failsafe kill) are in force.
+/// Always true normally; under `rc-optional`, false until SBUS has been seen this boot.
 pub fn rc_gates_active() -> bool {
     #[cfg(feature = "rc-optional")]
     return sensors::rc::RC_EVER_SEEN.load(core::sync::atomic::Ordering::Relaxed);
@@ -87,6 +81,12 @@ pub async fn pre_arm_check(mode: FlightMode) -> Result<(), &'static str> {
         return Err("IMU not healthy");
     }
     if mode_needs_baro && !health.baro_ok {
+        // range-alt: a usable rangefinder satisfies the gate in place of the dead baro.
+        #[cfg(feature = "range-alt")]
+        if !STATE.flow.lock().await.usable() {
+            return Err("no altitude source (baro dead, rangefinder not usable)");
+        }
+        #[cfg(not(feature = "range-alt"))]
         return Err("mode requires a live barometer");
     }
     if mode_needs_gps && !health.gps_ok {
@@ -102,7 +102,7 @@ pub async fn pre_arm_check(mode: FlightMode) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Shared SPI1 bus — IMU (CS=PA4) and baro (CS=PA8) are both on this bus.
+/// Shared SPI1 bus - IMU (CS=PA4) and baro (CS=PA8) are both on this bus.
 /// Initialised in main() before any task is spawned.
 pub type SpiBus = Spi<'static, Async, spi::mode::Master>;
 pub static SPI1_BUS: Mutex<CriticalSectionRawMutex, Option<SpiBus>> = Mutex::new(None);
@@ -112,7 +112,7 @@ bind_interrupts!(pub struct Irqs {
     USART2       => embassy_stm32::usart::InterruptHandler<embassy_stm32::peripherals::USART2>;
     USART3       => embassy_stm32::usart::InterruptHandler<embassy_stm32::peripherals::USART3>;
     UART4        => embassy_stm32::usart::InterruptHandler<embassy_stm32::peripherals::UART4>;
-    //SPI1       => embassy_stm32::spi::InterruptHandler<embassy_stm32::peripherals::SPI1>;
+    //SPI1 => embassy_stm32::spi::InterruptHandler<embassy_stm32::peripherals::SPI1>;
     DMA1_STREAM1 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH1>;
     DMA1_STREAM2 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH2>;
     DMA1_STREAM3 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH3>;
@@ -123,7 +123,7 @@ bind_interrupts!(pub struct Irqs {
     DMA2_STREAM6 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA2_CH6>;
 });
 
-/// 500 Hz control loop: AHRS fusion → PID cascade → motor mix → STATE.motor_outputs.
+/// 500 Hz control loop: AHRS fusion -> PID cascade -> motor mix -> STATE.motor_outputs.
 #[embassy_executor::task]
 async fn control_task() {
     use ahrs::MadgwickFilter;
@@ -132,7 +132,7 @@ async fn control_task() {
     // Gyro low-pass cutoff for the rate loop (attenuates motor noise on the D-term).
     const GYRO_LPF_HZ: f32 = 90.0;
     // Crash/tumble cutoff: disarm if |roll| or |pitch| exceeds this for CRASH_TICKS.
-    const CRASH_ANGLE_RAD: f32 = 1.31;   // ~75°
+    const CRASH_ANGLE_RAD: f32 = 1.31;   // ~75 deg
     const CRASH_TICKS: u32 = 100;        // 0.2 s sustained @ 500 Hz
 
     let mut filter = MadgwickFilter::new(0.1, 1.0 / 500.0);
@@ -145,7 +145,7 @@ async fn control_task() {
     loop {
         ticker.next().await;
         wdg_tick += 1;
-        if wdg_tick % 250 == 0 {   // every 0.5 s at 500 Hz — well within 2 s timeout
+        if wdg_tick % 250 == 0 {   // every 0.5 s at 500 Hz - well within 2 s timeout
             crate::pet_watchdog();
         }
 
@@ -164,7 +164,7 @@ async fn control_task() {
             rc.to_attitude_setpoint()
         };
 
-        // usable() = calibrated AND fresh — never fuse a stale compass snapshot.
+        // usable() = calibrated AND fresh - never fuse a stale compass snapshot.
         let quat = if mag.usable() {
             filter.update_with_mag(
                 imu.gyro, imu.accel,
@@ -176,22 +176,18 @@ async fn control_task() {
         *STATE.attitude.lock().await = quat;
         let euler = filter.euler();
 
-        // Bench IMU bring-up: ~2 Hz attitude readout — tilt the board and watch
-        // roll/pitch/yaw track to confirm IMU axes + fusion. Bench build only.
-        // yawNED is the NED heading (ahrs::ned_yaw): 0 = North, CW-positive —
-        // the bench acceptance test "yaw increases rotating clockwise from
-        // above" checks THIS value, not the raw (CCW-positive) Madgwick yaw.
+        // Bench IMU bring-up: ~2 Hz attitude readout. yawNED is the NED heading
+        // (0 = North, CW-positive), not the raw CCW-positive Madgwick yaw.
         #[cfg(feature = "nucleo-vcp")]
         if wdg_tick % 250 == 0 {
             const R2D: f32 = 180.0 / core::f32::consts::PI;
-            // velD: estimator NED down-velocity (m/s) — the lift acceptance
-            // test wants this clearly NEGATIVE while raising the board.
+            // velD: estimator NED down-velocity - clearly NEGATIVE while raising the board.
             let est = *STATE.pos_estimate.lock().await;
             info!("ATT  roll={=f32}deg  pitch={=f32}deg  yawNED={=f32}deg  velD={=f32}m/s",
                   euler.roll * R2D, euler.pitch * R2D, ahrs::ned_yaw(&quat) * R2D, est.vel_d);
         }
 
-        // Crash/tumble cutoff: sustained extreme tilt while armed → kill motors, latch Fault.
+        // Crash/tumble cutoff: sustained extreme tilt while armed -> kill motors, latch Fault.
         if is_armed && (euler.roll.abs() > CRASH_ANGLE_RAD || euler.pitch.abs() > CRASH_ANGLE_RAD) {
             crash_ticks += 1;
             if crash_ticks > CRASH_TICKS {
@@ -215,6 +211,12 @@ async fn control_task() {
             continue;
         }
 
+        // Ground/idle anti-windup: on the ground the rate integrals wind to their
+        // clamps and pin one motor at full scale (observed props-off 2026-07-09).
+        // Autonomous throttle is alt_pid-clamped >= 0.1, so this never fires in flight.
+        if setpoint.throttle < 0.05 {
+            pids.reset_all();
+        }
         let (roll_out, pitch_out, yaw_out) = pids.update(&setpoint, &euler, gyro_f);
         let outputs = mix_quad_x(setpoint.throttle, roll_out, pitch_out, yaw_out);
         *STATE.motor_outputs.lock().await = outputs;
@@ -229,15 +231,9 @@ async fn control_task() {
     }
 }
 
-/// 50 Hz: arm/disarm via RC switch (Ch5 > mid), throttle-low interlock.
-///
-/// Arm requires: switch HIGH + throttle < 5 % + no failsafe + not Fault +
-/// pre_arm_check(). Disarm (switch LOW or failsafe) is honoured in EVERY
-/// state including Fault — the pilot's switch is an absolute kill.
-///
-/// `safety_pin`: remove-before-flight jumper (PA0→GND, pull-up: inserted =
-/// LOW = arm denied). Gates only the disarmed→armed transition — never
-/// checked in flight, so a flaky wire can't force a mid-air disarm.
+/// 50 Hz arm/disarm via RC switch. Disarm is honoured in EVERY state including
+/// Fault - the pilot's switch is an absolute kill. `safety_pin` (RBF jumper)
+/// gates only the disarmed->armed transition, never checked in flight.
 #[embassy_executor::task]
 async fn arming_task(safety_pin: Input<'static>) {
     use core::sync::atomic::Ordering;
@@ -269,10 +265,8 @@ async fn arming_task(safety_pin: Input<'static>) {
                 }
                 info!("Disarmed");
             } else if state::get() == FlightState::Armed {
-                // Promote Armed → Flying once real power is applied — pilot stick
-                // OR autonomous throttle. Without the autonomous term an Auto
-                // takeoff flies in state Armed, and the MAVLink disarm handler's
-                // in-air guard (Flying|Landing) would not protect it.
+                // Promote Armed -> Flying once real power is applied (pilot stick OR
+                // autonomous throttle, so an Auto takeoff gets the in-air disarm guard).
                 let nav = *STATE.nav_command.lock().await;
                 if rc.throttle > 0.15
                     || (nav.autonomous && nav.attitude_setpoint.throttle > 0.15)
@@ -312,10 +306,8 @@ async fn main(spawner: Spawner) {
     
     use embassy_stm32::rcc::*;
 
-    // SupplyConfig::Default writes SDEN=1 LDOEN=1, which is identical to the
-    // H723 POR reset value — making it a no-op and keeping ACTVOSRDY asserted.
-    // Any other SupplyConfig variant writes a different CR3 value, drops
-    // ACTVOSRDY, and hangs Embassy's init loop. CR3 is write-once per POR.
+    // SupplyConfig::Default matches the H723 POR value. Any other variant drops
+    // ACTVOSRDY and hangs Embassy's init loop (CR3 is write-once per POR).
     config.rcc.supply_config = SupplyConfig::Default;
     config.rcc.voltage_scale = VoltageScale::Scale1;
 
@@ -324,34 +316,30 @@ async fn main(spawner: Spawner) {
 
     config.rcc.pll1 = Some(Pll {
         source: PllSource::Hsi,
-        prediv: PllPreDiv::Div4,    // 64 MHz / 4  = 16 MHz
-        mul:    PllMul::Mul50,      // 16 MHz × 50 = 800 MHz VCO
-        divp:   Some(PllDiv::Div2), // 800 / 2 = 400 MHz → SYSCLK
-        divq:   Some(PllDiv::Div8), // 800 / 8 = 100 MHz → SPI/FDCAN
+        prediv: PllPreDiv::Div4,    // 64 MHz / 4 = 16 MHz
+        mul:    PllMul::Mul50,      // 16 MHz x 50 = 800 MHz VCO
+        divp:   Some(PllDiv::Div2), // 800 / 2 = 400 MHz -> SYSCLK
+        divq:   Some(PllDiv::Div8), // 800 / 8 = 100 MHz -> SPI/FDCAN
         divr:   None,
     });
 
     config.rcc.sys      = Sysclk::Pll1P;         // SYSCLK = 400 MHz
-    config.rcc.ahb_pre  = AHBPrescaler::Div2;    // HCLK   = 200 MHz
-    config.rcc.apb1_pre = APBPrescaler::Div2;    // APB1   = 100 MHz → TIM3 timer = 200 MHz
-    config.rcc.apb2_pre = APBPrescaler::Div2;    // APB2   = 100 MHz
-    config.rcc.apb3_pre = APBPrescaler::Div2;    // APB3   = 100 MHz
-    config.rcc.apb4_pre = APBPrescaler::Div2;    // APB4   = 100 MHz
+    config.rcc.ahb_pre  = AHBPrescaler::Div2;    // HCLK = 200 MHz
+    config.rcc.apb1_pre = APBPrescaler::Div2;    // APB1 = 100 MHz -> TIM3 timer = 200 MHz
+    config.rcc.apb2_pre = APBPrescaler::Div2;    // APB2 = 100 MHz
+    config.rcc.apb3_pre = APBPrescaler::Div2;    // APB3 = 100 MHz
+    config.rcc.apb4_pre = APBPrescaler::Div2;    // APB4 = 100 MHz
 
-    // ADC kernel clock from per_ck (HSI) — without it ADC conversions never complete.
-    // ⚠ Calibrate V_DIVIDER (battery.rs) at bring-up before trusting the low-battery
-    // failsafe: a wrong reading reads "critical" and forces RTH/Land.
+    // ADC kernel clock from per_ck (HSI) - without it ADC conversions never complete.
     config.rcc.mux.adcsel = mux::Adcsel::Per;
 
-    // IWDG runs off the LSI, independent of RCC — start it BEFORE embassy init
-    // so a hang inside init (e.g. wrong SupplyConfig) resets instead of bricking.
-    // Petted ONLY by control_task; individual sensor-task deaths are covered by
-    // health_task freshness flags, not the watchdog.
+    // Start the IWDG BEFORE embassy init so a hang inside init resets instead of
+    // bricking. Petted ONLY by control_task; health_task covers sensor-task deaths.
     init_watchdog();
 
     let p = embassy_stm32::init(config);
 
-    // Initialise shared SPI1 bus before spawning — 12.5 MHz, Mode 0 works for
+    // Initialise shared SPI1 bus before spawning - 12.5 MHz, Mode 0 works for
     // both ICM-42688-P (max 24 MHz) and MS5611 (max 20 MHz).
     {
         let mut spi_cfg = spi::Config::default();
@@ -373,11 +361,11 @@ async fn main(spawner: Spawner) {
     #[cfg(feature = "nucleo")]
     let led = Output::new(p.PE1, Level::Low, Speed::Low);
 
-    // Remove-before-flight pin: PA0→GND jumper, internal pull-up.
+    // Remove-before-flight pin: PA0->GND jumper, internal pull-up.
     // Removed (open) = HIGH = clear to arm; installed (shorted) = LOW = denied.
     let safety_pin = Input::new(p.PA0, Pull::Up);
 
-    // Gripper-jaw microswitch (PC2 → GND, closed = weed held = LOW). Read by
+    // Gripper-jaw microswitch (PC2 -> GND, closed = weed held = LOW). Read by
     // navigation_task's grip check under `--features grip-sense`.
     let grip_pin = Input::new(p.PC2, Pull::Up);
 
@@ -385,7 +373,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(sensors::imu::imu_task(p.PA4).unwrap());
     #[cfg(not(feature = "pin-test"))]
     spawner.spawn(actuators::motor::motor_task(p.TIM3, p.PB4, p.PB5, p.PB0, p.PB1).unwrap());
-    // pin-test: motor pins as plain GPIO for DMM continuity checks — nothing spins.
+    // pin-test: motor pins as plain GPIO for DMM continuity checks - nothing spins.
     #[cfg(feature = "pin-test")]
     spawner.spawn(actuators::motor::pin_test_task(p.PB4, p.PB5, p.PB0, p.PB1).unwrap());
     spawner.spawn(sensors::rc::rc_task(p.USART2, p.PA2, p.PA3, p.DMA1_CH5, Irqs).unwrap());
@@ -398,14 +386,14 @@ async fn main(spawner: Spawner) {
     spawner.spawn(sensors::baro::baro_task(p.PA8).unwrap());
     spawner.spawn(sensors::gps::gps_task(p.USART1, p.PA10, p.PA9, p.DMA2_CH6, p.DMA2_CH5, Irqs).unwrap());
     // Battery monitor (ADC3: PC0 = pack divider, PF3 = ESC CUR pad).
-    // Bench with no pack reads ~0 V → "critical" (arming blocked).
+    // Bench with no pack reads ~0 V -> "critical" (arming blocked).
     spawner.spawn(sensors::battery::battery_task(p.ADC3, p.PC0, p.PF3).unwrap());
     spawner.spawn(navigation::navigation_task(grip_pin).unwrap());
     spawner.spawn(estimator::estimator_task().unwrap());
     spawner.spawn(health::health_task().unwrap());
     spawner.spawn(control_task().unwrap());
     spawner.spawn(arming_task(safety_pin).unwrap());
-    // Flow (MTF-02P): safe unwired — flow.valid stays false, consumers fall back to GPS/baro.
+    // Flow (MTF-02P): safe unwired - flow.valid stays false, consumers fall back to GPS/baro.
     spawner.spawn(sensors::flow::flow_task(p.UART4, p.PC11, p.DMA1_CH2, Irqs).unwrap());
     spawner.spawn(actuators::payloads::servo::servo_task(p.TIM4, p.PD12, p.PD13, p.PD14, p.PD15).unwrap());
     spawner.spawn(sensors::mag::mag_task(p.I2C1, p.PB8, p.PB9).unwrap());
@@ -424,12 +412,11 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
         // Explicit zero-throttle DSHOT frame so ESCs stop without waiting for
         // signal-loss timeout (drains/aborts any in-flight DMA first).
         actuators::motor::emergency_stop();
-        // Turn off the status LED via BSRR (+0x18, offset(6)) — atomic set/reset,
-        // can't clobber other pins on the port. H7 GPIO bases are 0x5802_xxxx
-        // (AHB4) — never F4-era 0x4002_xxxx. Update if the LED pin moves.
-        #[cfg(not(feature = "nucleo"))] // custom FC: PG7 active-low → set HIGH = off
+        // LED off via BSRR (atomic, can't clobber other pins). H7 GPIO bases are
+        // 0x5802_xxxx (AHB4), never F4-era 0x4002_xxxx. Update if the LED pin moves.
+        #[cfg(not(feature = "nucleo"))] // custom FC: PG7 active-low -> set HIGH = off
         let (gpio_base, bsrr) = (0x5802_1800u32, 1u32 << 7);
-        #[cfg(feature = "nucleo")]      // Nucleo: PE1 active-high → reset LOW = off
+        #[cfg(feature = "nucleo")]      // Nucleo: PE1 active-high -> reset LOW = off
         let (gpio_base, bsrr) = (0x5802_1000u32, 1u32 << (1 + 16));
         (gpio_base as *mut u32).offset(6).write_volatile(bsrr);
     }

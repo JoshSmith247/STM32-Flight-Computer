@@ -21,9 +21,9 @@ try:
     ]
 
     # Multiply physical OpenCV font_scale by this to get PIL point size.
-    # Calibrated so 0.40*PR ≈ 16pt ≈ same cap-height as OpenCV Hershey at 0.40*PR.
+    # Calibrated so 0.40*PR ~ 16pt ~ same cap-height as OpenCV Hershey at 0.40*PR.
     _PT = 20
-    # Minimum safe point size — Helvetica.ttc raises division-by-zero below ~9pt.
+    # Minimum safe point size - Helvetica.ttc raises division-by-zero below ~9pt.
     _PT_MIN = 10
 
     _cache: dict[int, ImageFont.FreeTypeFont] = {}
@@ -67,7 +67,7 @@ try:
         """Render all queued text onto panel via PIL FreeType in one pass."""
         if not _q:
             return
-        img  = _Img.fromarray(panel[:, :, ::-1])   # BGR→RGB, no copy
+        img  = _Img.fromarray(panel[:, :, ::-1])   # BGR->RGB, no copy
         draw = ImageDraw.Draw(img)
         for item in _q:
             text, x, y, pt, rgb, font_scale = item

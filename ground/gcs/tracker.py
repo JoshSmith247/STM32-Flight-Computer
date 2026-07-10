@@ -12,7 +12,7 @@ class WeedTracker:
     def __init__(self):
         self._prev_gray = None
         self._exg_boxes: list = []
-        self._named: dict[int, dict] = {}  # weed_id → {box, template, pts, lost_frames, world_pos}
+        self._named: dict[int, dict] = {}  # weed_id -> {box, template, pts, lost_frames, world_pos}
         self._next_id = 1
         self._pending_click: tuple[int, int] | None = None
         self._frame_size: tuple[int, int] | None = None
@@ -21,7 +21,7 @@ class WeedTracker:
     def set_frame_size(self, w: int, h: int) -> None:
         self._frame_size = (w, h)
 
-    # ── Named-weed tracking ──────────────────────────────────────────────────
+    # Named-weed tracking
 
     def _tmatch_one(self, template: np.ndarray, frame: np.ndarray, box: tuple) -> float:
         """Normalized cross-correlation between one template and a candidate blob."""
@@ -87,9 +87,8 @@ class WeedTracker:
             return
         claimed = set()
 
-        # Pass 1 — optical flow predicts new position; ExG center check confirms it.
-        # The predicted box is NOT written back unless its center lands inside a blob,
-        # so a drifting flow can't silently claim an unrelated green patch.
+        # Pass 1 - optical flow predicts new position; the box is only written back
+        # if its center lands inside an ExG blob, so drift can't claim a random patch.
         for wid, w in self._named.items():
             # Predict where the box moved this frame
             prop_box = w['box']
@@ -134,15 +133,13 @@ class WeedTracker:
                 w['lost_frames'] = 0
                 claimed.add(best_blob)
             else:
-                # No confirmed blob — freeze box at last known position and clear flow
+                # No confirmed blob - freeze box at last known position and clear flow
                 # points so drift doesn't accumulate while the weed is out of view.
                 w['pts'] = None
                 w['lost_frames'] += 1
 
-        # Pass 2 — re-identification for lost named weeds.
-        # World position gates candidates to blobs within WORLD_REMATCH_DIST metres;
-        # template matching then picks the best among those (graceful fallback when
-        # no GPS fix is available: all blobs are considered).
+        # Pass 2 - re-identification for lost named weeds: world position gates
+        # candidates, template matching picks the best (all blobs when no GPS).
         for wid, w in self._named.items():
             if w['lost_frames'] == 0:
                 continue
@@ -162,9 +159,8 @@ class WeedTracker:
                         if dist > config.WORLD_REMATCH_DIST:
                             continue   # too far in the world
                         world_confirmed = True
-                # GPS-confirmed candidates need only a loose template sanity check;
-                # without GPS, template matching is the only discriminator so we
-                # require a stricter score to avoid cross-ID between similar weeds.
+                # GPS-confirmed candidates need only a loose template check; without
+                # GPS a stricter score avoids cross-ID between similar weeds.
                 thresh = config.REMATCH_THRESH_GPS if world_confirmed else config.REMATCH_THRESH
                 score  = self._tmatch(w['templates'], frame, box)
                 if score > thresh:
@@ -191,7 +187,7 @@ class WeedTracker:
             print(f"Re-identified W{wid} (score={best_score:.2f})", flush=True)
         self._prev_gray = gray
 
-    # ── Click handling ───────────────────────────────────────────────────────
+    # Click handling
 
     def queue_click(self, x: int, y: int) -> None:
         """Store click coordinates; resolved with the live frame in process_click()."""
@@ -204,7 +200,7 @@ class WeedTracker:
         x, y = self._pending_click
         self._pending_click = None
 
-        # Click a named weed → remove it
+        # Click a named weed -> remove it
         for wid in list(self._named):
             x1, y1, x2, y2 = self._named[wid]['box']
             if x1 <= x <= x2 and y1 <= y <= y2:
@@ -214,7 +210,7 @@ class WeedTracker:
                     self._selected_wid = None
                 return
 
-        # Click an unnamed ExG blob → assign next ID
+        # Click an unnamed ExG blob -> assign next ID
         named_boxes = {w['box'] for w in self._named.values()}
         for box in self._exg_boxes:
             if box in named_boxes:
@@ -224,18 +220,18 @@ class WeedTracker:
                 self._name_box(box, frame)
                 return
 
-    # ── ExG list update ──────────────────────────────────────────────────────
+    # ExG list update
 
     def update_exg(self, boxes: list) -> None:
         self._exg_boxes = boxes
 
-    # ── Rendering ────────────────────────────────────────────────────────────
+    # Rendering
 
     def draw(self, frame: np.ndarray, exg_boxes: list) -> np.ndarray:
         out = frame.copy()
         named_boxes = {w['box'] for w in self._named.values()}
 
-        # Named weeds — red when selected, teal when active, grey when lost
+        # Named weeds - red when selected, teal when active, grey when lost
         for wid, w in self._named.items():
             x1, y1, x2, y2 = w['box']
             active   = w['lost_frames'] == 0
@@ -252,7 +248,7 @@ class WeedTracker:
             cv2.putText(out, label, (x1 + 3, y1 - 3),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
 
-        # Unnamed ExG blobs — orange
+        # Unnamed ExG blobs - orange
         for box in exg_boxes:
             if box in named_boxes:
                 continue

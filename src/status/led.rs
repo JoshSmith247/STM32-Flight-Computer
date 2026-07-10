@@ -1,5 +1,4 @@
-//! Status LED — blink patterns per FlightState.
-//!
+//! Status LED - blink patterns per FlightState.
 //! Custom FC: PG7, active-LOW. Nucleo (`--features nucleo`): LD2/PE1, active-HIGH.
 
 use embassy_stm32::gpio::Output;
@@ -22,14 +21,14 @@ pub async fn led_task(mut led: Output<'static>) {
     loop {
         match state::get() {
             FlightState::Idle => {
-                // Slow blink — 1 Hz
+                // Slow blink - 1 Hz
                 led_on(&mut led);
                 Timer::after(Duration::from_millis(500)).await;
                 led_off(&mut led);
                 Timer::after(Duration::from_millis(500)).await;
             }
             FlightState::Arming => {
-                // Fast blink — 5 Hz
+                // Fast blink - 5 Hz
                 led_on(&mut led);
                 Timer::after(Duration::from_millis(100)).await;
                 led_off(&mut led);

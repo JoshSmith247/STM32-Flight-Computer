@@ -15,17 +15,12 @@ try:
 except ImportError:
     _HAVE_MAVLINK = False
 
-# ---------------------------------------------------------------------------
-# Weed target sender — UDP to Pi weed_pilot.py
-# ---------------------------------------------------------------------------
+# Weed target sender - UDP to Pi weed_pilot.py
 
 _target_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-# ---------------------------------------------------------------------------
-# GCS → STM32 command sender
-# ---------------------------------------------------------------------------
-# Builds a minimal MAVLink v2 COMMAND_LONG frame and sends it as UDP to the
-# Pi's GCS port; the Pi's _gcs_to_serial thread relays it to the STM32.
+# GCS to STM32 command sender: minimal MAVLink v2 COMMAND_LONG frames sent as
+# UDP to the Pi's GCS port, relayed to the STM32 by _gcs_to_serial.
 
 _cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 _cmd_seq  = 0
@@ -43,7 +38,7 @@ def _cmd_crc(data: bytes, extra: int) -> int:
 def send_mavlink_command(cmd: int, param1: float = 0.0, param2: float = 0.0) -> None:
     """Send MAVLink v2 COMMAND_LONG to the STM32 via the Pi serial relay."""
     global _cmd_seq
-    # payload: 7×f32 params + u16 cmd + target_sys + target_comp + confirmation
+    # payload: 7xf32 params + u16 cmd + target_sys + target_comp + confirmation
     payload = struct.pack('<7fH', param1, param2, 0.0, 0.0, 0.0, 0.0, 0.0, cmd)
     payload += bytes([1, 1, 0])          # target_sys=1, target_comp=1, confirmation=0
     n      = len(payload)                # 33 bytes
@@ -119,12 +114,8 @@ def send_weed_target(wid: int, east_m: float, north_m: float) -> None:
         print(f"UDP send failed: {exc}", flush=True)
 
 
-# ---------------------------------------------------------------------------
-# MAVLink position receiver
-# ---------------------------------------------------------------------------
-# Receives GLOBAL_POSITION_INT + ATTITUDE from the drone in a background thread.
-# pixel_to_world() uses the latest fix to project pixel centroids to local ENU metres,
-# giving each named weed a world-frame position that survives it leaving the frame.
+# MAVLink position receiver: GLOBAL_POSITION_INT + ATTITUDE in a background thread.
+# pixel_to_world() projects pixel centroids to local ENU metres using the latest fix.
 
 _mav_lock  = threading.Lock()
 _mav_state: dict = {
@@ -143,11 +134,11 @@ _mav_state: dict = {
     'payload_flags':  0,   # connected payload bitmask [31:16]
     # GPS_RAW_INT fix quality (0=no GPS, 1=no fix, 2=2D, 3=3D, 4+=DGPS/RTK)
     'gps_fix_type':   0,
-    # VFR_HUD collective throttle percentage (0–100)
+    # VFR_HUD collective throttle percentage (0-100)
     'throttle_pct':   0,
     # SYS_STATUS onboard_control_sensors_health bitmask (0 = not yet received)
     'sensors_health': 0,
-    # Last COMMAND_ACK received — (cmd_id, result_code); consumed by draw_stats_panel
+    # Last COMMAND_ACK received - (cmd_id, result_code); consumed by draw_stats_panel
     'last_ack': None,
 }
 
@@ -174,7 +165,7 @@ def _mav_listener() -> None:
             if msg.get_type() == 'GLOBAL_POSITION_INT':
                 lat = msg.lat / 1e7
                 lon = msg.lon / 1e7
-                alt = max(0.3, msg.relative_alt / 1000.0)   # mm → m, clamp
+                alt = max(0.3, msg.relative_alt / 1000.0)   # mm -> m, clamp
                 if _mav_state['origin'] is None:
                     _mav_state['origin'] = (lat, lon)
                 _mav_state.update(lat=lat, lon=lon, alt=alt,
@@ -268,15 +259,14 @@ def pixel_to_world(px: float, py: float,
             _mav_state['origin'], _mav_state['roll'], _mav_state['pitch'],
         )
 
-    # Pixel ray in body frame (x=forward, y=right, z=down — NED body convention).
-    # The frame is displayed after a 90° CW rotation, so the camera's physical HFOV axis
-    # (original width) now spans frame_h pixels — use frame_h for the focal length.
+    # Pixel ray in NED body frame. The frame is displayed after a 90-deg CW rotation,
+    # so the camera's physical HFOV axis spans frame_h pixels - use frame_h for focal length.
     fx = (frame_h / 2) / math.tan(math.radians(config.CAM_HFOV / 2))
     dx = -(py - frame_h / 2) / fx   # forward (body X)
     dy =  (px - frame_w / 2) / fx   # rightward (body Y)
     dz = 1.0                          # downward (body Z)
 
-    # Rotate body ray to NED earth frame using ZYX Euler (roll → pitch → yaw)
+    # Rotate body ray to NED earth frame using ZYX Euler (roll -> pitch -> yaw)
     cr, sr = math.cos(roll),  math.sin(roll)
     cp, sp = math.cos(pitch), math.sin(pitch)
     cy, sy = math.cos(yaw),   math.sin(yaw)
@@ -285,15 +275,15 @@ def pixel_to_world(px: float, py: float,
     dx1, dy1, dz1 = dx, cr*dy - sr*dz, sr*dy + cr*dz
     # Apply pitch around body Y
     dx2, dy2, dz2 = cp*dx1 + sp*dz1, dy1, -sp*dx1 + cp*dz1
-    # Apply yaw around body Z → NED earth frame
+    # Apply yaw around body Z -> NED earth frame
     ned_n, ned_e, ned_d = cy*dx2 - sy*dy2, sy*dx2 + cy*dy2, dz2
 
     # Convert NED ray to ENU: E=NED-E, N=NED-N, U=-NED-D
     ray_e, ray_n, ray_u = ned_e, ned_n, -ned_d
 
     # Intersect ray with ground plane (ENU Z=0, drone at Z=alt).
-    # Solve: alt + t * ray_u = 0  →  t = -alt / ray_u
-    if abs(ray_u) < 1e-6:   # ray nearly horizontal — no valid intersection
+    # Solve: alt + t * ray_u = 0 -> t = -alt / ray_u
+    if abs(ray_u) < 1e-6:   # ray nearly horizontal - no valid intersection
         return None
     t = -alt / ray_u        # positive when ray_u < 0 (pointing down)
 
@@ -308,9 +298,7 @@ def pixel_to_world(px: float, py: float,
     return drone_e + east_offset, drone_n + north_offset
 
 
-# ---------------------------------------------------------------------------
 # Telemetry logger
-# ---------------------------------------------------------------------------
 
 _LOG_INTERVAL = 0.5   # seconds between rows (2 Hz)
 

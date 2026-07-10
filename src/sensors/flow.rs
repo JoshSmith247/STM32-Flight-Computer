@@ -1,30 +1,6 @@
-//! MicoAir MTF-02P optical flow + rangefinder — UART4 RX-only, 115200 baud,
-//! MICOLINK protocol (select via the jumper on the module / MicoAssistant).
-//!
-//! MICOLINK frame:
-//!   0xEF dev_id sys_id msg_id seq len payload[len] checksum
-//!   checksum = wrapping u8 sum of every byte from 0xEF through the payload.
-//!
-//! Range/flow message: msg_id 0x51, len 20, little-endian payload:
-//!   @0  time_ms      u32
-//!   @4  distance_mm  u32   0 = invalid
-//!   @8  strength     u8
-//!   @9  precision    u8
-//!   @10 dis_status   u8
-//!   @11 (reserved)   u8
-//!   @12 flow_vel_x   i16   cm/s at 1 m height (angular rate ×100)
-//!   @14 flow_vel_y   i16   cm/s at 1 m height
-//!   @16 flow_quality u8    0–255
-//!   @17 flow_status  u8
-//!   @18 (reserved)   u16
-//!
-//! Flow scale: 1 cm/s @ 1 m = 0.01 rad/s = 10_000 µrad/s (FlowData is µrad/s;
-//! consumers multiply by height and divide by 1e6 for m/s). Streams at 50 Hz.
-//!
-//! ⚠ BRING-UP: verify flow axis polarity vs body forward/right after mounting
-//! (hold at fixed height, translate the airframe, check the sign in defmt).
-//!
-//! Pinout: PC11 = UART4 RX (AF8). No TX needed.
+//! MicoAir MTF-02P optical flow + rangefinder - UART4 RX-only (PC11), 115200 baud,
+//! MICOLINK protocol, 50 Hz. Parses the msg 0x51 range/flow frame into FlowData.
+//! WARNING: BRING-UP: verify flow axis polarity vs body forward/right after mounting.
 
 use defmt::{info, warn};
 use embassy_stm32::{
@@ -42,7 +18,7 @@ const RANGE_FLOW_LEN:     usize = 20;
 const MAX_PAYLOAD:        usize = 64;
 const QUALITY_THRESHOLD:  u8 = 50;
 
-// cm/s @ 1 m → µrad/s
+// cm/s @ 1 m -> urad/s
 const FLOW_SCALE: i32 = 10_000;
 
 #[embassy_executor::task]
@@ -59,7 +35,7 @@ pub async fn flow_task(
         .expect("UART4 (optical flow) init failed");
 
     // Ring-buffered DMA RX so frames aren't dropped between reads.
-    // 256 B ≈ 22 ms of slack @ 115200 baud (50 Hz × 27 B frames).
+    // 256 B ~ 22 ms of slack @ 115200 baud (50 Hz x 27 B frames).
     let mut rx_ring = [0u8; 256];
     let mut rx = rx.into_ring_buffered(&mut rx_ring);
 
@@ -71,23 +47,23 @@ pub async fn flow_task(
     let mut cksum   = [0u8; 1];
 
     loop {
-        // ── sync on header byte ─────────────────────────────────────────────
+        // sync on header byte
         match with_timeout(Duration::from_millis(500), super::read_exact_ring(&mut rx, &mut byte)).await {
             Ok(Ok(())) if byte[0] == MICOLINK_HEAD => {}
             _ => continue,
         }
 
-        // ── dev_id / sys_id / msg_id / seq / len ────────────────────────────
+        // dev_id / sys_id / msg_id / seq / len
         if with_timeout(Duration::from_millis(20), super::read_exact_ring(&mut rx, &mut hdr)).await != Ok(Ok(())) {
             continue;
         }
         let msg_id = hdr[2];
         let len    = hdr[4] as usize;
         if len > MAX_PAYLOAD {
-            continue; // bogus length from a false sync — resync
+            continue; // bogus length from a false sync - resync
         }
 
-        // ── payload + checksum ──────────────────────────────────────────────
+        // payload + checksum
         if with_timeout(Duration::from_millis(20), super::read_exact_ring(&mut rx, &mut payload[..len])).await != Ok(Ok(())) {
             continue;
         }
@@ -104,7 +80,7 @@ pub async fn flow_task(
         }
 
         if msg_id != MSG_ID_RANGE_FLOW || len != RANGE_FLOW_LEN {
-            continue; // other MICOLINK traffic — ignore
+            continue; // other MICOLINK traffic - ignore
         }
 
         let distance_mm = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);

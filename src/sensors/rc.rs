@@ -1,11 +1,5 @@
-//! RC receiver input — SBUS parser on USART2.
-//!
-//! SBUS: 100 kbaud, 8E2, inverted logic (requires hardware inverter or
-//! STM32 USART inversion feature).
-//! Frame: 25 bytes — start 0x0F, 22 bytes channel data (16 × 11-bit), flags, end 0x00.
-//!
-//! Compatible receivers: any SBUS-output receiver, including BETAFPV ExpressLRS Lite
-//! (verify it is configured for SBUS output, not CRSF, before wiring).
+//! RC receiver input - SBUS parser on USART2 (100 kbaud, 8E2, inverted).
+//! Works with any SBUS-output receiver (verify SBUS, not CRSF, before wiring).
 
 use embassy_stm32::{
     peripherals, Peri,
@@ -28,14 +22,12 @@ const SBUS_FLAG_FRAME_LOST: u8 = 1 << 2;
 const SBUS_MIN: u16 = 172;
 const SBUS_MAX: u16 = 1811;
 
-/// True once a valid SBUS frame has been received this boot. Consumed by
-/// `main::rc_gates_active()`: under `rc-optional`, RC gates only apply after
-/// the link has actually existed — but once seen, they apply permanently
-/// (a receiver that appears and then drops is a real failsafe, not "absent").
+/// True once a valid SBUS frame has been received this boot. Under `rc-optional`
+/// the RC gates only apply after the link has existed - but then permanently.
 pub static RC_EVER_SEEN: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// 16 SBUS channel values (raw 11-bit, 172–1811).
+/// 16 SBUS channel values (raw 11-bit, 172-1811).
 #[derive(Default)]
 struct SbusFrame {
     channels: [u16; 16],
@@ -51,7 +43,7 @@ fn parse_sbus(buf: &[u8; SBUS_FRAME_LEN]) -> Option<SbusFrame> {
     let b = &buf[1..23]; // 22 data bytes
     let mut ch = [0u16; 16];
 
-    // Unpack 16 × 11-bit channels from 22 bytes (little-endian bit packing)
+    // Unpack 16 x 11-bit channels from 22 bytes (little-endian bit packing)
     ch[0]  = ((b[0] as u16)       | ((b[1] as u16) << 8))                    & 0x07FF;
     ch[1]  = (((b[1] as u16) >> 3) | ((b[2] as u16) << 5))                   & 0x07FF;
     ch[2]  = (((b[2] as u16) >> 6) | ((b[3] as u16) << 2) | ((b[4] as u16) << 10)) & 0x07FF;
@@ -97,18 +89,14 @@ fn decode_mode(raw: u16) -> FlightMode {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Embassy task
-// ---------------------------------------------------------------------------
 
-/// 100 ms = ~7× the 14 ms SBUS frame period; if no frame arrives in this
-/// window the link is considered lost and inputs are zeroed with failsafe set.
+/// ~7x the 14 ms SBUS frame period; no frame in this window = link lost,
+/// inputs zeroed with failsafe set.
 const SBUS_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// How long `frame_lost` must persist before escalating to failsafe. It is a
-/// MOMENTARY per-frame flag (routine RF blips) — during the grace window we
-/// fly on the receiver's held channels. The receiver's own `failsafe` flag
-/// still acts immediately.
+/// How long the momentary `frame_lost` flag must persist before escalating to
+/// failsafe; the receiver's own `failsafe` flag still acts immediately.
 const FRAME_LOST_GRACE: Duration = Duration::from_millis(250);
 
 #[embassy_executor::task]
@@ -132,12 +120,10 @@ pub async fn rc_task(
     info!("RC task started (SBUS @ 100 kbaud 8E2 inverted)");
 
     let mut buf = [0u8; SBUS_FRAME_LEN];
-    // Edge-triggered link-state logging: the timeout path fires at ~10 Hz when no RC
-    // is connected, so log only on the healthy↔lost transitions instead of every tick.
+    // Log only on healthy/lost transitions (timeout path fires at ~10 Hz with no RC).
     let mut link_up = false;
-    // A degrading link (continuous partial frames / UART errors) never reaches the
-    // timeout path, so trip failsafe after this many consecutive bad reads rather than
-    // leaving stale RC active. At ~14 ms/SBUS frame this is ~40 ms.
+    // A degrading link never reaches the timeout path - trip failsafe after this
+    // many consecutive bad reads (~40 ms) rather than leaving stale RC active.
     let mut bad_frames: u8 = 0;
     const FAILSAFE_AFTER_BAD: u8 = 3;
     // frame_lost staging; None = link clean.
@@ -200,7 +186,7 @@ pub async fn rc_task(
                     *STATE.rc_input.lock().await = rc;
                 }
             }
-            // Partial frame or UART error — a degraded (not silent) link. Count
+            // Partial frame or UART error - a degraded (not silent) link. Count
             // consecutive bad reads and assert failsafe before stale RC can linger.
             Ok(Ok(_)) | Ok(Err(_)) => {
                 bad_frames = bad_frames.saturating_add(1);
@@ -213,8 +199,8 @@ pub async fn rc_task(
                 }
             }
             Err(_) => {
-                // No frame within the timeout — link fully lost. Failsafe every tick;
-                // log only on the healthy→lost edge to avoid flooding at ~10 Hz.
+                // No frame within the timeout - link fully lost. Failsafe every tick;
+                // log only on the healthy->lost edge to avoid flooding at ~10 Hz.
                 if link_up {
                     warn!("SBUS: signal lost — failsafe active");
                     link_up = false;

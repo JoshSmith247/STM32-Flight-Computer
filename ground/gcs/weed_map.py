@@ -53,16 +53,14 @@ GST_PIPELINE = (
 )
 FFMPEG_URL = f"udp://@0.0.0.0:{VIDEO_PORT}?overrun_nonfatal=1&fifo_size=5000000"
 
-# Canvas covers ±(CANVAS_W/2 / MAP_SCALE) metres from origin in each axis.
-# At 20 px/m, 4000×4000 px covers a 200×200 m patch — enough for a large garden.
+# Canvas covers +/-(CANVAS_W/2 / MAP_SCALE) metres from origin in each axis.
+# At 20 px/m, 4000x4000 px covers a 200x200 m patch - enough for a large garden.
 CANVAS_W = 4000
 CANVAS_H = 4000
 WORK_W   = 640   # frames are scaled to this width before processing
 
 
-# ---------------------------------------------------------------------------
-# GPS receiver — live mode only
-# ---------------------------------------------------------------------------
+# GPS receiver - live mode only
 
 class GpsReceiver:
     """Receives MAVLink GLOBAL_POSITION_INT + ATTITUDE in a background thread."""
@@ -113,9 +111,7 @@ class GpsReceiver:
             return (self._lat, self._lon, self._alt, self._yaw, self._origin)
 
 
-# ---------------------------------------------------------------------------
 # Mosaic builder
-# ---------------------------------------------------------------------------
 
 class MosaicBuilder:
     """
@@ -158,7 +154,7 @@ class MosaicBuilder:
         self._frame_count = 0
         self._gps_frames  = 0
 
-    # ── GPS homography ────────────────────────────────────────────────────────
+    # GPS homography
 
     def _gps_H(self, lat: float, lon: float, alt: float, yaw: float,
                frame_w: int, frame_h: int) -> np.ndarray:
@@ -200,7 +196,7 @@ class MosaicBuilder:
             [0,          0,         1],
         ], dtype=np.float64)
 
-    # ── ORB fallback ──────────────────────────────────────────────────────────
+    # ORB fallback
 
     def _orb_update_H(self, gray: np.ndarray) -> None:
         kp, des = self._orb.detectAndCompute(gray, None)
@@ -220,11 +216,11 @@ class MosaicBuilder:
                     try:
                         self._H = self._H @ np.linalg.inv(H)
                     except np.linalg.LinAlgError:
-                        pass  # degenerate homography — keep previous transform
+                        pass  # degenerate homography - keep previous transform
         self._prev_kp  = kp
         self._prev_des = des
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    # Public API
 
     def add_frame(self, frame: np.ndarray,
                   gps: tuple | None = None) -> None:
@@ -292,7 +288,7 @@ class MosaicBuilder:
 
         oh, ow = out.shape[:2]
 
-        # North arrow (top-right) — only meaningful in GPS mode
+        # North arrow (top-right) - only meaningful in GPS mode
         if self._gps_frames > 0:
             nax, nay = ow - 22, 32
             cv2.arrowedLine(out, (nax, nay + 16), (nax, nay - 16),
@@ -300,7 +296,7 @@ class MosaicBuilder:
             cv2.putText(out, 'N', (nax - 5, nay - 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.38, (60, 60, 210), 1, cv2.LINE_AA)
 
-        # Scale bar (bottom-left): pick smallest round-number length ≥ 60 px
+        # Scale bar (bottom-left): pick smallest round-number length >= 60 px
         bar_m = 1.0
         for m in (0.25, 0.5, 1, 2, 5, 10, 20, 50, 100):
             if m * self._px_m >= 60:
@@ -344,10 +340,10 @@ class MosaicBuilder:
                 continue
             cx = M['m10'] / M['m00']
             cy = M['m01'] / M['m00']
-            # Canvas pixel → ENU metres relative to origin
+            # Canvas pixel -> ENU metres relative to origin
             east_m  = (cx - self._canvas_cx) / self._px_m
             north_m = -(cy - self._canvas_cy) / self._px_m   # canvas y increases south
-            # ENU → lat/lon (flat-earth approximation, valid for patches < 10 km)
+            # ENU -> lat/lon (flat-earth approximation, valid for patches < 10 km)
             lat = lat0 + north_m / 111_320.0
             lon = lon0 + east_m  / (111_320.0 * math.cos(math.radians(lat0)))
             area_m2 = area_px / (self._px_m ** 2)
@@ -390,9 +386,7 @@ class MosaicBuilder:
         return self._frame_count
 
 
-# ---------------------------------------------------------------------------
 # Main
-# ---------------------------------------------------------------------------
 
 def main() -> None:
     offline = len(sys.argv) > 1

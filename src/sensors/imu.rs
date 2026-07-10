@@ -1,14 +1,5 @@
-//! ICM-42688-P IMU driver — SPI1 async DMA, 500 Hz sample rate.
-//!
-//! Pinout (SPI1, AF5):
-//!   SPI1_SCK  → PA5   SPI1_MOSI → PA7
-//!   SPI1_MISO → PA6   IMU_CS    → PA4 (GPIO, active-low)
-//!
-//! DMA: DMA2_CH3 (TX), DMA2_CH0 (RX).
-//! ODR set to 1 kHz; task reads at 500 Hz so every read is fresh data.
-//!
-//! SPI1 bus is shared with the barometer; this task takes the SPI1_BUS mutex
-//! for each individual transaction and releases it immediately after.
+//! ICM-42688-P IMU driver - SPI1 async DMA (bus shared with the baro), CS=PA4.
+//! ODR 1 kHz, task reads at 500 Hz so every read is fresh data.
 
 use core::f32::consts::PI;
 
@@ -27,9 +18,7 @@ use crate::{
     STATE,
 };
 
-// ---------------------------------------------------------------------------
 // Register map
-// ---------------------------------------------------------------------------
 
 const WHO_AM_I:      u8 = 0x75;
 const DEVICE_CONFIG: u8 = 0x11;
@@ -40,33 +29,23 @@ const TEMP_DATA1:    u8 = 0x1D; // first byte of 14-byte sensor block
 
 const WHO_AM_I_EXPECTED: u8 = 0x47;
 
-// ---------------------------------------------------------------------------
-// Scale factors (datasheet §3.1 / §3.2)
-// ---------------------------------------------------------------------------
+// Scale factors (datasheet 3.1 / 3.2)
 
-// ±2000 dps full-scale → rad/s per LSB
+// full-scale 2000 dps -> rad/s per LSB
 const GYRO_SCALE:  f32 = (2000.0 / 32768.0) * (PI / 180.0);
-// ±16g full-scale → m/s² per LSB
+// full-scale 16 g -> m/s^2 per LSB
 const ACCEL_SCALE: f32 = (16.0 / 32768.0) * 9.80665;
 
-// ---------------------------------------------------------------------------
 // Startup gyro-bias calibration
-// ---------------------------------------------------------------------------
 
-// Number of stationary samples to average for the bias estimate. At the 500 Hz
-// sample rate this is ~0.6 s of data; comfortably inside the 200–500 window and
-// quick enough not to stall bring-up.
+// Stationary samples averaged for the bias estimate (~0.6 s at 500 Hz).
 const CAL_SAMPLES: u32 = 300;
 
-// If the averaged per-axis gyro magnitude exceeds this, the board was almost
-// certainly moving during calibration. ~0.05 rad/s ≈ 2.9 °/s — far above the
-// few-tenths-of-a-°/s bias a stationary MEMS gyro shows, but well below any
-// real hand motion, so it catches a disturbed cal without false-positives.
+// Averaged per-axis gyro above this means the board was moving during cal:
+// far above stationary MEMS bias, well below any real hand motion.
 const CAL_SANITY_RAD_S: f32 = 0.05;
 
-// ---------------------------------------------------------------------------
 // SPI transaction helpers
-// ---------------------------------------------------------------------------
 
 /// Write a register: assert CS, clock out [addr, val], deassert CS.
 async fn write_reg(cs: &mut Output<'_>, addr: u8, val: u8) {
@@ -89,10 +68,8 @@ async fn read_reg(cs: &mut Output<'_>, addr: u8) -> u8 {
     buf[1]
 }
 
-/// Burst-read the 14-byte sensor block (2 temp + 6 accel + 6 gyro, regs
-/// 0x1D–0x2A) and return the gyro XYZ in rad/s. Returns `None` if the SPI bus
-/// is unavailable or the transfer faults. Shared by calibration and the main
-/// loop so the read/scale path stays identical.
+/// Burst-read the 14-byte sensor block and return the gyro XYZ in rad/s.
+/// Returns `None` if the SPI bus is unavailable or the transfer faults.
 async fn read_gyro(cs: &mut Output<'_>) -> Option<Vec3> {
     let mut buf = [0u8; 15];
     buf[0] = TEMP_DATA1 | 0x80;
@@ -113,10 +90,8 @@ async fn read_gyro(cs: &mut Output<'_>) -> Option<Vec3> {
     })
 }
 
-/// Collect `CAL_SAMPLES` stationary gyro samples at the loop rate and average
-/// them into a bias vector. If the result is implausibly large the board was
-/// likely moving; we `warn!` and return a zero bias so we never bake a bad
-/// offset into every subsequent reading.
+/// Average CAL_SAMPLES stationary gyro samples into a bias vector. An implausibly
+/// large result (board moved) is discarded for a zero bias, with a warn.
 async fn calibrate_gyro_bias(cs: &mut Output<'_>, ticker: &mut Ticker) -> Vec3 {
     info!("IMU: calibrating gyro bias — keep the board still ({} samples)", CAL_SAMPLES);
 
@@ -152,18 +127,16 @@ async fn calibrate_gyro_bias(cs: &mut Output<'_>, ticker: &mut Ticker) -> Vec3 {
     bias
 }
 
-// ---------------------------------------------------------------------------
 // Embassy task
-// ---------------------------------------------------------------------------
 
 #[embassy_executor::task]
 pub async fn imu_task(cs_pin: Peri<'static, peripherals::PA4>) {
     let mut cs = Output::new(cs_pin, Level::High, Speed::High);
 
-    // 1 ms minimum from VDD stable to first SPI transaction (datasheet §6.1).
+    // 1 ms minimum from VDD stable to first SPI transaction (datasheet 6.1).
     Timer::after(Duration::from_millis(10)).await;
 
-    // Soft reset — clears all registers to default state.
+    // Soft reset - clears all registers to default state.
     write_reg(&mut cs, DEVICE_CONFIG, 0x01).await;
     // Device needs up to 1 ms to complete reset before accepting new commands.
     Timer::after(Duration::from_millis(2)).await;
@@ -181,16 +154,14 @@ pub async fn imu_task(cs_pin: Peri<'static, peripherals::PA4>) {
     #[cfg(feature = "simulation")]
     let who = WHO_AM_I_EXPECTED;
     if who != WHO_AM_I_EXPECTED {
-        // Default (flight) build: a missing IMU is fatal — a flight computer with no
-        // attitude source must refuse to operate, so Fault and park.
+        // Flight build: a missing IMU is fatal - Fault and park.
         #[cfg(not(feature = "nucleo-vcp"))]
         {
             error!("ICM-42688-P not found: WHO_AM_I = 0x{:02X} (expected 0x{:02X})", who, WHO_AM_I_EXPECTED);
             crate::state::set(FlightState::Fault);
             loop { Timer::after(Duration::from_secs(1)).await; }
         }
-        // Bench build (nucleo-vcp): tolerate a missing IMU so motor tests can run
-        // without faulting the board out of Idle. ⚠ No attitude — DO NOT FLY this build.
+        // Bench build: tolerate a missing IMU so motor tests can run. WARNING: DO NOT FLY.
         #[cfg(feature = "nucleo-vcp")]
         {
             warn!("ICM-42688-P not found (WHO_AM_I=0x{:02X}) — bench build, continuing WITHOUT IMU (no Fault, DO NOT FLY)", who);
@@ -203,10 +174,10 @@ pub async fn imu_task(cs_pin: Peri<'static, peripherals::PA4>) {
     write_reg(&mut cs, PWR_MGMT0, 0x0F).await;
     Timer::after(Duration::from_millis(1)).await;
 
-    // GYRO_CONFIG0: FS = ±2000 dps (bits 7:5 = 000), ODR = 1 kHz (bits 3:0 = 0110).
+    // GYRO_CONFIG0: FS = +/-2000 dps (bits 7:5 = 000), ODR = 1 kHz (bits 3:0 = 0110).
     write_reg(&mut cs, GYRO_CONFIG0, 0x06).await;
 
-    // ACCEL_CONFIG0: FS = ±16g (bits 7:5 = 000), ODR = 1 kHz (bits 3:0 = 0110).
+    // ACCEL_CONFIG0: FS = +/-16g (bits 7:5 = 000), ODR = 1 kHz (bits 3:0 = 0110).
     write_reg(&mut cs, ACCEL_CONFIG0, 0x06).await;
 
     // Gyro startup in low-noise mode takes up to 45 ms (datasheet Table 1).
@@ -214,7 +185,7 @@ pub async fn imu_task(cs_pin: Peri<'static, peripherals::PA4>) {
 
     let mut ticker = Ticker::every(Duration::from_hz(500));
 
-    // Startup gyro-bias calibration — board must be still (checked inside).
+    // Startup gyro-bias calibration - board must be still (checked inside).
     let gyro_bias = calibrate_gyro_bias(&mut cs, &mut ticker).await;
 
     info!("IMU: running — ±2000 dps / ±16g @ 1 kHz ODR, sampling at 500 Hz");
@@ -222,9 +193,7 @@ pub async fn imu_task(cs_pin: Peri<'static, peripherals::PA4>) {
     loop {
         ticker.next().await;
 
-        // Burst-read 14 bytes: 2 temp + 6 accel + 6 gyro (registers 0x1D–0x2A).
-        // buf[0] = address clocked out; buf[1..15] = data clocked back in.
-        // DMA handles the transfer autonomously — CPU is free during the ~10 µs.
+        // Burst-read 14 bytes: 2 temp + 6 accel + 6 gyro (regs 0x1D-0x2A).
         let mut buf = [0u8; 15];
         buf[0] = TEMP_DATA1 | 0x80;
         {
@@ -239,7 +208,7 @@ pub async fn imu_task(cs_pin: Peri<'static, peripherals::PA4>) {
             cs.set_high();
         }
 
-        // Temperature (°C) — datasheet §4.17: Temp_degC = raw / 132.48 + 25
+        // Temperature ( degC) - datasheet 4.17: Temp_degC = raw / 132.48 + 25
         let temp_raw = i16::from_be_bytes([buf[1], buf[2]]);
         let temp_c   = (temp_raw as f32 / 132.48) + 25.0;
 

@@ -30,7 +30,7 @@ pub fn get() -> FlightState {
     FlightState::from_u8(FLIGHT_STATE.load(Ordering::Relaxed))
 }
 
-/// Set the flight state. Re-setting the current state is a silent no-op —
+/// Set the flight state. Re-setting the current state is a silent no-op -
 /// 100 Hz failsafe paths call this every tick while a condition holds.
 pub fn set(state: FlightState) {
     let prev = FLIGHT_STATE.swap(state as u8, Ordering::Relaxed);

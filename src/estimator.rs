@@ -1,12 +1,6 @@
-//! Complementary NED position/velocity estimator (deliberately not an EKF):
-//! trusts IMU dead-reckoning on short timescales, pulls toward GPS on long,
-//! optional low-altitude flow correction. Publishes `STATE.pos_estimate`.
-//!
-//! Output frame: NED (x=N, y=E, z=Down). Origin = first valid GPS 3-D fix
-//! (same point navigation captures as home). Flat-earth conversion:
-//!   meters_n = dlat_deg * 111_320;  meters_e = dlon_deg * 111_320 * cos(lat)
-//!
-//! Runs at 150 Hz.
+//! Complementary NED position/velocity estimator (deliberately not an EKF),
+//! 150 Hz: IMU dead-reckoning corrected by GPS and low-altitude flow.
+//! Origin = first valid GPS 3-D fix. Publishes `STATE.pos_estimate`.
 
 use defmt::info;
 use embassy_time::{Duration, Instant, Ticker};
@@ -17,40 +11,31 @@ use crate::{
     STATE,
 };
 
-// ── Tuning ──────────────────────────────────────────────────────────────────
+// Tuning
 
 const RATE_HZ: u64 = 150;
 const DT: f32 = 1.0 / RATE_HZ as f32;
 const GRAVITY: f32 = 9.81; // m/s² on the NED Down axis
 
-/// Complementary correction gains (per GPS update). These are applied as a
-/// fraction of the residual between the dead-reckoned estimate and the GPS
-/// measurement each time a fresh fix arrives. Small position gain (slow trust
-/// in absolute GPS position), larger velocity gain (GPS NED velocity is far
-/// less noisy than differentiated position on the M8N).
-///
-/// Effective complementary time constant τ ≈ dt_gps / gain. At ~5 Hz GPS:
-///   pos: τ ≈ 0.2 / 0.10 ≈ 2 s   vel: τ ≈ 0.2 / 0.30 ≈ 0.7 s
+/// Complementary correction gains (fraction of residual per GPS update).
+/// Time constant ~ dt_gps / gain: pos ~2 s, vel ~0.7 s at 5 Hz GPS.
 const K_POS_GPS: f32 = 0.10;
 const K_VEL_GPS: f32 = 0.30;
 
-/// Optical-flow horizontal velocity correction gain, used only at low altitude
-/// where the rangefinder/flow is reliable. Weak — flow is a complement to,
-/// not a replacement for, GPS velocity.
+/// Optical-flow horizontal velocity correction gain (low altitude only).
+/// Weak - flow complements GPS velocity, it doesn't replace it.
 const K_VEL_FLOW: f32 = 0.05;
 const FLOW_MAX_HEIGHT_MM: i32 = 5_000;
 
-/// Estimator-side GPS staleness bound, much tighter than types::GPS_FRESH_MS
-/// (2.5 s, the navigation gate): at 5 Hz a fix older than 3 epochs is a frozen
-/// snapshot, and pulling the estimate toward it fights the dead-reckoning.
+/// Estimator-side GPS staleness bound, much tighter than types::GPS_FRESH_MS:
+/// pulling toward a frozen fix fights the dead-reckoning.
 const GPS_CORR_FRESH_MS: u64 = 600;
 
-/// If accel-only dead-reckoning persists this long without any GPS correction,
-/// bleed velocity toward zero so a stuck/biased accel doesn't run the position
-/// estimate away unbounded during a long dropout.
+/// Velocity bleed during long GPS dropouts so a biased accel can't run the
+/// position estimate away unbounded.
 const DR_VEL_DECAY: f32 = 0.999; // per-tick multiplier when coasting
 
-// ── Filter state ──────────────────────────────────────────────────────────────
+// Filter state
 
 /// Complementary NED position/velocity estimator.
 pub struct PosEstimator {
@@ -91,10 +76,10 @@ impl PosEstimator {
     }
 
     /// High-rate PREDICT: rotate body specific force into the world frame,
-    /// convert NWU→NED, remove gravity, integrate to velocity then position.
+    /// convert NWU->NED, remove gravity, integrate to velocity then position.
     fn predict(&mut self, accel_body: Vec3, q: Quaternion) {
-        // R(q) rotates body → Madgwick world frame = Z-UP / NWU
-        // (X=North, Y=West, Z=Up — see ahrs::ned_yaw).
+        // R(q) rotates body -> Madgwick world frame = Z-UP / NWU
+        // (X=North, Y=West, Z=Up - see ahrs::ned_yaw).
         let (w, x, y, z) = (q.w, q.x, q.y, q.z);
 
         let r00 = 1.0 - 2.0 * (y * y + z * z);
@@ -112,15 +97,13 @@ impl PosEstimator {
         let f_w  = r10 * accel_body.x + r11 * accel_body.y + r12 * accel_body.z;
         let f_up = r20 * accel_body.x + r21 * accel_body.y + r22 * accel_body.z;
 
-        // NWU → NED: N = X, E = -Y, D = -Z. At rest f_up = +g, so linear
-        // down-acceleration a_d = g - f_up = 0.
-        // ⚠ BRING-UP: lift the board sharply and confirm vel_d goes negative
-        // (up) before trusting the vertical channel.
+        // NWU -> NED: N = X, E = -Y, D = -Z. At rest a_d = g - f_up = 0.
+        // WARNING: BRING-UP: lift the board and confirm vel_d goes negative (up).
         let an = f_n;
         let ae = -f_w;
         let ad = GRAVITY - f_up;
 
-        // Integrate accel → velocity → position (forward Euler).
+        // Integrate accel -> velocity -> position (forward Euler).
         self.vel_n += an * DT;
         self.vel_e += ae * DT;
         self.vel_d += ad * DT;
@@ -178,15 +161,14 @@ impl PosEstimator {
     }
 }
 
-// ── Embassy task ──────────────────────────────────────────────────────────────
+// Embassy task
 
 #[embassy_executor::task]
 pub async fn estimator_task() {
     let mut est = PosEstimator::new();
 
-    // GPS arrives much slower than the predict loop; only run a correction when
-    // a genuinely new fix is seen. The M8N fix doesn't carry a timestamp here,
-    // so we detect change via lat/lon deltas plus a minimum interval.
+    // Only correct on a genuinely new fix, detected via lat/lon deltas plus a
+    // minimum interval (the fix carries no timestamp here).
     let mut last_gps_lat: f64 = 0.0;
     let mut last_gps_lon: f64 = 0.0;
     let mut last_correct: Instant = Instant::now();
@@ -197,12 +179,15 @@ pub async fn estimator_task() {
     loop {
         ticker.next().await;
 
-        // ── PREDICT from IMU ────────────────────────────────────────────────
+        // PREDICT from IMU only while it's alive: integrating an all-zero or
+        // frozen accel sample manufactures phantom velocity. Coast instead.
         let imu = *STATE.imu_data.lock().await;
         let q = *STATE.attitude.lock().await;
-        est.predict(imu.accel, q);
+        if imu.is_fresh() {
+            est.predict(imu.accel, q);
+        }
 
-        // ── CORRECT from GPS (fresh valid fix only) ──────────────────────────
+        // CORRECT from GPS (fresh valid fix only)
         let gps = *STATE.gps_fix.lock().await;
         let gps_fresh = gps.usable()
             && Instant::now().as_millis().saturating_sub(gps.stamp_ms) <= GPS_CORR_FRESH_MS;
@@ -230,9 +215,8 @@ pub async fn estimator_task() {
         // corrections stop, instead of waiting for the 2 s decay threshold.
         let had_recent_gps = last_correct.elapsed().as_millis() < GPS_CORR_FRESH_MS;
 
-        // ── Optional CORRECT from optical flow at low altitude ───────────────
-        // Only fused when we lack a recent GPS update (flow then carries the
-        // horizontal velocity estimate during dropout near the ground).
+        // Optional CORRECT from optical flow at low altitude, only fused when
+        // there's no recent GPS update.
         if est.origin_set && !had_recent_gps {
             let flow = *STATE.flow.lock().await;
             if flow.usable() && flow.height_mm > 0 && flow.height_mm <= FLOW_MAX_HEIGHT_MM {
@@ -250,7 +234,7 @@ pub async fn estimator_task() {
             }
         }
 
-        // ── Publish ──────────────────────────────────────────────────────────
+        // Publish
         *STATE.pos_estimate.lock().await = est.snapshot();
     }
 }

@@ -1,12 +1,5 @@
-//! Servo output — 4-channel PWM on TIM4 at 50 Hz.
-//!
-//! Pinout (TIM4 AF2):
-//!   S1 → PD12 (TIM4_CH1)   S3 → PD14 (TIM4_CH3)
-//!   S2 → PD13 (TIM4_CH2)   S4 → PD15 (TIM4_CH4)
-//!
-//! Position is read from STATE.servo_outputs (normalised [0.0, 1.0]).
-//! 0.0 = 1000 µs (retracted), 1.0 = 2000 µs (deployed).
-//! Commanded via MAVLink DO_SET_SERVO (cmd 183) parsed in telemetry.rs.
+//! Servo output - 4-channel PWM on TIM4 at 50 Hz (S1-S4 = PD12-PD15, AF2).
+//! Reads STATE.servo_outputs (0.0 = 1000 us retracted, 1.0 = 2000 us deployed).
 
 use defmt::info;
 use embassy_stm32::{
@@ -24,7 +17,7 @@ use embassy_time::{Duration, Ticker};
 use crate::{types::payload_flags, STATE};
 
 const SERVO_HZ: u32 = 50;
-const PERIOD_US: u32 = 1_000_000 / SERVO_HZ; // 20_000 µs
+const PERIOD_US: u32 = 1_000_000 / SERVO_HZ; // 20_000 us
 const MIN_US: u32 = 1000;
 const MAX_US: u32 = 2000;
 

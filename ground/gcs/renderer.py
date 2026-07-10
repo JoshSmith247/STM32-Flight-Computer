@@ -13,7 +13,7 @@ from mavlink import _mav_lock, _mav_state, send_follow_target, send_weed_target
 from tracker import WeedTracker
 
 _FOLLOW_MODE_ID = 6   # FlightMode::FollowMe discriminant in STM32 heartbeat
-_WEED_MODE_ID   = 3   # FlightMode::Auto — only mode that runs ExG detection
+_WEED_MODE_ID   = 3   # FlightMode::Auto - only mode that runs ExG detection
 
 _LOGS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
 
@@ -165,7 +165,7 @@ class _Renderer:
         self.frame_count  = 0
         self.stream_alive = False
         self._prev_sel: int | None = None
-        # Letterbox state — written by renderer thread, read by main thread (GIL-safe)
+        # Letterbox state - written by renderer thread, read by main thread (GIL-safe)
         self._vid_scale = 1.0
         self._vid_x_off = 0
         self._vid_y_off = 0
@@ -210,7 +210,7 @@ class _Renderer:
             self._recorder.close()
 
     def _run(self) -> None:
-        # Cached panels — rebuilt only when content changes, not every frame.
+        # Cached panels - rebuilt only when content changes, not every frame.
         _sidebar:       np.ndarray | None = None
         _sidebar_key    = (-1, None)
         _stats:         np.ndarray | None = None
@@ -228,7 +228,7 @@ class _Renderer:
             follow_mode = (_running == config.PROG_FOLLOW_ME)
             weed_mode   = (_running == config.PROG_WEED_PICK)
 
-            # ── Rebuild cached panels only when needed ────────────────────────
+            # Rebuild cached panels only when needed
             if follow_mode:
                 sidebar_key = ('follow', self._person._tracked, self._person._lost_frames)
             else:
@@ -249,7 +249,7 @@ class _Renderer:
                     self._stats_arr = _stats
                     self._stats_seq += 1
 
-            # ── No active stream: build standby frame at ~30 fps ─────────────
+            # No active stream: build standby frame at ~30 fps
             if grabber is None or not alive:
                 display, btn = _make_no_stream_frame(
                     self._disp_w, self._disp_h, self._nsi)
@@ -260,7 +260,7 @@ class _Renderer:
                 time.sleep(1 / 30)
                 continue
 
-            # ── Active stream ─────────────────────────────────────────────────
+            # Active stream
             ok, frame = grabber.read()
             if not ok:
                 with self._lock:
@@ -274,10 +274,8 @@ class _Renderer:
             frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
 
             if follow_mode:
-                # ── Follow Me: YOLO person detection + IoU tracking ───────────
-                # process_frame() is non-blocking: it queues the frame for the
-                # background inference thread and immediately returns the last
-                # available detections, so this thread is never stalled.
+                # Follow Me: process_frame() is non-blocking - it queues the frame
+                # for background inference and returns the last available detections.
                 detections = self._person.process_frame(frame)
                 if detections != _last_detections:
                     self._person.process_click(detections)
@@ -295,7 +293,7 @@ class _Renderer:
 
                 display = self._person.draw(frame, detections)
             elif weed_mode:
-                # ── Weed Picker: Excess Green detection + optical-flow tracking
+                # Weed Picker: Excess Green detection + optical-flow tracking
                 mask  = exg_mask(frame)
                 blobs = exg_candidates(mask)
                 self._tracker.process_click(frame)
@@ -308,7 +306,7 @@ class _Renderer:
                     tint[:, :, 1] = mask
                     display = cv2.addWeighted(display, 1.0, tint, 0.4, 0)
             else:
-                # ── No detection (manual, altitude hold, RTH, etc.) ───────────
+                # No detection (manual, altitude hold, RTH, etc.)
                 display = frame.copy()
 
             # Start/stop recorder based on runtime flag

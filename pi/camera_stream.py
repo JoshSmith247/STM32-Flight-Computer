@@ -75,12 +75,11 @@ def build_cmd(encoder: str, width: int, height: int) -> list:
     ]
 
     if encoder == 'hw':
-        # Hardware H.264 on the VideoCore (Pi Zero 2 W / Pi 3 / Pi 4). Frees the CPU,
-        # which is what fixes the lag/hang. NOTE: h264_v4l2m2m does NOT accept
-        # libx264's -preset/-tune flags — keep them off this branch.
+        # Hardware H.264 on the VideoCore - frees the CPU, which fixes the lag/hang.
+        # NOTE: h264_v4l2m2m does NOT accept libx264's -preset/-tune flags.
         encode = ['-c:v', 'h264_v4l2m2m', '-b:v', BITRATE, '-g', str(FRAMERATE)]
     elif encoder == 'sw':
-        # Software H.264 — CPU-bound; keep the resolution low on a Zero 2 W.
+        # Software H.264 - CPU-bound; keep the resolution low on a Zero 2 W.
         encode = [
             '-c:v', 'libx264',
             '-preset', 'ultrafast',
@@ -130,7 +129,7 @@ def main() -> None:
 
     encoder, width, height = ENCODER, WIDTH, HEIGHT
 
-    # Gate 1: hw requested but the encoder isn't even listed → fall back up front.
+    # Gate 1: hw requested but the encoder isn't even listed -> fall back up front.
     if encoder == 'hw' and not encoder_available('h264_v4l2m2m'):
         print(f"WARNING: h264_v4l2m2m (hardware H.264) not found in ffmpeg — falling "
               f"back to software libx264 at {SW_FB_W}x{SW_FB_H} to avoid CPU "
@@ -143,9 +142,8 @@ def main() -> None:
         rc = run_ffmpeg(encoder, width, height)
         elapsed = time.monotonic() - start
 
-        # Gate 2: hw was listed but ffmpeg died almost immediately → the V4L2 M2M
-        # device likely failed to open. Fall back once to software at low res rather
-        # than letting systemd's Restart=always crash-loop us every few seconds.
+        # Gate 2: hw listed but ffmpeg died almost immediately - fall back once to
+        # software rather than letting systemd's Restart=always crash-loop us.
         if encoder == 'hw' and rc not in (0, -signal.SIGTERM) and elapsed < 5.0:
             print(f"WARNING: hardware encoder failed at runtime (exit {rc} after "
                   f"{elapsed:.1f}s) — retrying once with software libx264 at "

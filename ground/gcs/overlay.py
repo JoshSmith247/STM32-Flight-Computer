@@ -40,17 +40,17 @@ except ImportError:
 import config
 from mavlink import _mav_lock, _mav_state, send_mavlink_command, send_set_home
 
-# ── Layout (logical px) ───────────────────────────────────────────────────────
+# Layout (logical px)
 _MW     = 440
 _HDR_H  = 44
 _PAD    = 16
 _ITEM_H = 30
 
 _SEC1_Y = 68                                   # 24 px below header line
-_ROW1_Y = _SEC1_Y + 30                         # 98  — 30 px from label to first row
+_ROW1_Y = _SEC1_Y + 30                         # 98 - 30 px from label to first row
 _N_ROWS = 7                                    # LINK GPS IMU BARO BATTERY THROTTLE HOME
-_SEC2_Y = _ROW1_Y + _N_ROWS * _ITEM_H + 42    # 350 — 42 px gap before OPTIONS
-_OPT1_Y = _SEC2_Y + 32                        # 382 — 32 px from label to first option
+_SEC2_Y = _ROW1_Y + _N_ROWS * _ITEM_H + 42    # 350 - 42 px gap before OPTIONS
+_OPT1_Y = _SEC2_Y + 32                        # 382 - 32 px from label to first option
 _OPT2_Y = _OPT1_Y + _ITEM_H                   # 412
 _ARM_Y  = _OPT2_Y + _ITEM_H + 20              # 462
 _ARM_H  = 44
@@ -61,7 +61,7 @@ _MH     = _CNL_Y + _CNL_H + 16                # 562
 _BG_DIM = 0.62
 _FADE_S = 0.75
 
-# ── State (main thread only) ──────────────────────────────────────────────────
+# State (main thread only)
 _st: dict = {
     'active':    False,
     'arm_state': 'idle',   # 'idle' | 'arming' | 'fading'
@@ -71,10 +71,10 @@ _st: dict = {
     'verb':      False,
 }
 
-# Click areas in logical screen coords — set during draw_overlay()
+# Click areas in logical screen coords - set during draw_overlay()
 _HIT: dict = {}
 
-# Per-frame text queue — batched into one PIL pass per draw call
+# Per-frame text queue - batched into one PIL pass per draw call
 _TQ: list = []
 
 
@@ -115,7 +115,7 @@ def _sz(text: str, pt: int) -> tuple[int, int]:
     return w, h
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# Public API
 
 def is_active() -> bool:
     return _st['active']
@@ -177,7 +177,7 @@ def handle_click(lx: int, ly: int) -> bool:
     return True
 
 
-# ── Rendering ─────────────────────────────────────────────────────────────────
+# Rendering
 
 def draw_overlay(screen_w: int, screen_h: int) -> np.ndarray:
     """Return a (screen_h*PR, screen_w*PR, 4) float32 RGBA array for DPG upload."""
@@ -191,10 +191,10 @@ def draw_overlay(screen_w: int, screen_h: int) -> np.ndarray:
     if not _st['active']:
         return canvas.ravel()
 
-    # ── Background scrim ──────────────────────────────────────────────────────
+    # Background scrim
     canvas[:, :, 3] = _BG_DIM * fa
 
-    # ── Telemetry snapshot ────────────────────────────────────────────────────
+    # Telemetry snapshot
     now = time.monotonic()
     with _mav_lock:
         last_t       = _mav_state['last_msg_t']
@@ -206,7 +206,7 @@ def draw_overlay(screen_w: int, screen_h: int) -> np.ndarray:
         home_set     = _mav_state['home_set']
     linked = last_t is not None and (now - last_t) < 2.0
 
-    # ── Modal geometry ────────────────────────────────────────────────────────
+    # Modal geometry
     mw = _MW * s
     mh = _MH * s
     mx = (W - mw) // 2
@@ -220,7 +220,7 @@ def draw_overlay(screen_w: int, screen_h: int) -> np.ndarray:
     _HIT['arm']      = (lmx + _PAD,         lmy + _ARM_Y,     _MW - 2*_PAD, _ARM_H)
     _HIT['cancel']   = (lmx + (_MW-140)//2, lmy + _CNL_Y,     140,          _CNL_H)
 
-    # ── Modal surface (BGR uint8) ─────────────────────────────────────────────
+    # Modal surface (BGR uint8)
     modal = np.full((mh, mw, 3), (44, 46, 56), dtype=np.uint8)
 
     # Header bar
@@ -231,7 +231,7 @@ def draw_overlay(screen_w: int, screen_h: int) -> np.ndarray:
     tw, _ = _sz('PRE-FLIGHT CHECKLIST', title_pt)
     _qt('PRE-FLIGHT CHECKLIST', ((mw - tw) // 2, 28 * s), title_pt, (205, 212, 225))
 
-    # ── Readiness section ─────────────────────────────────────────────────────
+    # Readiness section
     sec_pt  = max(10, 10 * s)
     body_pt = max(10, 12 * s)
 
@@ -310,7 +310,7 @@ def draw_overlay(screen_w: int, screen_h: int) -> np.ndarray:
             cv2.line(modal, (_PAD * s, ry + _ITEM_H * s),
                      (mw - _PAD * s, ry + _ITEM_H * s), (50, 52, 64), max(1, s))
 
-    # ── Options section ───────────────────────────────────────────────────────
+    # Options section
     cv2.line(modal, (_PAD * s, (_SEC2_Y - 28) * s), (mw - _PAD * s, (_SEC2_Y - 28) * s),
              (65, 70, 88), max(1, s))
     _qt('OPTIONS', (_PAD * s, _SEC2_Y * s), sec_pt, (95, 100, 118))
@@ -337,7 +337,7 @@ def draw_overlay(screen_w: int, screen_h: int) -> np.ndarray:
             cv2.line(modal, p2, p3, (230, 240, 230), max(1, 2 * s))
         _qt(label, ((_PAD + 20) * s, mid_y + 6 * s), body_pt, (168, 172, 185))
 
-    # ── ARM button ────────────────────────────────────────────────────────────
+    # ARM button
     arm_state = _st['arm_state']
     ax0 = _PAD * s
     ay0 = _ARM_Y * s
@@ -368,13 +368,13 @@ def draw_overlay(screen_w: int, screen_h: int) -> np.ndarray:
     _qt(arm_lbl, ((mw - aw) // 2, ay0 + (_ARM_H * s + arm_pt) // 2 - s),
         arm_pt, arm_fg)
 
-    # ── Cancel ────────────────────────────────────────────────────────────────
+    # Cancel
     cnl_pt = max(10, 11 * s)
     cw, _  = _sz('Cancel', cnl_pt)
     _qt('Cancel', ((mw - cw) // 2, (_CNL_Y + _CNL_H // 2 + 6) * s),
         cnl_pt, (95, 98, 116))
 
-    # ── Flush text and composite into RGBA canvas ─────────────────────────────
+    # Flush text and composite into RGBA canvas
     _flush(modal)
 
     canvas[my:my + mh, mx:mx + mw, 0] = modal[:, :, 2] / 255.0

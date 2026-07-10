@@ -52,9 +52,8 @@ try:
               file=sys.stderr, flush=True)
         model_path = bare
 
-    # Redirect fd 1 → fd 2 (stderr) during init so ultralytics' logging
-    # StreamHandler (which holds the original stdout fd) doesn't write
-    # the fuse summary to the protocol pipe before we send 'ready'.
+    # Redirect fd 1 to stderr during init so ultralytics' logging can't write
+    # to the protocol pipe before we send 'ready'.
     _saved_fd1 = os.dup(1)
     os.dup2(2, 1)
     try:
@@ -87,7 +86,7 @@ stdout_b = sys.stdout.buffer
 while True:
     header = stdin_b.read(12)
     if len(header) < 12:
-        break   # parent closed stdin → exit cleanly
+        break   # parent closed stdin -> exit cleanly
 
     h, w, c = struct.unpack('<iii', header)
     n_bytes  = h * w * c

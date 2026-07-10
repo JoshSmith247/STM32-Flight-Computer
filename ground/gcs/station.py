@@ -15,12 +15,8 @@ Tune EXG_THRESH and EXG_MIN_AREA in .env for your surface:
 
 import os
 
-# ── Must be set before ANY torch/ultralytics import ──────────────────────────
-# On macOS ARM-64, PyTorch uses Apple's Accelerate/vecLib for CPU BLAS.
-# Accelerate internally dispatches to Metal for certain ops, which conflicts
-# with DearPyGUI's Metal render thread and causes SIGSEGV after ~30 s.
-# Limiting all threading backends to 1 thread keeps computation on the calling
-# thread only — no background BLAS threads fighting over the Metal context.
+# Must be set before ANY torch/ultralytics import: on macOS ARM-64, background
+# BLAS threads dispatch to Metal and SIGSEGV against DPG's render thread.
 os.environ.setdefault('OMP_NUM_THREADS',         '1')
 os.environ.setdefault('VECLIB_MAXIMUM_THREADS',  '1')   # Apple Accelerate / vecLib
 os.environ.setdefault('MKL_NUM_THREADS',         '1')
@@ -164,7 +160,7 @@ def _macos_activate() -> None:
             lib.objc_getClass(b'NSApplication'),
             lib.sel_registerName(b'sharedApplication'),
         )
-        # NSApplicationActivationPolicyRegular = 0 → shows in Dock + menu bar
+        # NSApplicationActivationPolicyRegular = 0 -> shows in Dock + menu bar
         _msg_long(ns_app, lib.sel_registerName(b'setActivationPolicy:'), 0)
         _msg_bool(ns_app, lib.sel_registerName(b'activateIgnoringOtherApps:'), True)
     except Exception as exc:
@@ -172,9 +168,8 @@ def _macos_activate() -> None:
 
 
 def _macos_set_app_name(name: str) -> None:
-    # NSProcessInfo.setProcessName: does NOT affect the Dock — the Dock reads
-    # from Launch Services. We must use the private _LSSetApplicationInformationItem
-    # API to override CFBundleName/CFBundleDisplayName for the running process.
+    # The Dock reads from Launch Services, so the private
+    # _LSSetApplicationInformationItem API is needed to override the bundle name.
     try:
         import ctypes
 
@@ -200,9 +195,9 @@ def _macos_set_app_name(name: str) -> None:
         app_svc._LSSetApplicationInformationItem.argtypes = [
             ctypes.c_int32,   # kLSDefaultSessionID = -2
             ctypes.c_uint64,  # ASN
-            ctypes.c_void_p,  # key   (CFStringRef)
+            ctypes.c_void_p,  # key (CFStringRef)
             ctypes.c_void_p,  # value (CFTypeRef)
-            ctypes.c_void_p,  # outDict — NULL
+            ctypes.c_void_p,  # outDict - NULL
         ]
         app_svc._LSSetApplicationInformationItem(-2, asn, cf_bname, cf_name, None)
         app_svc._LSSetApplicationInformationItem(-2, asn, cf_dname, cf_name, None)
@@ -214,9 +209,8 @@ def _macos_set_app_name(name: str) -> None:
 
 
 def main() -> None:
-    # ── Screen size ───────────────────────────────────────────────────────────
-    # CGDisplayBounds covers the full display frame in logical points (including
-    # the Dock area), matching DPG's viewport coordinate space exactly.
+    # Screen size: CGDisplayBounds is in logical points (including the Dock area),
+    # matching DPG's viewport coordinate space exactly.
     screen_w, screen_h = 2560, 1440
     pixel_ratio = 1   # physical pixels per logical point (2 on Retina)
     try:
@@ -237,9 +231,8 @@ def main() -> None:
         screen_w = int(_b.size.width)
         screen_h = int(_b.size.height)
 
-        # NSScreen.mainScreen.backingScaleFactor is the authoritative HiDPI scale factor.
-        # CGDisplayPixelsWide returns the scaled render resolution on modern macOS,
-        # not the panel's physical pixel count, so it can equal the logical size.
+        # NSScreen backingScaleFactor is the authoritative HiDPI scale -
+        # CGDisplayPixelsWide can equal the logical size on modern macOS.
         _objc = ctypes.CDLL(ctypes.util.find_library('objc'))
         _objc.objc_getClass.restype     = ctypes.c_void_p
         _objc.objc_getClass.argtypes    = [ctypes.c_char_p]
@@ -274,7 +267,7 @@ def main() -> None:
               flush=True)
     start_logging()
 
-    # ── Layout ────────────────────────────────────────────────────────────────
+    # Layout
     frame_w, frame_h = 1920, 1080
     config.STATS_W = max(screen_w // 2, 800)
     config.PR      = pixel_ratio
@@ -293,8 +286,7 @@ def main() -> None:
     tracker.set_frame_size(frame_w, frame_h)
     person_tracker.set_frame_size(frame_w, frame_h)
     # Preload YOLO weights in the background so Follow Me activates without a
-    # first-frame hang.  The worker runs as a subprocess so it is safe to start
-    # at any time — no Metal contention with DPG.
+    # first-frame hang (subprocess worker, so no Metal contention with DPG).
     person_tracker.preload()
     _btn_rect = [None]
     _conn     = {'cap': None, 'ok': False, 'busy': False, 'loop': False}
@@ -302,7 +294,7 @@ def main() -> None:
     def _open_stream():
         src = config.VIDEO_SOURCE
         if src:
-            # Local source — webcam index or video file
+            # Local source - webcam index or video file
             cap_arg = int(src) if src.isdigit() else src
             c = cv2.VideoCapture(cap_arg)
             if c.isOpened():
@@ -345,7 +337,7 @@ def main() -> None:
     _conn['busy'] = True
     threading.Thread(target=_open_stream, daemon=True).start()
 
-    # ── Dear PyGui setup ──────────────────────────────────────────────────────
+    # Dear PyGui setup
     dpg.create_context()
     _icon_path = str(pathlib.Path(__file__).parent.parent / "assets" / "drone_icon.png")
 
@@ -383,7 +375,7 @@ def main() -> None:
             return
 
         # Program / motor-test panel (bottom-right of the stats column) drives
-        # MAVLink, not the camera — so it must stay clickable with no video feed.
+        # MAVLink, not the camera - so it must stay clickable with no video feed.
         if x >= disp_w + config.SIDEBAR_W:
             px  = x - (disp_w + config.SIDEBAR_W)
             COL = config.STATS_W // 2
@@ -438,7 +430,7 @@ def main() -> None:
     sid_x   = disp_w
     stats_x = disp_w + config.SIDEBAR_W
 
-    # viewport_drawlist renders directly onto the viewport surface — no window
+    # viewport_drawlist renders directly onto the viewport surface - no window
     # chrome, no padding, and it always fills the viewport exactly.
     with dpg.viewport_drawlist(front=False, tag="canvas"):
         dpg.draw_image("tex_vid",     (0,       0), (disp_w,   screen_h))
@@ -457,9 +449,8 @@ def main() -> None:
     _macos_set_presentation(True)   # hide menu bar + Dock
     _overlay.open_overlay()
 
-    # BGR uint8 → flat RGBA float32 for DPG texture upload.
-    # Panels are pre-rendered at physical pixel resolution (config.PR applied by each
-    # drawing module), so no resize is needed here.
+    # BGR uint8 to flat RGBA float32 for DPG texture upload. Panels are already
+    # pre-rendered at physical pixel resolution, so no resize is needed.
     def _to_tex(bgr: np.ndarray) -> np.ndarray:
         h, w = bgr.shape[:2]
         out = np.empty((h, w, 4), dtype=np.float32)
@@ -477,26 +468,26 @@ def main() -> None:
     while dpg.is_dearpygui_running() and not _quit[0]:
         r = renderer[0]
 
-        # ── Stream connect ─────────────────────────────────────────────────────
+        # Stream connect
         if not stream_ok[0] and _conn['ok']:
             cap = _conn['cap']
             _fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             _fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             if _fw > 0 and _fh > 0:
-                tracker.set_frame_size(_fh, _fw)        # swapped: camera rotated 90°
+                tracker.set_frame_size(_fh, _fw)        # swapped: camera rotated 90 deg
                 person_tracker.set_frame_size(_fh, _fw)
             r.attach_grabber(FrameGrabber(cap, loop=_conn.get('loop', False)))
             stream_ok[0] = True
             print(f"Stream connected: {_fw}×{_fh}", flush=True)
 
-        # ── Stream disconnect ──────────────────────────────────────────────────
+        # Stream disconnect
         if stream_ok[0] and not r.stream_alive:
             stream_ok[0] = False
             cap = None
             _conn.update({'cap': None, 'ok': False, 'busy': False})
             print("Stream lost — showing standby display", flush=True)
 
-        # ── Upload only changed panels to GPU ──────────────────────────────────
+        # Upload only changed panels to GPU
         panels = r.latest_panels()
         if panels is not None:
             vid, side, stats, vs, ss, sts = panels
@@ -510,7 +501,7 @@ def main() -> None:
                 dpg.set_value("tex_stats", _to_tex(stats))
                 _seen[2] = sts
 
-        # ── Overlay tick + upload ──────────────────────────────────────────────
+        # Overlay tick + upload
         now_active = _overlay.is_active()
         if now_active or _overlay_was_active:
             with _mav_lock:
@@ -522,12 +513,8 @@ def main() -> None:
 
         dpg.render_dearpygui_frame()
 
-    # Halt DPG's internal Metal command-dispatch thread immediately.
-    # When the user clicks the OS close button, DPG begins its own partial
-    # teardown while its render thread keeps running.  Every second we spend
-    # in join() or shutdown() below is a second that thread can hit a freed
-    # Metal object (KERN_INVALID_ADDRESS, Thread 12).  Calling stop first
-    # drains DPG before we do anything else.
+    # Halt DPG's Metal command-dispatch thread FIRST: its render thread keeps
+    # running during teardown and can hit a freed Metal object (KERN_INVALID_ADDRESS).
     dpg.stop_dearpygui()
 
     r = renderer[0]

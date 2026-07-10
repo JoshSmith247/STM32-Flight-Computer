@@ -16,7 +16,7 @@ def exg_mask(frame: np.ndarray) -> np.ndarray:
     exg_gate = (exg > config.EXG_THRESH).astype(np.uint8)
 
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    # Hue 25-85 (OpenCV 0-179 scale) covers yellow-green → green → blue-green
+    # Hue 25-85 (OpenCV 0-179 scale) covers yellow-green -> green -> blue-green
     # Saturation floor rejects grey rocks, concrete, and lichen
     sat_gate = cv2.inRange(hsv, (25, config.EXG_SAT_MIN, 30), (85, 255, 255))
 

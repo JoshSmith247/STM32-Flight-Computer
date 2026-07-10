@@ -1,20 +1,6 @@
-//! LiPo battery voltage monitor — ADC3 on PC0 at 2 Hz.
-//!
-//! Hardware: voltage divider between pack positive and GND, midpoint → PC0.
-//!   Example: R1 = 4.7 kΩ (pack side), R2 = 1 kΩ (GND side)
-//!   → V_DIVIDER = (4.7 + 1.0) / 1.0 = 5.7
-//!
-//! Tune CELL_COUNT and V_DIVIDER for your pack and resistor values.
-//!
-//! Safe-abort behaviour (navigation_task reads STATE.battery.critical):
-//!   • 3 consecutive samples below V_CELL_CRIT (≈ 1.5 s) → critical = true
-//!   • Navigation overrides to RTH (GPS fix present) or Land (no fix)
-//!   • Once on the ground (AGL < 0.15 m) the task disarms and sets Fault
-//!     state, preventing re-arm until the battery is swapped
-//!
-//! NOTE: The embassy-stm32 ADC API changes between versions.  If Adc::new
-//! requires a Delay argument use: Adc::new(adc_peri, &mut embassy_time::Delay).
-//! If blocking_read is not available, replace it with `.read(&mut pin).await`.
+//! LiPo battery voltage monitor - ADC3 on PC0 (pack divider) at 2 Hz.
+//! 3 consecutive samples below V_CELL_CRIT latch critical; navigation then forces
+//! RTH/Land, and on the ground the task disarms and Fault-locks until pack swap.
 
 use defmt::{info, warn};
 use embassy_stm32::{
@@ -26,31 +12,28 @@ use embassy_time::{Duration, Ticker};
 
 use crate::{state, types::BatteryData, STATE};
 
-// ── Tune these for your hardware ────────────────────────────────────────────
+// Tune these for your hardware
 
 const CELL_COUNT: u32 = 4;          // 3 for 3S, 4 for 4S
 const V_DIVIDER:  f32 = 5.7;        // (R1 + R2) / R2
 const VREF:       f32 = 3.3;        // STM32 VDDA
 const ADC_FULL:   f32 = 4095.0;     // 12-bit resolution
 
-// ── ESC current sense (CUR pad → PF3 / ADC3) ────────────────────────────────
-// ⚠ Flip to `true` only after the CUR pad is wired AND CUR_A_PER_V is calibrated
-// against a known load (e.g. bench supply current limit or a clamp meter).
-// While false, current_a publishes -1.0 and telemetry falls back to its
-// throttle-based estimate — a floating PF3 would otherwise report garbage amps.
+// ESC current sense (CUR pad -> PF3 / ADC3)
+// WARNING: Flip to `true` only after the CUR pad is wired AND CUR_A_PER_V is calibrated -
+// a floating PF3 reports garbage amps. While false, current_a publishes -1.0.
 const CUR_SENSE_FITTED: bool = false;
-// A per volt at the CUR pad. 40 A/V (25 mV/A) is a common BLHeli_S 4-in-1 scale
-// (Betaflight "scale 250") — a starting guess ONLY; calibrate before trusting.
+// A per volt at the CUR pad. 40 A/V is a common BLHeli_S 4-in-1 scale - a
+// starting guess ONLY; calibrate before trusting.
 const CUR_A_PER_V: f32 = 40.0;
 
 const V_CELL_FULL:  f32 = 4.20;     // 100 %
-const V_CELL_EMPTY: f32 = 3.00;     //   0 %
-/// Per-cell critical threshold, measured UNDER LOAD (≈3.5–3.6 V resting).
-/// Maps to 25 % on the linear pct curve — must stay BELOW navigation's
-/// BATT_LOW_PCT (30 %) so the low→RTH stage fires before the critical abort.
+const V_CELL_EMPTY: f32 = 3.00;     // 0 %
+/// Per-cell critical threshold UNDER LOAD. Maps to 25% - must stay BELOW
+/// navigation's BATT_LOW_PCT (30%) so low->RTH fires before the critical abort.
 const V_CELL_CRIT:  f32 = 3.30;
 
-// ── Helpers ─────────────────────────────────────────────────────────────────
+// Helpers
 
 fn voltage_to_pct(v_total: f32) -> u8 {
     let per_cell = v_total / CELL_COUNT as f32;
@@ -58,7 +41,7 @@ fn voltage_to_pct(v_total: f32) -> u8 {
         .clamp(0.0, 100.0) as u8
 }
 
-// ── Task ─────────────────────────────────────────────────────────────────────
+// Task
 
 #[embassy_executor::task]
 pub async fn battery_task(
@@ -66,18 +49,25 @@ pub async fn battery_task(
     mut vbat_pin: Peri<'static, peripherals::PC0>,
     mut cur_pin:  Peri<'static, peripherals::PF3>,
 ) {
+    // no-batt: publish "unknown but OK" once and park; the flight timer is the
+    // only pack protection. WARNING: The pilot owns pack health.
+    #[cfg(feature = "no-batt")]
+    {
+        let _ = (&adc_peri, &vbat_pin, &cur_pin);
+        *STATE.battery.lock().await =
+            BatteryData { voltage_v: 0.0, pct: 0, critical: false, current_a: -1.0 };
+        warn!("no-batt build: battery sensing DISABLED — flight timer is the only pack protection");
+        core::future::pending::<()>().await;
+    }
+
     let mut adc = Adc::new(adc_peri);
 
     let mut ticker       = Ticker::every(Duration::from_hz(2));
-    // Seeded critical: BatteryData defaults to critical=true, and the first
-    // published sample must not flip it to false before 3 real lows can
-    // accumulate — that opened a ~1 s post-boot window where the pre-arm
-    // battery gate was open at 0 V. Costs 10 clean samples (~5 s) to clear.
+    // Seeded critical so the first sample can't open a post-boot window where
+    // the pre-arm battery gate is open at 0 V. Takes 10 clean samples to clear.
     let mut consec_crit: u8 = 3;
     let mut consec_good: u8 = 0;
-    // Log rate-limiting: critical warns every 10th sample (5 s), normal info
-    // only when the 10 %-decade changes (pct % 10 == 0 held for whole samples
-    // at 2 Hz — continuously on a bench with no pack).
+    // Log rate-limiting: critical warns every 10th sample, normal info per 10%-decade change.
     let mut crit_log:   u8 = 0;
     let mut log_decade: u8 = 255;
 
@@ -101,9 +91,8 @@ pub async fn battery_task(
             -1.0
         };
 
-        // Asymmetric hysteresis: 3 consecutive low samples (~1.5 s) to go
-        // critical; 10 consecutive good samples (~5 s) without any low sample
-        // to clear it. Any bad reading resets the recovery counter.
+        // Asymmetric hysteresis: 3 consecutive lows to go critical, 10 consecutive
+        // goods to clear; any bad reading resets the recovery counter.
         if low {
             consec_crit = consec_crit.saturating_add(1);
             consec_good = 0;

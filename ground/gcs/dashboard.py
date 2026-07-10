@@ -25,14 +25,13 @@ _STATE_COLORS = {
     5: (40,  40, 210),
 }
 
-# Maps PROGRAMS index → (cmd, param1, param2) sent on SEND. DO_SET_MODE param2
-# = firmware FlightMode discriminant, same numbering as HEARTBEAT custom_mode
-# (0=Stab 1=AltH 2=PosH 3=Auto 4=RTH 5=Land 6=FollowMe).
+# Maps PROGRAMS index to (cmd, param1, param2) sent on SEND. DO_SET_MODE param2
+# = firmware FlightMode discriminant (same numbering as HEARTBEAT custom_mode).
 _PROG_COMMANDS = {
-    0: (176, 0.0, 0.0),   # MANUAL      → DO_SET_MODE, Stabilise
-    1: (176, 0.0, 6.0),   # FOLLOW ME   → DO_SET_MODE, FollowMe
-    2: (176, 0.0, 3.0),   # WEED PICKER → DO_SET_MODE, Auto
-    3: (20,  0.0, 0.0),   # RETURN HOME → NAV_RETURN_TO_LAUNCH
+    0: (176, 0.0, 0.0),   # MANUAL -> DO_SET_MODE, Stabilise
+    1: (176, 0.0, 6.0),   # FOLLOW ME -> DO_SET_MODE, FollowMe
+    2: (176, 0.0, 3.0),   # WEED PICKER -> DO_SET_MODE, Auto
+    3: (20,  0.0, 0.0),   # RETURN HOME -> NAV_RETURN_TO_LAUNCH
 }
 
 _ui_state: dict = {
@@ -42,20 +41,16 @@ _ui_state: dict = {
     'denied_until':     0.0,
 }
 
-# ── Bench motor test (MAV_CMD_DO_MOTOR_TEST, 209) ────────────────────────────
-# A row of M1..M4 buttons under the SEND/STOP buttons. The firmware spins one
-# motor for 2 s, ONLY while disarmed and on the ground (Idle), and clamps the
-# throttle to 0.20. PROPS OFF — this exists to verify per-corner wiring + spin
-# direction during bring-up.
-MOTOR_TEST_THROTTLE = 0.08   # 8 % — clear spin, well under the firmware's 0.20 clamp
-# Logical-pixel geometry of the program panel's button rows, relative to the panel
-# top. Shared by _draw_program_panel (× config.PR when drawing) and
-# _handle_overlay_click (× 1 when hit-testing) so buttons and hit-boxes stay aligned.
+# Bench motor test (MAV_CMD_DO_MOTOR_TEST, 209): M1..M4 buttons. Firmware spins
+# one motor for 2 s, only disarmed + Idle, throttle clamped to 0.20. PROPS OFF.
+MOTOR_TEST_THROTTLE = 0.08   # 8 % - clear spin, well under the firmware's 0.20 clamp
+# Logical-pixel geometry of the program panel's button rows, shared by
+# _draw_program_panel and _handle_overlay_click so buttons and hit-boxes stay aligned.
 _PROG_SEP_Y  = 28 + len(PROGRAMS) * 26 + 4   # separator under the program rows (136)
-_PROG_BTN_Y0 = _PROG_SEP_Y + 6               # SEND/STOP/LAND/RESUME button top  (142)
-_PROG_BTN_Y1 = _PROG_SEP_Y + 30              # ...and bottom                      (166)
-_MT_BTN_Y0   = _PROG_BTN_Y1 + 18             # motor-test M1..M4 button top       (184)
-_MT_BTN_Y1   = _MT_BTN_Y0 + 26               # ...and bottom                      (210)
+_PROG_BTN_Y0 = _PROG_SEP_Y + 6               # SEND/STOP/LAND/RESUME button top (142)
+_PROG_BTN_Y1 = _PROG_SEP_Y + 30              # ...and bottom (166)
+_MT_BTN_Y0   = _PROG_BTN_Y1 + 18             # motor-test M1..M4 button top (184)
+_MT_BTN_Y1   = _MT_BTN_Y0 + 26               # ...and bottom (210)
 
 
 def _motor_test_btn_xranges(w: int, unit: float):
@@ -100,7 +95,7 @@ def handle_payload_double_click(px: int, py: int) -> None:
         toggle_payload_override(bits[idx])
 
 
-_horizon_img_cache: dict = {}   # r → {'sky': patch, 'gnd': patch}
+_horizon_img_cache: dict = {}   # r -> {'sky': patch, 'gnd': patch}
 
 
 def _load_horizon_patch(path: str, r: int) -> np.ndarray | None:
@@ -599,7 +594,7 @@ def _draw_weed_map(panel: np.ndarray, x: int, y: int, w: int, h: int,
 def _draw_program_panel(panel: np.ndarray, x: int, y: int, w: int,
                         armed: bool = False) -> None:
     global _arm_btn_rect
-    _arm_btn_rect = (0, 0, 0, 0)   # no ARM button — arming is via pre-flight overlay only
+    _arm_btn_rect = (0, 0, 0, 0)   # no ARM button - arming is via pre-flight overlay only
     s = config.PR
     P = 10 * s
     cv2.line(panel, (x, y), (x + w, y), (48, 48, 48), max(1, s))
@@ -653,9 +648,8 @@ def _draw_program_panel(panel: np.ndarray, x: int, y: int, w: int,
         _btn(x + 8 * s,        x + 88 * s,      (18, 18, 120), (40, 40, 190),  'STOP',   (80, 80, 230))
         _btn(x + w - 88 * s,   x + w - 8 * s,   (34, 54, 90),  (72, 108, 160), 'SEND',   (172, 210, 255))
 
-    # ── Motor test (bench bring-up — PROPS OFF) ────────────────────────────────
-    # One M1..M4 button row. Each sends MAV_CMD_DO_MOTOR_TEST; the firmware spins
-    # that motor for 2 s and only while disarmed + Idle, so it is safe on the bench.
+    # Motor test row (bench bring-up, PROPS OFF): each button sends
+    # MAV_CMD_DO_MOTOR_TEST; firmware spins that motor 2 s, disarmed + Idle only.
     mt_y0 = y + _MT_BTN_Y0 * s
     mt_y1 = y + _MT_BTN_Y1 * s
     gfx.put_text(panel, 'MOTOR TEST', (x + 8 * s, mt_y0 - 5 * s), 0.32 * s, (120, 110, 70))
@@ -680,7 +674,7 @@ def _handle_overlay_click(lx: int, ly: int) -> None:
     if row_i < len(PROGRAMS):
         _ui_state['selected_prog'] = row_i
         return
-    # Motor-test buttons (M1..M4), below the SEND/STOP row. PROPS OFF — the
+    # Motor-test buttons (M1..M4), below the SEND/STOP row. PROPS OFF - the
     # firmware only honours this while disarmed and on the ground (Idle).
     if _MT_BTN_Y0 <= ly <= _MT_BTN_Y1:
         for i, (bx0, bx1) in enumerate(_motor_test_btn_xranges(config.STATS_W // 2, 1)):
@@ -691,8 +685,7 @@ def _handle_overlay_click(lx: int, ly: int) -> None:
                 return
         return
     # SEND / STOP / LAND / RESUME button row. Tight hit-boxes matching the drawn
-    # buttons (see _draw_program_panel) so clicks in the surrounding padding do
-    # nothing instead of firing a command.
+    # buttons so clicks in the surrounding padding don't fire a command.
     if not (_PROG_BTN_Y0 <= ly <= _PROG_BTN_Y1):
         return
     panel_w      = config.STATS_W // 2
@@ -783,13 +776,13 @@ def draw_stats_panel(h: int, tracker=None) -> np.ndarray:
     hdg    = math.degrees(yaw) % 360
     climb  = -vz
 
-    # ── Header ───────────────────────────────────────────────────────────────
+    # Header
     cv2.rectangle(panel, (s, 0), (W, 36 * s), (40, 44, 50), -1)
     (tw, _), _ = gfx.size('FLIGHT COMPUTER', 0.46 * s)
     gfx.put_text(panel, 'FLIGHT COMPUTER', (W // 2 - tw // 2, 23 * s), 0.46 * s, (185, 192, 200))
     cv2.line(panel, (0, 36 * s), (W, 36 * s), (60, 60, 60), max(1, s))
 
-    # ── Status row ───────────────────────────────────────────────────────────
+    # Status row
     sy = 57 * s
     dot_col = (50, 210, 50) if linked else (60, 60, 200)
     cv2.circle(panel, (13 * s, sy - 5 * s), 5 * s, dot_col, -1)
@@ -811,7 +804,7 @@ def draw_stats_panel(h: int, tracker=None) -> np.ndarray:
     cv2.line(panel, (0, CY), (W, CY), (48, 48, 48), max(1, s))
     cv2.line(panel, (COL, CY), (COL, H - 1), (50, 50, 50), max(1, s))
 
-    # ── Left column ──────────────────────────────────────────────────────────
+    # Left column
     L          = 0
     BATT_NAV_H = 295 * s
     gauge_area = max(180 * s, H - CY - BATT_NAV_H)
@@ -860,7 +853,7 @@ def draw_stats_panel(h: int, tracker=None) -> np.ndarray:
                         time_rem   if linked else 0)
     _draw_distance_home(panel, L, power_y + 155 * s, COL, lat, lon, origin)
 
-    # ── Right column ─────────────────────────────────────────────────────────
+    # Right column
     R          = COL
     MOTORS_H   = 260 * s
     payloads_h = (24 + len(PAYLOAD_NAMES) * 24 + 20) * s
