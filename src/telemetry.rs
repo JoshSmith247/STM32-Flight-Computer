@@ -350,11 +350,14 @@ async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
             if param1 >= 0.5 {
                 // Same pre-arm gates as the RC path, plus the RC arm switch
                 // must be ON — arming_task disarms within 20 ms if it's low.
+                // RC gates are waived while rc_gates_active() is false
+                // (`rc-optional` build with no SBUS link ever seen).
                 let rc = *STATE.rc_input.lock().await;
-                if !rc.arm {
+                let rc_gates = crate::rc_gates_active();
+                if rc_gates && !rc.arm {
                     warn!("MAVLink: arm rejected — RC arm switch is off");
                     MAV_RESULT_TEMPORARILY_REJECTED
-                } else if rc.throttle >= 0.05 || rc.failsafe
+                } else if (rc_gates && (rc.throttle >= 0.05 || rc.failsafe))
                     || state::get() == FlightState::Fault
                 {
                     warn!("MAVLink: arm rejected — throttle/failsafe/Fault gate");
@@ -380,22 +383,26 @@ async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
                     MAV_RESULT_TEMPORARILY_REJECTED
                 } else {
                     *STATE.armed.lock().await = false;
-                    state::set(FlightState::Idle);
+                    // A latched Fault stays latched (same rule as the RC disarm
+                    // path in arming_task) — recovery is owned by the fault source.
+                    if state::get() != FlightState::Fault {
+                        state::set(FlightState::Idle);
+                    }
                     info!("MAVLink: disarmed");
                     MAV_RESULT_ACCEPTED
                 }
             }
         }
         183 => {
-            let idx  = param1 as u8;
             let norm = (param2.clamp(1000.0, 2000.0) - 1000.0) / 1000.0;
-            let mut s = *STATE.servo_outputs.lock().await;
-            match idx {
+            // Mutate under one lock — a read/modify/write across two lock takes
+            // can revert a concurrent navigation grip actuation.
+            let mut s = STATE.servo_outputs.lock().await;
+            match param1 as u8 {
                 1 => s.s1 = norm, 2 => s.s2 = norm,
                 3 => s.s3 = norm, 4 => s.s4 = norm,
                 _ => return MAV_RESULT_UNSUPPORTED,
             }
-            *STATE.servo_outputs.lock().await = s;
             MAV_RESULT_ACCEPTED
         }
         209 => {
@@ -629,7 +636,9 @@ pub async fn telemetry_task(
                     let n = write_frame(&mut buf, seq, 0, &p, MAGIC_HEARTBEAT);
                     tx.write(&buf[..n]).await.ok();
                     seq = seq.wrapping_add(1);
-                    info!("HB tx — state={} mode={} payloads=0x{:04X}", flight_state, mode, pl_flags);
+                    // debug-level: 1 Hz RTT chatter pollutes the dshot-debug
+                    // cadence stats (defmt-RTT blocking is the prime suspect).
+                    defmt::debug!("HB tx — state={} mode={} payloads=0x{:04X}", flight_state, mode, pl_flags);
                 }
                 2 => {
                     let bat = *STATE.battery.lock().await;

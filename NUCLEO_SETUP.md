@@ -27,13 +27,13 @@ board revision — remove the bridge that ties each pin to its onboard function:
 
 | Pin | Firmware use | Onboard conflict | Action |
 |-----|--------------|------------------|--------|
-| **PA7** | SPI1_MOSI (IMU/baro) | Ethernet `RMII_CRS_DV` | Remove the Ethernet SB on PA7 (you don't use Ethernet) |
+| **PA7** | SPI1_MOSI (IMU/baro) | Ethernet `RMII_CRS_DV` | **RESOLVED in firmware** (2026-07-03): the `nucleo` feature moves MOSI to **PD7** — wire IMU/baro MOSI to PD7, leave PA7 and its SB alone |
 | **PB0** | Motor M3 (TIM3_CH3) | Green user LED **LD1** | Remove the LD1 SB (or accept LD1 blinking with DSHOT during bench tests) |
 
-Alternative if you'd rather not touch bridges: remap M3 to **PC8** (other TIM3_CH3
-pin) — but that needs `motor.rs` changes (GPIOC clock + separate pin config, since
-`dshot_init` currently configures all four motor pins on GPIOB), so the SB removal
-is cleaner. PA7 has no clean same-instance remap, so the SB removal is preferred there.
+Alternative if you'd rather not touch the LD1 bridge: remap M3 to **PC8** (other
+TIM3_CH3 pin) — but that needs `motor.rs` changes (GPIOC clock + separate pin
+config, since `dshot_init` currently configures all four motor pins on GPIOB), so
+accepting the LD1 flicker or removing its SB is cleaner.
 
 ## Pins kept as-is (no conflict in practice)
 - **USART3 PB10/PB11** (Pi telemetry): the ST-LINK VCP also uses USART3 (on PD8/PD9),

@@ -57,7 +57,10 @@ sudo apt install rsync -y
 Then run from the repo root on your laptop:
 
 ```bash
-rsync -avz --exclude='demo*' /Users/jsmith/Documents/GitHub/STM32-Flight-Computer/pi/ jsmith@raspberrypi.local:~/pi/
+# Excludes: demo videos (~330 MB), the Mac-architecture .venv (~116 MB, useless
+# on ARM Linux), Mac bytecode caches, and .env (never clobber the Pi's config).
+rsync -avz --exclude='demo*' --exclude='.venv' --exclude='__pycache__' --exclude='.env' \
+    /Users/jsmith/Documents/GitHub/STM32-Flight-Computer/pi/ jsmith@raspberrypi.local:~/pi/
 ```
 
 ## First-time setup (run after every reflash)

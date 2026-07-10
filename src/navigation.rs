@@ -307,6 +307,13 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
     let mut prev_mode:        FlightMode           = FlightMode::Stabilise;
     let mut home_set:         bool                 = false;
     let mut last_gps_ok:      Instant              = Instant::now();
+    // Latched failsafe response (geofence / battery). Held until disarm — a
+    // breach that "recovers" must not bounce the craft back onto the mission
+    // at the fence line, and load-sagging battery pct must not toggle RTH.
+    let mut failsafe_forced:  Option<FlightMode>   = None;
+    // Altitude latched at GPS loss so Auto/FollowMe hold height (not sticks-
+    // at-zero manual) during the window before the >5 s AltitudeHold demotion.
+    let mut gps_loss_alt:     Option<f32>          = None;
     let mut prev_armed:       bool                 = false;
     let mut takeoff_done:     bool                 = false;
     let mut takeoff_target_alt: f32               = 0.0;
@@ -327,7 +334,10 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
         let health   = *STATE.sensor_health.lock().await;
 
         let gps_ok = gps.usable();
-        if gps_ok { last_gps_ok = Instant::now(); }
+        if gps_ok {
+            last_gps_ok = Instant::now();
+            gps_loss_alt = None;
+        }
 
         let pos = gps.pos();
         // NED heading (0 = N, CW positive); never use raw Madgwick yaw in NED math.
@@ -343,6 +353,7 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
 
         if !is_armed {
             STATE.nav_command.lock().await.autonomous = false;
+            failsafe_forced = None; // latched failsafe responses end at disarm
             continue;
         }
 
@@ -374,54 +385,56 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
             }
         }
 
-        // Resolve effective mode: Fault → Land; critical battery → RTH or Land.
-        // Warns are edge-triggered against prev_mode — these branches hold for
-        // seconds and 100 Hz warns flood defmt-RTT.
+        // Failsafe triggers (geofence / battery) LATCH their response until
+        // disarm — re-evaluated per tick they oscillate at the fence line and
+        // on load-sagging battery pct. Skipped while the pilot is already
+        // flying a recovery mode (Land / RTH).
+        if failsafe_forced.is_none()
+            && !matches!(mode, FlightMode::Land | FlightMode::ReturnToHome)
+        {
+            // (reason, set Landing state?) — low battery is a routine RTH, not a
+            // landing-in-progress, so it leaves the flight state alone.
+            let trigger = if home_set
+                && (baro.altitude_m > GEOFENCE_MAX_ALT_M
+                    || (gps_ok && haversine_m(pos, mission.home) > GEOFENCE_MAX_RADIUS_M))
+            {
+                Some(("Geofence breach", true))
+            } else if battery.critical {
+                Some(("Critical battery", true))
+            } else if battery.voltage_v > 0.0 && battery.pct < BATT_LOW_PCT {
+                Some(("Low battery", false))
+            } else {
+                None
+            };
+            if let Some((why, set_landing)) = trigger {
+                let forced = if gps_ok && home_set {
+                    FlightMode::ReturnToHome
+                } else {
+                    FlightMode::Land
+                };
+                warn!("{=str} — forcing {} (latched until disarm)", why, forced);
+                if set_landing { state::set(state::FlightState::Landing); }
+                failsafe_forced = Some(forced);
+            }
+        }
+
+        // Pilot-selected Land still wins over a latched RTH (strictly more
+        // conservative); nothing overrides a latched Land.
+        let base_mode = match failsafe_forced {
+            Some(_) if mode == FlightMode::Land => FlightMode::Land,
+            Some(forced) => forced,
+            None => mode,
+        };
+
+        // Resolve effective mode: Fault → Land; sensor-loss demotions apply
+        // only to pilot modes — a latched RTH/Land handles its own GPS loss
+        // (RTH without a usable fix descends via the Lander).
         let effective_mode = if state::get() == state::FlightState::Fault {
             FlightMode::Land
-        } else if home_set
-            && (baro.altitude_m > GEOFENCE_MAX_ALT_M
-                || (gps_ok && haversine_m(pos, mission.home) > GEOFENCE_MAX_RADIUS_M))
-            && !matches!(mode, FlightMode::Land | FlightMode::ReturnToHome)
-        {
-            // Geofence breach (altitude ceiling or distance from home) → come home / land.
-            state::set(state::FlightState::Landing);
-            if gps_ok {
-                if prev_mode != FlightMode::ReturnToHome { warn!("Geofence breach — forcing RTH"); }
-                FlightMode::ReturnToHome
-            } else {
-                if prev_mode != FlightMode::Land { warn!("Geofence breach — forcing Land"); }
-                FlightMode::Land
-            }
-        } else if battery.critical
-            && !matches!(mode, FlightMode::Land | FlightMode::ReturnToHome)
-        {
-            state::set(state::FlightState::Landing);
-            if gps_ok && home_set {
-                if prev_mode != FlightMode::ReturnToHome { warn!("Critical battery — forcing RTH"); }
-                FlightMode::ReturnToHome
-            } else {
-                if prev_mode != FlightMode::Land { warn!("Critical battery — forcing Land"); }
-                FlightMode::Land
-            }
-        } else if battery.voltage_v > 0.0
-            && battery.pct < BATT_LOW_PCT
-            && !battery.critical
-            && !matches!(mode, FlightMode::Land | FlightMode::ReturnToHome)
-        {
-            if gps_ok && home_set {
-                if prev_mode != FlightMode::ReturnToHome {
-                    warn!("Low battery ({}%) — forcing RTH", battery.pct);
-                }
-                FlightMode::ReturnToHome
-            } else {
-                if prev_mode != FlightMode::Land {
-                    warn!("Low battery ({}%) — forcing Land (no GPS)", battery.pct);
-                }
-                FlightMode::Land
-            }
+        } else if failsafe_forced.is_some() {
+            base_mode
         } else if !health.baro_ok
-            && matches!(mode, FlightMode::AltitudeHold | FlightMode::PositionHold
+            && matches!(base_mode, FlightMode::AltitudeHold | FlightMode::PositionHold
                              | FlightMode::Auto | FlightMode::FollowMe)
         {
             // Dead baro mid-flight: every altitude PID would hold a frozen
@@ -432,7 +445,7 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
             }
             FlightMode::Stabilise
         } else if last_gps_ok.elapsed() > Duration::from_secs(5)
-            && matches!(mode, FlightMode::PositionHold | FlightMode::Auto
+            && matches!(base_mode, FlightMode::PositionHold | FlightMode::Auto
                              | FlightMode::ReturnToHome | FlightMode::FollowMe)
         {
             if prev_mode != FlightMode::AltitudeHold {
@@ -440,7 +453,7 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
             }
             FlightMode::AltitudeHold
         } else {
-            mode
+            base_mode
         };
 
         // Mode-entry initialisation — runs on the first tick of each new mode
@@ -584,10 +597,28 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
                 }
 
                 if !gps_ok {
-                    if prev_mode != FlightMode::Auto {
-                        warn!("Auto: no usable GPS fix");
+                    // Airborne with GPS gone but not yet demoted (>5 s →
+                    // AltitudeHold): hold the altitude where the fix died with
+                    // RC attitude live. Dropping to manual here means near-zero
+                    // throttle while the pilot's stick is parked. On the ground
+                    // (not Flying) manual passthrough stays — an altitude-hold
+                    // command there would spool up to hover throttle.
+                    if state::get() == state::FlightState::Flying {
+                        if gps_loss_alt.is_none() {
+                            warn!("Auto: GPS fix lost — holding altitude");
+                        }
+                        let alt = *gps_loss_alt.get_or_insert(baro.altitude_m);
+                        let rc = *STATE.rc_input.lock().await;
+                        let mut sp = rc.to_attitude_setpoint();
+                        sp.throttle = alt_pid.update(alt, baro.altitude_m);
+                        NavCommand { autonomous: true, attitude_setpoint: sp,
+                                     target: Default::default() }
+                    } else {
+                        if prev_mode != FlightMode::Auto {
+                            warn!("Auto: no usable GPS fix");
+                        }
+                        NavCommand { autonomous: false, ..Default::default() }
                     }
-                    NavCommand { autonomous: false, ..Default::default() }
                 } else if !takeoff_done {
                     // ── AUTO-TAKEOFF: climb to TAKEOFF_ALT_M before running the mission.
                     // Level attitude + alt PID to the captured target. NOTE: autonomous
@@ -826,10 +857,23 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
             // ── FollowMe: continuously track GCS person position at fixed alt ──
             FlightMode::FollowMe => {
                 if !gps_ok {
-                    if prev_mode != FlightMode::FollowMe {
-                        warn!("FollowMe: no usable GPS fix");
+                    // Same GPS-loss altitude hold as Auto (see comment there).
+                    if state::get() == state::FlightState::Flying {
+                        if gps_loss_alt.is_none() {
+                            warn!("FollowMe: GPS fix lost — holding altitude");
+                        }
+                        let alt = *gps_loss_alt.get_or_insert(baro.altitude_m);
+                        let rc = *STATE.rc_input.lock().await;
+                        let mut sp = rc.to_attitude_setpoint();
+                        sp.throttle = alt_pid.update(alt, baro.altitude_m);
+                        NavCommand { autonomous: true, attitude_setpoint: sp,
+                                     target: Default::default() }
+                    } else {
+                        if prev_mode != FlightMode::FollowMe {
+                            warn!("FollowMe: no usable GPS fix");
+                        }
+                        NavCommand { autonomous: false, ..Default::default() }
                     }
-                    NavCommand { autonomous: false, ..Default::default() }
                 } else {
                     if !hold_pos_set {
                         hold_pos = pos;

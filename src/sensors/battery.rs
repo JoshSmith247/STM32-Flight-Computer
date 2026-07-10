@@ -69,8 +69,17 @@ pub async fn battery_task(
     let mut adc = Adc::new(adc_peri);
 
     let mut ticker       = Ticker::every(Duration::from_hz(2));
-    let mut consec_crit: u8 = 0;
+    // Seeded critical: BatteryData defaults to critical=true, and the first
+    // published sample must not flip it to false before 3 real lows can
+    // accumulate — that opened a ~1 s post-boot window where the pre-arm
+    // battery gate was open at 0 V. Costs 10 clean samples (~5 s) to clear.
+    let mut consec_crit: u8 = 3;
     let mut consec_good: u8 = 0;
+    // Log rate-limiting: critical warns every 10th sample (5 s), normal info
+    // only when the 10 %-decade changes (pct % 10 == 0 held for whole samples
+    // at 2 Hz — continuously on a bench with no pack).
+    let mut crit_log:   u8 = 0;
+    let mut log_decade: u8 = 255;
 
     info!("Battery task started — {}S on PC0, divider {=f32}×", CELL_COUNT, V_DIVIDER);
 
@@ -107,7 +116,10 @@ pub async fn battery_task(
         *STATE.battery.lock().await = BatteryData { voltage_v: v_batt, pct, critical, current_a };
 
         if critical {
-            warn!("CRITICAL BATTERY {=f32} V  ({=u8} %)", v_batt, pct);
+            if crit_log == 0 {
+                warn!("CRITICAL BATTERY {=f32} V  ({=u8} %)", v_batt, pct);
+            }
+            crit_log = (crit_log + 1) % 10;
 
             // Fault-lock once on the ground: arm switch reset required after pack swap.
             // Prefer rangefinder AGL; fall back to baro when flow sensor is invalid.
@@ -123,8 +135,12 @@ pub async fn battery_task(
                 state::set(state::FlightState::Fault);
                 warn!("Critical battery — on ground — disarmed, Fault state set");
             }
-        } else if pct % 10 == 0 {
-            info!("Battery {=f32} V  ({=u8} %)", v_batt, pct);
+        } else {
+            crit_log = 0;
+            if pct / 10 != log_decade {
+                info!("Battery {=f32} V  ({=u8} %)", v_batt, pct);
+                log_decade = pct / 10;
+            }
         }
     }
 }

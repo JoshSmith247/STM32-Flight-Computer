@@ -40,6 +40,11 @@ const K_VEL_GPS: f32 = 0.30;
 const K_VEL_FLOW: f32 = 0.05;
 const FLOW_MAX_HEIGHT_MM: i32 = 5_000;
 
+/// Estimator-side GPS staleness bound, much tighter than types::GPS_FRESH_MS
+/// (2.5 s, the navigation gate): at 5 Hz a fix older than 3 epochs is a frozen
+/// snapshot, and pulling the estimate toward it fights the dead-reckoning.
+const GPS_CORR_FRESH_MS: u64 = 600;
+
 /// If accel-only dead-reckoning persists this long without any GPS correction,
 /// bleed velocity toward zero so a stuck/biased accel doesn't run the position
 /// estimate away unbounded during a long dropout.
@@ -185,7 +190,6 @@ pub async fn estimator_task() {
     let mut last_gps_lat: f64 = 0.0;
     let mut last_gps_lon: f64 = 0.0;
     let mut last_correct: Instant = Instant::now();
-    let mut had_recent_gps = false;
 
     info!("Estimator task started ({=u64} Hz)", RATE_HZ);
     let mut ticker = Ticker::every(Duration::from_hz(RATE_HZ));
@@ -200,7 +204,9 @@ pub async fn estimator_task() {
 
         // ── CORRECT from GPS (fresh valid fix only) ──────────────────────────
         let gps = *STATE.gps_fix.lock().await;
-        if gps.usable() {
+        let gps_fresh = gps.usable()
+            && Instant::now().as_millis().saturating_sub(gps.stamp_ms) <= GPS_CORR_FRESH_MS;
+        if gps_fresh {
             let moved = (gps.lat_deg != last_gps_lat) || (gps.lon_deg != last_gps_lon);
             // Correct on a new fix, or at least every 250 ms to keep tracking
             // even when stationary (lat/lon static but velocity meaningful).
@@ -212,7 +218,6 @@ pub async fn estimator_task() {
                 last_gps_lat = gps.lat_deg;
                 last_gps_lon = gps.lon_deg;
                 last_correct = Instant::now();
-                had_recent_gps = true;
             }
         } else if last_correct.elapsed() > Duration::from_secs(2) {
             // Long GPS dropout: coast on dead-reckoning but bleed velocity so a
@@ -220,8 +225,10 @@ pub async fn estimator_task() {
             est.vel_n *= DR_VEL_DECAY;
             est.vel_e *= DR_VEL_DECAY;
             est.vel_d *= DR_VEL_DECAY;
-            had_recent_gps = false;
         }
+        // Per-tick (not latched): flow fusion takes over as soon as GPS
+        // corrections stop, instead of waiting for the 2 s decay threshold.
+        let had_recent_gps = last_correct.elapsed().as_millis() < GPS_CORR_FRESH_MS;
 
         // ── Optional CORRECT from optical flow at low altitude ───────────────
         // Only fused when we lack a recent GPS update (flow then carries the

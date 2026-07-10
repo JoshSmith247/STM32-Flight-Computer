@@ -28,6 +28,13 @@ const SBUS_FLAG_FRAME_LOST: u8 = 1 << 2;
 const SBUS_MIN: u16 = 172;
 const SBUS_MAX: u16 = 1811;
 
+/// True once a valid SBUS frame has been received this boot. Consumed by
+/// `main::rc_gates_active()`: under `rc-optional`, RC gates only apply after
+/// the link has actually existed — but once seen, they apply permanently
+/// (a receiver that appears and then drops is a real failsafe, not "absent").
+pub static RC_EVER_SEEN: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// 16 SBUS channel values (raw 11-bit, 172–1811).
 #[derive(Default)]
 struct SbusFrame {
@@ -147,6 +154,7 @@ pub async fn rc_task(
                 if !link_up {
                     info!("SBUS: link acquired");
                     link_up = true;
+                    RC_EVER_SEEN.store(true, core::sync::atomic::Ordering::Relaxed);
                 }
                 if let Some(frame) = parse_sbus(&buf) {
                     let rc = if frame.failsafe {

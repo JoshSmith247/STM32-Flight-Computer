@@ -57,10 +57,10 @@
   PA10  USART1_RX     GPS        <-- GPS module TX             (AF7)
 
   --- PORT B ---------------------------------------------------------------
-  PB0   TIM3_CH3      Motor M3       DSHOT600                  (AF2)
-  PB1   TIM3_CH4      Motor M4       DSHOT600                  (AF2)
-  PB4   TIM3_CH1      Motor M1       DSHOT600                  (AF2)
-  PB5   TIM3_CH2      Motor M2       DSHOT600                  (AF2)
+  PB0   TIM3_CH3      Motor M3       DSHOT300                  (AF2)
+  PB1   TIM3_CH4      Motor M4       DSHOT300                  (AF2)
+  PB4   TIM3_CH1      Motor M1       DSHOT300                  (AF2)
+  PB5   TIM3_CH2      Motor M2       DSHOT300                  (AF2)
   PB8   I2C1_SCL      Mag            QMC5883L clock            (AF4)
   PB9   I2C1_SDA      Mag            QMC5883L data             (AF4)
   PB10  USART3_TX     Telemetry  --> Raspberry Pi RX           (AF7)
@@ -131,14 +131,15 @@
    Tilt-compensated using live AHRS quaternion. *** Still uncalibrated. ***
 
 ------------------------------------------------------------------------------
- GPS  —  SEQURE M10-18                              BUS: USART1, 38400 baud
+ GPS  —  SEQURE M10-18                              BUS: USART1, 115200 baud
 ------------------------------------------------------------------------------
    Module pin          ->  MCU pin    Notes
-   VCC                 ->  (per module: 3.3 V or 5 V — check its regulator)
+   VCC                 ->  5 V     (vendor spec; onboard reg, UART logic is 3.3 V)
    GND                 ->  GND
    TX                  ->  PA10       module TX  -> MCU RX
    RX                  ->  PA9        module RX  <- MCU TX (for UBX-CFG-VALSET)
-   Firmware enables UBX NAV-PVT @1Hz. If silent, some M10s ship at 115200.
+   Firmware enables UBX NAV-PVT @5Hz at 115200 baud (SEQURE vendor default,
+   spec sheet 2026-07-09). Generic u-blox M10s ship at 38400 — try if silent.
 
 ------------------------------------------------------------------------------
  RC  —  BETAFPV ExpressLRS Lite (SBUS out)          BUS: USART2, 100k 8E2 inv.

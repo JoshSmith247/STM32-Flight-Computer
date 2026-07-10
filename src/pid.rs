@@ -187,7 +187,10 @@ pub struct AltPid(Pid);
 impl AltPid {
     pub fn new() -> Self {
         // 1 m error → 0.05 throttle nudge; slow integrator for steady hover.
-        Self(Pid::new(0.05, 0.005, 0.10, 0.3, 0.4))
+        // i_limit clamps the INTEGRAL (error·s), not the I output: Ki × 40
+        // = 0.2 throttle of I authority, enough to trim a hover-throttle
+        // mismatch from the 0.55 assumption without saturating the output.
+        Self(Pid::new(0.05, 0.005, 0.10, 40.0, 0.4))
     }
 
     /// Returns throttle [0.1, 0.9] to hold `target_m` above takeoff.
@@ -211,7 +214,9 @@ impl PosPid {
         // 1 m position error → 0.05 rad lean (~3°).  Gentle I term corrects
         // slow wind drift; D damps oscillation around the hold point.
         // Output is clamped to ±25° (0.436 rad = MAX_TILT_RAD in navigation).
-        Self(Pid::new(0.05, 0.002, 0.08, 0.3, 0.436))
+        // i_limit clamps the INTEGRAL: Ki × 75 = 0.15 rad (~8.6°) of I
+        // authority — enough to stand against steady wind.
+        Self(Pid::new(0.05, 0.002, 0.08, 75.0, 0.436))
     }
 
     /// `err_m`: (target − current) in metres along one NED body-frame axis.

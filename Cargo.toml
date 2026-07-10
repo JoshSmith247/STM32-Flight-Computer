@@ -67,6 +67,14 @@ dshot600 = []
 # confirm each grab; failed grabs retry up to MAX_GRIP_ATTEMPTS then abort to
 # mission. OFF = legacy open-loop timer behaviour (no switch fitted).
 grip-sense = []
+# ⚠ RC-OPTIONAL (radio lost/absent): while NO SBUS link has been seen this boot,
+# the RC gates (arm switch, throttle-low, failsafe) are skipped for MAVLink
+# arming and RC failsafe cannot kill the motors — the GCS disarm command (force
+# magic 21196 while in-air) and the Pi-loss watchdog (Fault→Land after 5 s) are
+# then the ONLY kill paths. The moment an SBUS link IS seen, full RC authority
+# applies as normal, including mid-flight link-loss motor cut. Bench and
+# low-hover use only — build without this feature once the radio is replaced.
+rc-optional = []
 # PID-tuning "blackbox": stream ~50 Hz setpoint/measured/gyro/output over RTT defmt for
 # capture + plotting during tuning (`cargo run --features tune-log`). Off by default.
 tune-log = []

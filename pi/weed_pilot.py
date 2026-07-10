@@ -57,6 +57,19 @@ HEARTBEAT_HZ     = 4    # send heartbeat at 4 Hz — many retries within the FC'
 _seq_lock = threading.Lock()
 _seq      = 0
 
+# Source-IP allowlist rejections, announced once per offending IP. Silent drops
+# cost real debugging time on a dual-homed laptop (Pi 4 setup: shell on Ethernet
+# + video on WiFi) — commands can arrive from the "other" interface's IP.
+_dropped_ips: set = set()
+
+
+def _warn_drop(tag: str, ip: str) -> None:
+    if ip not in _dropped_ips:
+        _dropped_ips.add(ip)
+        print(f"{tag}: ignoring packets from {ip} (allowlist is LAPTOP_IP={LAPTOP_IP}) — "
+              f"if that's the laptop's other interface, fix LAPTOP_IP in ~/pi/.env",
+              flush=True)
+
 # Reference point for time_boot_ms (ms since this process started).
 _BOOT_TIME = time.monotonic()
 
@@ -190,6 +203,7 @@ def _gcs_to_serial(ser, gcs_port: int, ser_lock: threading.Lock) -> None:
         try:
             data, addr = sock.recvfrom(4096)
             if addr[0] != LAPTOP_IP:
+                _warn_drop('gcs→serial', addr[0])
                 continue
             with ser_lock:
                 ser.write(data)
@@ -211,6 +225,7 @@ def _weed_target_listener(ser, ser_lock: threading.Lock) -> None:
         try:
             data, addr = sock.recvfrom(256)
             if addr[0] != LAPTOP_IP:
+                _warn_drop('weed-listener', addr[0])
                 continue
             target  = json.loads(data.decode())
             wid     = target['wid']

@@ -50,12 +50,29 @@ pub static STATE: types::SharedState = types::SharedState::new();
 pub static SAFETY_PIN_INSTALLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(true);
 
+/// Remove-before-flight pin gate — DISABLED 2026-07-09 for bench bring-up (no
+/// jumper hardware fitted). Set true and fit the PA0→GND jumper before field
+/// flights: jumper OUT (pin open/high) = clear to arm.
+pub const SAFETY_PIN_ENABLED: bool = false;
+
+/// Whether the RC gates (arm switch, throttle-low, failsafe kill) are in
+/// force. Always true in normal builds. Under `rc-optional` (radio lost),
+/// false until an SBUS link has been seen this boot — an absent receiver
+/// cannot gate MAVLink arming or kill motors, but one that HAS been seen
+/// keeps full authority, including mid-flight link-loss motor cut.
+pub fn rc_gates_active() -> bool {
+    #[cfg(feature = "rc-optional")]
+    return sensors::rc::RC_EVER_SEEN.load(core::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "rc-optional"))]
+    true
+}
+
 /// Pre-arm gates. Every arm path (RC in arming_task, MAVLink cmd 400 in
 /// telemetry) MUST go through this single function.
 pub async fn pre_arm_check(mode: FlightMode) -> Result<(), &'static str> {
     use core::sync::atomic::Ordering;
 
-    if SAFETY_PIN_INSTALLED.load(Ordering::Relaxed) {
+    if SAFETY_PIN_ENABLED && SAFETY_PIN_INSTALLED.load(Ordering::Relaxed) {
         return Err("remove-before-flight pin installed");
     }
 
@@ -161,11 +178,17 @@ async fn control_task() {
 
         // Bench IMU bring-up: ~2 Hz attitude readout — tilt the board and watch
         // roll/pitch/yaw track to confirm IMU axes + fusion. Bench build only.
+        // yawNED is the NED heading (ahrs::ned_yaw): 0 = North, CW-positive —
+        // the bench acceptance test "yaw increases rotating clockwise from
+        // above" checks THIS value, not the raw (CCW-positive) Madgwick yaw.
         #[cfg(feature = "nucleo-vcp")]
         if wdg_tick % 250 == 0 {
             const R2D: f32 = 180.0 / core::f32::consts::PI;
-            info!("ATT  roll={=f32}deg  pitch={=f32}deg  yaw={=f32}deg",
-                  euler.roll * R2D, euler.pitch * R2D, euler.yaw * R2D);
+            // velD: estimator NED down-velocity (m/s) — the lift acceptance
+            // test wants this clearly NEGATIVE while raising the board.
+            let est = *STATE.pos_estimate.lock().await;
+            info!("ATT  roll={=f32}deg  pitch={=f32}deg  yawNED={=f32}deg  velD={=f32}m/s",
+                  euler.roll * R2D, euler.pitch * R2D, ahrs::ned_yaw(&quat) * R2D, est.vel_d);
         }
 
         // Crash/tumble cutoff: sustained extreme tilt while armed → kill motors, latch Fault.
@@ -184,7 +207,9 @@ async fn control_task() {
             crash_ticks = 0;
         }
 
-        if !is_armed || rc.failsafe {
+        // RC failsafe kills motors only while the RC gates are live (always in
+        // normal builds; under `rc-optional`, only once SBUS has been seen).
+        if !is_armed || (rc.failsafe && rc_gates_active()) {
             pids.reset_all();
             *STATE.motor_outputs.lock().await = Default::default();
             continue;
@@ -222,6 +247,10 @@ async fn arming_task(safety_pin: Input<'static>) {
     // Deny warns rate-limited: the deny path holds every tick while the switch is up.
     let mut last_deny_log: Option<Instant> = None;
 
+    #[cfg(feature = "rc-optional")]
+    defmt::warn!("⚠ rc-optional build: until an SBUS link is seen, MAVLink arming \
+                  skips the RC gates and GCS disarm is the ONLY kill switch");
+
     loop {
         ticker.next().await;
 
@@ -229,18 +258,27 @@ async fn arming_task(safety_pin: Input<'static>) {
 
         let rc       = *STATE.rc_input.lock().await;
         let is_armed = *STATE.armed.lock().await;
+        let rc_gates = rc_gates_active();
 
         if is_armed {
-            if !rc.arm || rc.failsafe {
+            if rc_gates && (!rc.arm || rc.failsafe) {
                 *STATE.armed.lock().await = false;
                 // A latched Fault stays latched; recovery is owned by the fault source.
                 if state::get() != FlightState::Fault {
                     state::set(FlightState::Idle);
                 }
                 info!("Disarmed");
-            } else if state::get() == FlightState::Armed && rc.throttle > 0.15 {
-                // Promote Armed → Flying once the pilot spools up past idle throttle.
-                state::set(FlightState::Flying);
+            } else if state::get() == FlightState::Armed {
+                // Promote Armed → Flying once real power is applied — pilot stick
+                // OR autonomous throttle. Without the autonomous term an Auto
+                // takeoff flies in state Armed, and the MAVLink disarm handler's
+                // in-air guard (Flying|Landing) would not protect it.
+                let nav = *STATE.nav_command.lock().await;
+                if rc.throttle > 0.15
+                    || (nav.autonomous && nav.attitude_setpoint.throttle > 0.15)
+                {
+                    state::set(FlightState::Flying);
+                }
             }
         } else if state::get() == FlightState::Fault {
             // Never arm out of Fault.

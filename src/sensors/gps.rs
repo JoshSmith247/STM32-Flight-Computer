@@ -1,7 +1,8 @@
 //! u-blox M10 GPS (SEQURE M10-18) — UBX NAV-PVT parser on USART1 (PA10 RX, PA9 TX).
 //!
 //! The M10 chip replaced the M8N's CFG-PRT / CFG-MSG protocol with UBX-CFG-VALSET.
-//! Default baud rate on M10 is 38400 (M8N was 9600).
+//! Baud: the SEQURE M10-18 ships at 115200 with UBX output enabled (vendor spec
+//! sheet, confirmed 2026-07-09). Generic u-blox M10 default is 38400.
 //!
 //! Startup sequence:
 //!   1. UBX-CFG-VALSET — enable NAV-PVT output on UART1
@@ -11,8 +12,8 @@
 //! Then loops reading NAV-PVT frames (92-byte payload) and writing STATE.gps_fix.
 //! Non-NAV-PVT frames (NMEA or other UBX) are drained and discarded.
 //!
-//! If the module doesn't respond, verify the default baud rate with a logic
-//! analyzer on PA10 — some M10 modules ship at 115200 instead of 38400.
+//! If the module doesn't respond, verify the baud rate with a logic analyzer
+//! on PA10 — try 38400 (generic u-blox default) if 115200 is silent.
 //!
 //! NAV-PVT payload offsets used here:
 //!   byte 20      fixType  (3 = 3-D fix)
@@ -122,7 +123,9 @@ pub async fn gps_task(
     irqs:      Irqs,
 ) {
     let mut cfg = Config::default();
-    cfg.baudrate = 38400; // u-blox M10 default (M8N was 9600)
+    // SEQURE M10-18 vendor default (spec sheet). Generic u-blox M10 modules
+    // ship at 38400 — fall back to that if this module is silent.
+    cfg.baudrate = 115200;
 
     let uart = Uart::new(uart_peri, rx_pin, tx_pin, tx_dma, rx_dma, irqs, cfg)
         .expect("USART1 (GPS) init failed");
@@ -137,11 +140,11 @@ pub async fn gps_task(
 
     // Ring-buffered DMA RX so the interleaved NMEA/UBX stream isn't dropped between
     // reads — one-shot byte reads lose bytes under load and corrupt UBX frames.
-    // 512 B ≈ 130 ms of slack @ 38400 baud.
+    // 512 B ≈ 44 ms of slack @ 115200 baud.
     let mut rx_ring = [0u8; 512];
     let mut rx = rx.into_ring_buffered(&mut rx_ring);
 
-    info!("GPS task started — UBX NAV-PVT @ 5 Hz, 38400 baud on USART1 (M10)");
+    info!("GPS task started — UBX NAV-PVT @ 5 Hz, 115200 baud on USART1 (M10-18)");
 
     let mut byte    = [0u8; 1];
     let mut hdr     = [0u8; 4];   // [class, id, len_l, len_h]
@@ -192,12 +195,19 @@ pub async fn gps_task(
         }
 
         let fix = parse_pvt(&payload);
+        let num_sv = payload[23]; // numSV — satellites used in the nav solution
         *STATE.gps_fix.lock().await = fix;
 
-        // Log on the no-fix→fix edge, then at most every 5 s.
+        // Log on the no-fix→fix edge, then at most every 5 s. While there is
+        // NO fix, still log at 5 s so the bench can tell "wired + parsing,
+        // waiting for satellites" apart from dead wiring (which is silent).
         if fix.fix_ok && (!had_fix || last_log.elapsed() > Duration::from_secs(5)) {
-            info!("GPS 3D fix  lat={=f64}  lon={=f64}  alt={=f32}m  hacc={=f32}m",
-                  fix.lat_deg, fix.lon_deg, fix.alt_m, fix.hacc_m);
+            info!("GPS 3D fix  lat={=f64}  lon={=f64}  alt={=f32}m  hacc={=f32}m  sats={=u8}",
+                  fix.lat_deg, fix.lon_deg, fix.alt_m, fix.hacc_m, num_sv);
+            last_log = embassy_time::Instant::now();
+        } else if !fix.fix_ok && last_log.elapsed() > Duration::from_secs(5) {
+            info!("GPS: NAV-PVT arriving (no fix yet) — fixType={=u8} sats={=u8}",
+                  fix.fix_type, num_sv);
             last_log = embassy_time::Instant::now();
         }
         had_fix = fix.fix_ok;

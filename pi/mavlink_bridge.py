@@ -39,13 +39,23 @@ def serial_to_udp(ser, sock: socket.socket) -> None:
             time.sleep(0.1)
 
 
+_dropped_ips: set = set()
+
+
 def udp_to_serial(ser, sock: socket.socket) -> None:
     while True:
         try:
             data, addr = sock.recvfrom(4096)
             # Only relay commands from the known GCS laptop — anyone on the
-            # network could otherwise inject MAVLink at the drone.
+            # network could otherwise inject MAVLink at the drone. Announce
+            # (once per IP) so a dual-homed laptop's wrong-interface commands
+            # don't fail silently.
             if addr[0] != LAPTOP_IP:
+                if addr[0] not in _dropped_ips:
+                    _dropped_ips.add(addr[0])
+                    print(f"udp→serial: ignoring {addr[0]} (allowlist is "
+                          f"LAPTOP_IP={LAPTOP_IP}) — fix LAPTOP_IP in ~/pi/.env "
+                          f"if that's the laptop", flush=True)
                 continue
             ser.write(data)
         except socket.timeout:
