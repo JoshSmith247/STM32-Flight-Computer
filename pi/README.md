@@ -104,6 +104,43 @@ After it reboots, confirm the port exists before continuing:
 ls -l /dev/serial0      # should symlink → ttyAMA0
 ```
 
+⚠ If this points at **ttyS0** instead, the config didn't take — MAVLink will be
+garbage (mini-UART baud drifts with the CPU clock). Redo step 2 and re-check.
+
+### 3. WiFi power-save OFF, permanently
+
+Power-save parks the radio and causes random drops/unreachability. The `iw`
+command does NOT survive reboot — install it as a boot service instead:
+
+```bash
+sudo tee /etc/systemd/system/wifi-powersave-off.service >/dev/null <<'EOF'
+[Unit]
+Description=Disable WiFi power management (prevents random drops)
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/sleep 5
+ExecStart=/usr/sbin/iw dev wlan0 set power_save off
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable --now wifi-powersave-off.service
+iw dev wlan0 get power_save    # must say "off"
+```
+
+### 4. Hostname — BEFORE this Pi ever shares a network with the other Pi
+
+Two Pis both named `raspberrypi.local` make SSH/mDNS resolve to the wrong
+machine ("can't connect" with a perfectly healthy Pi). Rename now:
+
+```bash
+sudo hostnamectl set-hostname pi4-dev   # or zero2w-flight for the Zero
+```
+
 ## Installing and starting services
 
 Run once on the Pi after syncing (fixes hardcoded paths, then installs and enables the systemd services):
@@ -161,12 +198,9 @@ debug the symptoms (see Troubleshooting below for the full rationale).
   single 2.4 GHz radio and lock up your SSH shell. `.env.example` already ships
   `CAM_BITRATE=800k`; confirm it's in your `~/pi/.env` (drop to `500k` if `ping`
   to the Pi still spikes while streaming), then `sudo systemctl restart camera`.
-- **Disable WiFi power-save**, which parks the radio and causes random drops. This
-  does **not** persist across reboot, so re-run it after every boot (or add it to
-  `/etc/rc.local` / a systemd unit):
-  ```bash
-  sudo iw dev wlan0 set power_save off
-  ```
+- **Disable WiFi power-save** — now installed as a persistent systemd unit in
+  First-time setup step 3 above. If drops persist, verify it took:
+  `iw dev wlan0 get power_save` must say "off".
 
 ## Troubleshooting: is the Pi overloaded?
 

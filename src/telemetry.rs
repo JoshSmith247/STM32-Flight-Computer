@@ -331,6 +331,26 @@ fn build_statustext_dshot() -> [u8; 51] {
     p
 }
 
+// Executor-cadence STATUSTEXT: observable over MAVLink with defmt compiled out
+// and no RTT host - the only way to measure cadence without the prime suspect
+// (blocking RTT) in the loop.
+#[cfg(feature = "dshot-debug")]
+fn build_statustext_cadence() -> [u8; 51] {
+    use core::fmt::Write;
+    use core::sync::atomic::Ordering;
+    use crate::actuators::motor::debug_stats as ds;
+
+    let long_gaps = ds::LONG_GAPS.load(Ordering::Relaxed);
+    let mut p = [0u8; 51];
+    p[0] = if long_gaps > 0 { 4 } else { 6 }; // MAV_SEVERITY_WARNING on clumping, else INFO
+    let mut fb = FixedBuf { buf: [0u8; 50], len: 0 };
+    let _ = write!(fb, "CAD gap={}us lg={} sg={} (steady: <2500,0,0)",
+        ds::MAX_GAP_US.load(Ordering::Relaxed), long_gaps,
+        ds::SHORT_GAPS.load(Ordering::Relaxed));
+    p[1..1 + fb.len].copy_from_slice(&fb.buf[..fb.len]);
+    p
+}
+
 // Command dispatcher
 
 async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
@@ -672,6 +692,11 @@ pub async fn telemetry_task(
                     let n = write_frame(&mut buf, seq, 253, &p, MAGIC_STATUSTEXT);
                     tx.write(&buf[..n]).await.ok();
                     seq = seq.wrapping_add(1);
+                    // Executor cadence rides in its own STATUSTEXT (50-char cap).
+                    let p = build_statustext_cadence();
+                    let n = write_frame(&mut buf, seq, 253, &p, MAGIC_STATUSTEXT);
+                    tx.write(&buf[..n]).await.ok();
+                    seq = seq.wrapping_add(1);
                 }
                 _ => {}
             }
@@ -710,6 +735,9 @@ pub async fn telemetry_task(
     // RX loop
     let rx_fut = async {
         let mut sm:      u8        = 0; // 0=SYNC 1=HDR 2=PAY 3=CRC 4=SIGN
+        // CRC-fail warns rate-limited: corrupted-line byte soup (baud mismatch,
+        // mini-UART clock drift, bad ground) floods hundreds/s and drowns RTT.
+        let mut crc_fails: u32     = 0;
         let mut hdr      = [0u8; 9];
         let mut hdr_idx: usize     = 0;
         let mut payload  = [0u8; 64];
@@ -781,7 +809,11 @@ pub async fn telemetry_task(
                         crc
                     };
                     if computed != u16::from_le_bytes(crc_buf) {
-                        warn!("MAVLink CRC fail msgid={}", msg_id);
+                        crc_fails += 1;
+                        if crc_fails == 1 || crc_fails % 50 == 0 {
+                            warn!("MAVLink CRC fail msgid={} (total {=u32} — steady stream = baud/clock/ground issue, check /dev/serial0 → ttyAMA0)",
+                                  msg_id, crc_fails);
+                        }
                         continue;
                     }
 

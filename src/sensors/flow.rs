@@ -45,12 +45,28 @@ pub async fn flow_task(
     let mut hdr     = [0u8; 5];            // dev_id, sys_id, msg_id, seq, len
     let mut payload = [0u8; MAX_PAYLOAD];
     let mut cksum   = [0u8; 1];
+    // Bench readout: ~2 Hz at the 50 Hz frame rate (nucleo-vcp builds only).
+    #[cfg(feature = "nucleo-vcp")]
+    let mut log_ctr: u32 = 0;
+
+    // Silence detector: counts 500 ms sync timeouts (reset by ANY received
+    // byte) so a dead line is loudly distinguishable from wrong-protocol
+    // chatter (which shows up as checksum mismatches instead).
+    let mut silent_ticks: u32 = 0;
 
     loop {
         // sync on header byte
         match with_timeout(Duration::from_millis(500), super::read_exact_ring(&mut rx, &mut byte)).await {
-            Ok(Ok(())) if byte[0] == MICOLINK_HEAD => {}
-            _ => continue,
+            Ok(Ok(())) if byte[0] == MICOLINK_HEAD => { silent_ticks = 0; }
+            Ok(Ok(())) => { silent_ticks = 0; continue; } // byte arrived, not a header — resync
+            _ => {
+                silent_ticks += 1;
+                if silent_ticks % 10 == 0 { // every ~5 s of dead air
+                    warn!("Flow: UART4 SILENT ({=u32}s) — check module power, TX→PC11, jumpers",
+                          silent_ticks / 2);
+                }
+                continue;
+            }
         }
 
         // dev_id / sys_id / msg_id / seq / len
@@ -99,5 +115,17 @@ pub async fn flow_task(
             valid,
             stamp_ms:     crate::types::stamp_now_ms(),
         };
+
+        // Bench bring-up readout — polarity check: at fixed height, slide the
+        // drone FORWARD → vx must go POSITIVE; slide RIGHT → vy POSITIVE.
+        // (Raw MICOLINK units: cm/s at 1 m height.)
+        #[cfg(feature = "nucleo-vcp")]
+        {
+            log_ctr += 1;
+            if log_ctr % 25 == 0 {
+                info!("FLOW  h={=i32}mm  q={=u8}  vx={=i32}  vy={=i32}  valid={=bool}",
+                      height_mm, quality, flow_x, flow_y, valid);
+            }
+        }
     }
 }

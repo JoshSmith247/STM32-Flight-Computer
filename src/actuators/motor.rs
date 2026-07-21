@@ -102,6 +102,19 @@ pub mod debug_stats {
     pub static ERRORS:   AtomicU32 = AtomicU32::new(0); // teif + feif + dmeif
     pub static PIN_MASK: AtomicU32 = AtomicU32::new(0); // last pin-toggle probe (bits 4,5,0,1)
 
+    // Executor loop cadence, last 1 s window. Surfaced over MAVLink because the
+    // prime clumping suspect is defmt-RTT blocking under probe - RTT can't
+    // observe itself without perturbing the measurement.
+    pub static MAX_GAP_US: AtomicU32 = AtomicU32::new(0);
+    pub static LONG_GAPS:  AtomicU32 = AtomicU32::new(0); // gaps > 5 ms
+    pub static SHORT_GAPS: AtomicU32 = AtomicU32::new(0); // gaps < 1 ms (catch-up)
+
+    pub fn publish_cadence(max_gap_us: u32, long_gaps: u32, short_gaps: u32) {
+        MAX_GAP_US.store(max_gap_us, Ordering::Relaxed);
+        LONG_GAPS.store(long_gaps, Ordering::Relaxed);
+        SHORT_GAPS.store(short_gaps, Ordering::Relaxed);
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn publish(frames: u32, tc: u32, skipped: u32, stuck_en: u32, errors: u32, pin_mask: u8) {
         FRAMES.store(frames, Ordering::Relaxed);
@@ -565,6 +578,8 @@ pub async fn motor_task(
                       dbg.teif, dbg.feif, dbg.dmeif, ndtr, en);
                 info!("DSHOT dbg: cadence max_gap={=u32}us long_gaps(>5ms)={=u32} short_gaps(<1ms)={=u32} (steady 500Hz ⇒ max≈2000, 0, 0)",
                       dbg.max_gap_us, dbg.long_gaps, dbg.short_gaps);
+                // Snapshot cadence for the GCS STATUSTEXT BEFORE resetting the window.
+                debug_stats::publish_cadence(dbg.max_gap_us, dbg.long_gaps, dbg.short_gaps);
                 dbg.max_gap_us = 0; dbg.long_gaps = 0; dbg.short_gaps = 0;
                 // #4: surface the snapshot to telemetry_task -> STATUSTEXT -> GCS.
                 debug_stats::publish(dbg.frames, dbg.tc, dbg.skipped, dbg.stuck_en,
