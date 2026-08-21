@@ -36,6 +36,17 @@ enum WeedPhase {
     DisposeDescend,
 }
 
+/// Self-contained tethered hover demo: climb to a low altitude, hold, descend.
+#[derive(Clone, Copy, PartialEq)]
+enum DemoPhase {
+    /// Closed-loop climb to DEMO_HOVER_ALT_M above the launch point.
+    Takeoff,
+    /// Hold that altitude for DEMO_HOLD_MS.
+    Hold,
+    /// Controlled descent (Lander); disarm at touchdown.
+    Descend,
+}
+
 // Constants
 
 pub const MAX_WAYPOINTS: usize = 32;
@@ -80,6 +91,13 @@ const MAX_GRIP_ATTEMPTS:  u8   = 3;           // grab tries before aborting this
 const GRIP_RELEASE_MS:    u64  = 400;         // jaw-reopen dwell before a retry
 const WEED_ASCEND_NEAR_M: f32  = 1.0;         // within this of approach alt -> ascent complete
 const BIN_DROP_ALT_M:     f32  = 0.5;         // AGL to descend to over bin before releasing
+
+// Demo hover (tethered, closed-loop) - self-contained takeoff/hold/descend/disarm.
+const DEMO_HOVER_ALT_M:        f32 = 0.6;      // ~2 ft target height above launch (AGL)
+const DEMO_HOLD_MS:            u64 = 20_000;   // 20 s hover
+const DEMO_ALT_BAND_M:         f32 = 0.15;     // "reached hover altitude" tolerance
+const DEMO_CEILING_M:          f32 = 1.2;      // hard abort ceiling above launch (2x target)
+const DEMO_TAKEOFF_TIMEOUT_MS: u64 = 8_000;    // no-progress climb timeout -> abort to descent
 
 // Public types
 
@@ -329,6 +347,10 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
     let mut prev_armed:       bool                 = false;
     let mut takeoff_done:     bool                 = false;
     let mut takeoff_target_alt: f32               = 0.0;
+    // Demo-hover sequence state (None = not running). Re-inits on each fresh arm.
+    let mut demo_phase:       Option<DemoPhase>    = None;
+    let mut demo_timer:       Option<Instant>      = None;
+    let mut demo_start_alt:   f32                  = 0.0;
 
     info!("Navigation task started (100 Hz)");
     #[cfg(feature = "range-alt")]
@@ -397,6 +419,7 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
         if !is_armed {
             STATE.nav_command.lock().await.autonomous = false;
             failsafe_forced = None; // latched failsafe responses end at disarm
+            demo_phase = None;      // demo restarts fresh on the next arm
             #[cfg(feature = "no-batt")]
             {
                 armed_since = None;
@@ -487,7 +510,7 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
             base_mode
         } else if !alt_source_ok
             && matches!(base_mode, FlightMode::AltitudeHold | FlightMode::PositionHold
-                             | FlightMode::Auto | FlightMode::FollowMe)
+                             | FlightMode::Auto | FlightMode::FollowMe | FlightMode::DemoHover)
         {
             // Altitude source dead mid-flight: hand back manual throttle if a pilot
             // is on the sticks; with no RC link force Land (Stabilise = zero throttle).
@@ -523,6 +546,7 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
             wp_arrived_at    = None;
             weed_phase_timer = None;
             mission_done_pos = None;
+            demo_phase       = None;
             if weed_phase.take().is_some() {
                 STATE.servo_outputs.lock().await.s1 = 0.0;
                 STATE.weed_target.lock().await.valid = false;
@@ -974,6 +998,84 @@ pub async fn navigation_task(grip_pin: embassy_stm32::gpio::Input<'static>) {
             FlightMode::Land => {
                 lander.get_or_insert_with(|| Lander::begin(alt_now))
                     .step(&mut alt_pid, alt_now, &flow)
+            }
+
+            // DemoHover: self-contained tethered demo. Level attitude only (no
+            // position hold); altitude closed-loop off baro/rangefinder. Climb to
+            // DEMO_HOVER_ALT_M, hold DEMO_HOLD_MS, descend, disarm. A dead altitude
+            // source is caught upstream (remaps to Land); a bad-but-live source is
+            // bounded here by the hard ceiling and the climb timeout so it can never
+            // spool away. Reached here only while armed and alt_source_ok.
+            FlightMode::DemoHover => {
+                if demo_phase.is_none() {
+                    demo_start_alt = alt_now;
+                    demo_timer     = Some(Instant::now());
+                    demo_phase     = Some(DemoPhase::Takeoff);
+                    alt_pid.reset();
+                    lander = None;
+                    info!("DemoHover: start — climb to {=f32}m, hold {=u64}s, descend",
+                          DEMO_HOVER_ALT_M, DEMO_HOLD_MS / 1000);
+                }
+
+                let target_alt   = demo_start_alt + DEMO_HOVER_ALT_M;
+                let over_ceiling  = alt_now > demo_start_alt + DEMO_CEILING_M;
+
+                match demo_phase {
+                    Some(DemoPhase::Takeoff) => {
+                        let reached  = alt_now >= target_alt - DEMO_ALT_BAND_M;
+                        let timedout = demo_timer.map_or(false, |t|
+                            t.elapsed() >= Duration::from_millis(DEMO_TAKEOFF_TIMEOUT_MS));
+                        if reached {
+                            demo_phase = Some(DemoPhase::Hold);
+                            demo_timer = Some(Instant::now());
+                            info!("DemoHover: reached {=f32}m — holding {=u64}s",
+                                  alt_now, DEMO_HOLD_MS / 1000);
+                        } else if over_ceiling || timedout {
+                            warn!("DemoHover: climb aborted ({=str}) — descending",
+                                  if over_ceiling { "ceiling" } else { "timeout" });
+                            demo_phase = Some(DemoPhase::Descend);
+                            lander = Some(Lander::begin(alt_now));
+                        }
+                        NavCommand {
+                            autonomous: true,
+                            attitude_setpoint: AttitudeSetpoint {
+                                roll: 0.0, pitch: 0.0, yaw_rate: 0.0,
+                                throttle: alt_pid.update(target_alt, alt_now),
+                            },
+                            target: Default::default(),
+                        }
+                    }
+                    Some(DemoPhase::Hold) => {
+                        let done = demo_timer.map_or(true, |t|
+                            t.elapsed() >= Duration::from_millis(DEMO_HOLD_MS));
+                        if done || over_ceiling {
+                            if over_ceiling { warn!("DemoHover: over ceiling during hold"); }
+                            demo_phase = Some(DemoPhase::Descend);
+                            lander = Some(Lander::begin(alt_now));
+                            info!("DemoHover: hold complete — descending");
+                        }
+                        NavCommand {
+                            autonomous: true,
+                            attitude_setpoint: AttitudeSetpoint {
+                                roll: 0.0, pitch: 0.0, yaw_rate: 0.0,
+                                throttle: alt_pid.update(target_alt, alt_now),
+                            },
+                            target: Default::default(),
+                        }
+                    }
+                    // Descend (or any unexpected state): controlled descent, disarm at touchdown.
+                    _ => {
+                        let cmd = lander.get_or_insert_with(|| Lander::begin(alt_now))
+                            .step(&mut alt_pid, alt_now, &flow);
+                        if lander.as_ref().map_or(false, |l| l.touched) {
+                            *STATE.armed.lock().await = false;
+                            state::set(state::FlightState::Idle);
+                            demo_phase = None;
+                            info!("DemoHover: landed + disarmed — demo complete");
+                        }
+                        cmd
+                    }
+                }
             }
         };
 

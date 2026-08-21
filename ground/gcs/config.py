@@ -46,11 +46,12 @@ SIDEBAR_HDR_H  = 37   # title bar height - matches FLIGHT COMPUTER header (36 px
 SIDEBAR_ROW_H  = 28   # height per weed entry
 STATS_W        = 1800  # drone stats panel width (2-column) - mutated by main() after window probe
 PR             = 1     # display pixel ratio (1 = standard, 2 = Retina) - set by main()
-PROGRAMS       = ['MANUAL', 'FOLLOW ME', 'WEED PICKER', 'RETURN HOME']
+PROGRAMS       = ['MANUAL', 'FOLLOW ME', 'WEED PICKER', 'RETURN HOME', 'DEMO HOVER']
 PROG_MANUAL    = 0
 PROG_FOLLOW_ME = 1
 PROG_WEED_PICK = 2
 PROG_RTH       = 3
+PROG_DEMO      = 4
 
 # Payload flag bit -> display name. Must match payload_flags constants in src/types.rs.
 PAYLOAD_NAMES = {

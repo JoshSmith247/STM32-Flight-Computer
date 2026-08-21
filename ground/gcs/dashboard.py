@@ -12,6 +12,7 @@ from mavlink import _mav_lock, _mav_state, send_mavlink_command
 
 _FLIGHT_MODES = {
     0: 'STAB', 1: 'ALTH', 2: 'POSH', 3: 'AUTO', 4: 'RTH', 5: 'LAND', 6: 'FOLW',
+    7: 'DEMO',
 }
 _FLIGHT_STATES = {
     0: 'IDLE', 1: 'ARMING', 2: 'ARMED', 3: 'FLYING', 4: 'LANDING', 5: 'FAULT',
@@ -32,6 +33,7 @@ _PROG_COMMANDS = {
     1: (176, 0.0, 6.0),   # FOLLOW ME -> DO_SET_MODE, FollowMe
     2: (176, 0.0, 3.0),   # WEED PICKER -> DO_SET_MODE, Auto
     3: (20,  0.0, 0.0),   # RETURN HOME -> NAV_RETURN_TO_LAUNCH
+    4: (176, 0.0, 7.0),   # DEMO HOVER  -> DO_SET_MODE, DemoHover (tethered demo)
 }
 
 _ui_state: dict = {

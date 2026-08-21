@@ -54,6 +54,23 @@ def send_mavlink_command(cmd: int, param1: float = 0.0, param2: float = 0.0) -> 
         print(f"send_mavlink_command: {exc}", flush=True)
 
 
+# In-air kill switch. The STM32 rejects a normal disarm while Flying/Landing (so a
+# stray COMMAND_LONG can't cut motors mid-flight); param2 == this magic overrides
+# that guard. On rc-optional builds with no radio wired, this is the ONLY manual
+# kill path — the crash cutoff (>75° tilt) and Pi-loss watchdog are the automatic ones.
+FORCE_DISARM_MAGIC = 21196.0
+
+
+def send_emergency_stop() -> None:
+    """Force-disarm the drone in ANY state, including in-air — cuts all four motors.
+
+    Sends COMPONENT_ARM_DISARM (400) with param1=0 (disarm) and param2=21196, the
+    MAVLink force magic the STM32 requires to honour an in-air disarm.
+    """
+    print("*** EMERGENCY STOP — force-disarm (param2=21196) sent, motors cut ***", flush=True)
+    send_mavlink_command(400, 0.0, FORCE_DISARM_MAGIC)
+
+
 def send_set_home() -> None:
     """Set home to the current GPS position.
 

@@ -29,6 +29,12 @@ const BUF_LEN: usize = SLOTS * MOTORS; // 72 u16 halfwords (DMA to 16-bit TIM3_D
 #[cfg_attr(feature = "pin-test", allow(dead_code))]
 const MOTOR_IDLE: f32 = 0.04;
 
+// BENCH-DEMO: non-flight motor cap for the props-off software test. Motors spin
+// visibly but a quad cannot lift at this throttle even with props fitted. The
+// DemoHover/PID logic upstream is untouched (real throttle visible in nav_command).
+#[cfg(feature = "bench-demo")]
+const BENCH_DEMO_MAX_THROTTLE: f32 = 0.12;
+
 // WARNING: BENCH ONLY (PROPS OFF): `--features bench-force` holds one motor at a constant
 // throttle for scope probing - no command/arming/watchdog. NEVER build for flight.
 #[cfg(feature = "bench-force")]
@@ -640,6 +646,11 @@ pub async fn motor_task(
                 [SPIN_ALL_THROTTLE; MOTORS]
             }
         };
+
+        // BENCH-DEMO: physical non-flight throttle cap so the props-off software test
+        // can never lift the craft, even if props are accidentally fitted.
+        #[cfg(feature = "bench-demo")]
+        let motors = motors.map(|t| t.min(BENCH_DEMO_MAX_THROTTLE));
 
         unsafe {
             // DMA must be idle BEFORE touching the buffer - rewriting DSHOT_BUF

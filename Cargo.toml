@@ -97,6 +97,20 @@ no-batt = []
 # PID-tuning "blackbox": stream ~50 Hz setpoint/measured/gyro/output over RTT defmt for
 # capture + plotting during tuning (`cargo run --features tune-log`). Off by default.
 tune-log = []
+# ⚠ STANDALONE DEMO (NO laptop / NO RC): after boot the FC auto-arms and runs the
+# DemoHover sequence (climb to ~0.6 m, hold 20 s, descend, disarm) — but ONLY while
+# the PA0 deadman jumper is HELD (PA0↔GND). Pulling the deadman pull-cord disarms
+# instantly (motors cut) and latches OFF until the next power cycle. Implies
+# rc-optional (no SBUS link). TETHERED, GUARDED, PROPS-VERIFIED BENCH DEMO ONLY —
+# never a field or free-flight build. The pull-cord is the sole manual kill.
+standalone-demo = ["rc-optional"]
+# ⚠ BENCH-DEMO (props-off SOFTWARE test of the DemoHover sequence): same boot-triggered
+# auto-run as standalone-demo but with NO PA0 deadman required, so no hardware/jumper
+# work. As a hard interlock the motor output is CLAMPED to a non-flight throttle
+# (BENCH_DEMO_MAX_THROTTLE in motor.rs) — motors spin visibly for observation but the
+# quad cannot lift even with props fitted. The DemoHover/PID logic runs at full fidelity
+# (real values visible in the RTT logs / nav_command). PROPS OFF, NEVER FLY THIS BUILD.
+bench-demo = ["standalone-demo"]
 # BENCH DIAGNOSTIC (`--features dshot-debug`): instrument the DSHOT TX path — a one-shot
 # readback of the GPIO alternate-function / TIM3 / DMAMUX config at init, plus a 1 Hz
 # DMA-health log (frames sent/skipped, transfer-complete + error flags, last NDTR). Pure

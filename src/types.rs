@@ -173,6 +173,7 @@ pub enum FlightMode {
     ReturnToHome,
     Land,
     FollowMe,       // Continuous person tracking via GCS YOLOv8; discriminant = 6
+    DemoHover,      // Self-contained tethered hover demo; discriminant = 7
 }
 
 // Control setpoints

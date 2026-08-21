@@ -231,11 +231,113 @@ async fn control_task() {
     }
 }
 
+/// Dispatches to the normal RC-driven arming logic, or — under `standalone-demo` —
+/// to the no-laptop/no-RC boot-triggered demo runner with the PA0 deadman kill.
+#[embassy_executor::task]
+async fn arming_task(safety_pin: Input<'static>) {
+    #[cfg(feature = "standalone-demo")]
+    standalone_arming(safety_pin).await;
+    #[cfg(not(feature = "standalone-demo"))]
+    normal_arming(safety_pin).await;
+}
+
+/// STANDALONE-DEMO (no laptop, no RC): auto-arm SETTLE_SECS after boot while the PA0
+/// deadman is CLOSED (PA0->GND = LOW), run DemoHover, auto-disarm at touchdown.
+/// Opening the deadman switch (PA0 goes HIGH) disarms instantly and latches OFF until
+/// the next power cycle. The deadman switch is the sole manual kill in this build; it
+/// is fail-safe (an open switch, unplugged connector, or broken wire all read HIGH = kill).
+#[cfg(feature = "standalone-demo")]
+async fn standalone_arming(safety_pin: Input<'static>) {
+    use embassy_time::Instant;
+    const SETTLE_SECS: u64 = 10; // sensor cal + clear-the-area countdown after boot
+
+    #[cfg(not(feature = "bench-demo"))]
+    defmt::warn!("⚠ STANDALONE-DEMO: auto-arms {=u64}s after boot while the PA0 deadman is CLOSED \
+                  (PA0->GND); OPEN the deadman switch to kill. No laptop/RC. NEVER a field build.", SETTLE_SECS);
+    #[cfg(feature = "bench-demo")]
+    defmt::warn!("⚠ BENCH-DEMO: auto-arms {=u64}s after boot with NO deadman; motor throttle is \
+                  CLAMPED non-flight (props-off software test only). NEVER FLY THIS BUILD.", SETTLE_SECS);
+    // Force DemoHover for the whole run (persists: no RC frames ever clear it).
+    *STATE.mode_override.lock().await = Some(FlightMode::DemoHover);
+
+    let mut ticker = Ticker::every(Duration::from_hz(50));
+    let boot = Instant::now();
+    let mut launched        = false;
+    let mut done            = false; // latched after any disarm - one run per power cycle
+    let mut held_ticks: u32 = 0;
+    let mut blocked_logged  = false;
+
+    loop {
+        ticker.next().await;
+        // Deadman: PA0->GND = HELD. Under bench-demo there is no deadman — auto-arm
+        // on the timer alone (safe: motor throttle is clamped non-flight, props off).
+        #[cfg(not(feature = "bench-demo"))]
+        let held = safety_pin.is_low();
+        #[cfg(feature = "bench-demo")]
+        let held = { let _ = &safety_pin; true };
+        held_ticks = if held { held_ticks.saturating_add(1) } else { 0 };
+
+        if done {
+            // Latched off for the rest of this power cycle: keep it disarmed.
+            if *STATE.armed.lock().await { *STATE.armed.lock().await = false; }
+            continue;
+        }
+
+        if !held {
+            // Deadman released -> immediate kill.
+            if *STATE.armed.lock().await {
+                *STATE.armed.lock().await = false;
+                state::set(FlightState::Idle);
+                defmt::warn!("STANDALONE: deadman released — DISARMED");
+            }
+            if launched { done = true; } // pulled after launch: end the run (power-cycle to reset)
+            continue;
+        }
+
+        if !launched {
+            // Hold out the settle window AND require a debounced continuous hold, so a
+            // momentary contact (or a bounce on insertion) can never trigger a launch.
+            if boot.elapsed() < Duration::from_secs(SETTLE_SECS) || held_ticks < 25 {
+                continue;
+            }
+            match pre_arm_check(FlightMode::DemoHover).await {
+                Ok(()) => {
+                    *STATE.armed.lock().await = true;
+                    state::set(FlightState::Armed);
+                    launched = true;
+                    defmt::warn!("STANDALONE: armed — DemoHover launching");
+                }
+                Err(reason) => {
+                    if !blocked_logged {
+                        defmt::warn!("STANDALONE: launch blocked — {=str}", reason);
+                        blocked_logged = true;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Launched and deadman still held.
+        if !*STATE.armed.lock().await {
+            // Navigation auto-disarmed at touchdown, or a crash cutoff fired.
+            done = true;
+            info!("STANDALONE: demo complete — disarmed (power-cycle to re-run)");
+            continue;
+        }
+        if state::get() == FlightState::Armed {
+            let nav = *STATE.nav_command.lock().await;
+            if nav.autonomous && nav.attitude_setpoint.throttle > 0.15 {
+                state::set(FlightState::Flying);
+            }
+        }
+    }
+}
+
 /// 50 Hz arm/disarm via RC switch. Disarm is honoured in EVERY state including
 /// Fault - the pilot's switch is an absolute kill. `safety_pin` (RBF jumper)
 /// gates only the disarmed->armed transition, never checked in flight.
-#[embassy_executor::task]
-async fn arming_task(safety_pin: Input<'static>) {
+#[cfg(not(feature = "standalone-demo"))]
+async fn normal_arming(safety_pin: Input<'static>) {
     use core::sync::atomic::Ordering;
     use embassy_time::Instant;
 
@@ -339,11 +441,17 @@ async fn main(spawner: Spawner) {
 
     let p = embassy_stm32::init(config);
 
-    // Initialise shared SPI1 bus before spawning - 12.5 MHz, Mode 0 works for
-    // both ICM-42688-P (max 24 MHz) and MS5611 (max 20 MHz).
+    // Initialise shared SPI1 bus before spawning - Mode 0 works for both
+    // ICM-42688-P (max 24 MHz) and MS5611 (max 20 MHz).
+    // DIAGNOSTIC: clock lowered 12.5 MHz -> 1 MHz. The IMU worked at 12.5 MHz when
+    // it was ALONE on the bus; it dropped off (WHO_AM_I=0x00) once the baro was added
+    // (bus loading / edge degradation hits the faster, more edge-sensitive IMU first,
+    // while the slow baro is unaffected). 1 MHz has ~12x the timing margin and is
+    // still plenty fast for a 14-byte burst at 500 Hz (~112 us). If this brings the
+    // IMU back, raise it stepwise to find the shared bus's real ceiling.
     {
         let mut spi_cfg = spi::Config::default();
-        spi_cfg.frequency = Hertz(12_500_000);
+        spi_cfg.frequency = Hertz(1_000_000);
         spi_cfg.mode      = spi::MODE_0;
         // MOSI: PA7 on the custom FC; PD7 on the Nucleo, where PA7 is hard-wired
         // to the on-board Ethernet PHY (RMII_CRS_DV) and unusable for SPI.

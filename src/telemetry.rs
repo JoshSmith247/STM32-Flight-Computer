@@ -462,7 +462,7 @@ async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
                 0 => FlightMode::Stabilise,    1 => FlightMode::AltitudeHold,
                 2 => FlightMode::PositionHold, 3 => FlightMode::Auto,
                 4 => FlightMode::ReturnToHome, 5 => FlightMode::Land,
-                6 => FlightMode::FollowMe,
+                6 => FlightMode::FollowMe,      7 => FlightMode::DemoHover,
                 _ => return MAV_RESULT_UNSUPPORTED,
             };
             *STATE.mode_override.lock().await = Some(mode);

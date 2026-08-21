@@ -36,7 +36,8 @@ import overlay as _overlay
 from dashboard import _handle_overlay_click, _ui_state, handle_payload_double_click
 from follow import PersonTracker
 from mavlink import (_HAVE_MAVLINK, _mav_listener, _mav_lock, _mav_state,
-                     _target_sock, send_mavlink_command, start_logging)
+                     _target_sock, send_emergency_stop, send_mavlink_command,
+                     start_logging)
 from renderer import FrameGrabber, _Renderer
 from tracker import WeedTracker
 
@@ -421,11 +422,17 @@ def main() -> None:
             r.show_exg = not r.show_exg
             print(f"ExG overlay {'on' if r.show_exg else 'off'}", flush=True)
 
+    # SPACEBAR = emergency stop: force-disarm (cuts motors) in any state, in-air
+    # included. The only manual kill when no RC is wired — keep a finger near it.
+    def _on_key_estop(*_):
+        send_emergency_stop()
+
     with dpg.handler_registry():
         dpg.add_mouse_click_handler(button=dpg.mvMouseButton_Left, callback=_on_click)
         dpg.add_key_press_handler(key=dpg.mvKey_Q, callback=_on_key_interrupt)
         dpg.add_key_press_handler(key=dpg.mvKey_Escape, callback=_on_key_interrupt)
         dpg.add_key_press_handler(key=dpg.mvKey_E, callback=_on_key_e)
+        dpg.add_key_press_handler(key=dpg.mvKey_Spacebar, callback=_on_key_estop)
 
     sid_x   = disp_w
     stats_x = disp_w + config.SIDEBAR_W
