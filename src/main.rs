@@ -53,12 +53,10 @@ pub static SAFETY_PIN_INSTALLED: core::sync::atomic::AtomicBool =
 pub const SAFETY_PIN_ENABLED: bool = false;
 
 /// Whether the RC gates (arm switch, throttle-low, failsafe kill) are in force.
-/// Always true normally; under `rc-optional`, false until SBUS has been seen this boot.
+/// No radio is fitted, so these stay OFF until an SBUS frame has been seen this
+/// boot; MAVLink arming and the GCS/Pi kill paths carry the safety until then.
 pub fn rc_gates_active() -> bool {
-    #[cfg(feature = "rc-optional")]
-    return sensors::rc::RC_EVER_SEEN.load(core::sync::atomic::Ordering::Relaxed);
-    #[cfg(not(feature = "rc-optional"))]
-    true
+    sensors::rc::RC_EVER_SEEN.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Pre-arm gates. Every arm path (RC in arming_task, MAVLink cmd 400 in
@@ -81,12 +79,6 @@ pub async fn pre_arm_check(mode: FlightMode) -> Result<(), &'static str> {
         return Err("IMU not healthy");
     }
     if mode_needs_baro && !health.baro_ok {
-        // range-alt: a usable rangefinder satisfies the gate in place of the dead baro.
-        #[cfg(feature = "range-alt")]
-        if !STATE.flow.lock().await.usable() {
-            return Err("no altitude source (baro dead, rangefinder not usable)");
-        }
-        #[cfg(not(feature = "range-alt"))]
         return Err("mode requires a live barometer");
     }
     if mode_needs_gps && !health.gps_ok {
@@ -176,17 +168,6 @@ async fn control_task() {
         *STATE.attitude.lock().await = quat;
         let euler = filter.euler();
 
-        // Bench IMU bring-up: ~2 Hz attitude readout. yawNED is the NED heading
-        // (0 = North, CW-positive), not the raw CCW-positive Madgwick yaw.
-        #[cfg(feature = "nucleo-vcp")]
-        if wdg_tick % 250 == 0 {
-            const R2D: f32 = 180.0 / core::f32::consts::PI;
-            // velD: estimator NED down-velocity - clearly NEGATIVE while raising the board.
-            let est = *STATE.pos_estimate.lock().await;
-            info!("ATT  roll={=f32}deg  pitch={=f32}deg  yawNED={=f32}deg  velD={=f32}m/s",
-                  euler.roll * R2D, euler.pitch * R2D, ahrs::ned_yaw(&quat) * R2D, est.vel_d);
-        }
-
         // Crash/tumble cutoff: sustained extreme tilt while armed -> kill motors, latch Fault.
         if is_armed && (euler.roll.abs() > CRASH_ANGLE_RAD || euler.pitch.abs() > CRASH_ANGLE_RAD) {
             crash_ticks += 1;
@@ -203,8 +184,8 @@ async fn control_task() {
             crash_ticks = 0;
         }
 
-        // RC failsafe kills motors only while the RC gates are live (always in
-        // normal builds; under `rc-optional`, only once SBUS has been seen).
+        // RC failsafe kills motors only while the RC gates are live - i.e.
+        // only once an SBUS link has been seen this boot.
         if !is_armed || (rc.failsafe && rc_gates_active()) {
             pids.reset_all();
             *STATE.motor_outputs.lock().await = Default::default();
@@ -218,126 +199,16 @@ async fn control_task() {
             pids.reset_all();
         }
         let (roll_out, pitch_out, yaw_out) = pids.update(&setpoint, &euler, gyro_f);
-        let outputs = mix_quad_x(setpoint.throttle, roll_out, pitch_out, yaw_out);
-        *STATE.motor_outputs.lock().await = outputs;
-
-        // PID-tuning stream (~50 Hz), capture via RTT: `cargo run --features tune-log`.
-        #[cfg(feature = "tune-log")]
-        if wdg_tick % 10 == 0 {
-            info!("TUNE spR={=f32} spP={=f32} mR={=f32} mP={=f32} gx={=f32} gy={=f32} gz={=f32} oR={=f32} oP={=f32} oY={=f32}",
-                  setpoint.roll, setpoint.pitch, euler.roll, euler.pitch,
-                  gyro_f.x, gyro_f.y, gyro_f.z, roll_out, pitch_out, yaw_out);
-        }
-    }
-}
-
-/// Dispatches to the normal RC-driven arming logic, or — under `standalone-demo` —
-/// to the no-laptop/no-RC boot-triggered demo runner with the PA0 deadman kill.
-#[embassy_executor::task]
-async fn arming_task(safety_pin: Input<'static>) {
-    #[cfg(feature = "standalone-demo")]
-    standalone_arming(safety_pin).await;
-    #[cfg(not(feature = "standalone-demo"))]
-    normal_arming(safety_pin).await;
-}
-
-/// STANDALONE-DEMO (no laptop, no RC): auto-arm SETTLE_SECS after boot while the PA0
-/// deadman is CLOSED (PA0->GND = LOW), run DemoHover, auto-disarm at touchdown.
-/// Opening the deadman switch (PA0 goes HIGH) disarms instantly and latches OFF until
-/// the next power cycle. The deadman switch is the sole manual kill in this build; it
-/// is fail-safe (an open switch, unplugged connector, or broken wire all read HIGH = kill).
-#[cfg(feature = "standalone-demo")]
-async fn standalone_arming(safety_pin: Input<'static>) {
-    use embassy_time::Instant;
-    const SETTLE_SECS: u64 = 10; // sensor cal + clear-the-area countdown after boot
-
-    #[cfg(not(feature = "bench-demo"))]
-    defmt::warn!("⚠ STANDALONE-DEMO: auto-arms {=u64}s after boot while the PA0 deadman is CLOSED \
-                  (PA0->GND); OPEN the deadman switch to kill. No laptop/RC. NEVER a field build.", SETTLE_SECS);
-    #[cfg(feature = "bench-demo")]
-    defmt::warn!("⚠ BENCH-DEMO: auto-arms {=u64}s after boot with NO deadman; motor throttle is \
-                  CLAMPED non-flight (props-off software test only). NEVER FLY THIS BUILD.", SETTLE_SECS);
-    // Force DemoHover for the whole run (persists: no RC frames ever clear it).
-    *STATE.mode_override.lock().await = Some(FlightMode::DemoHover);
-
-    let mut ticker = Ticker::every(Duration::from_hz(50));
-    let boot = Instant::now();
-    let mut launched        = false;
-    let mut done            = false; // latched after any disarm - one run per power cycle
-    let mut held_ticks: u32 = 0;
-    let mut blocked_logged  = false;
-
-    loop {
-        ticker.next().await;
-        // Deadman: PA0->GND = HELD. Under bench-demo there is no deadman — auto-arm
-        // on the timer alone (safe: motor throttle is clamped non-flight, props off).
-        #[cfg(not(feature = "bench-demo"))]
-        let held = safety_pin.is_low();
-        #[cfg(feature = "bench-demo")]
-        let held = { let _ = &safety_pin; true };
-        held_ticks = if held { held_ticks.saturating_add(1) } else { 0 };
-
-        if done {
-            // Latched off for the rest of this power cycle: keep it disarmed.
-            if *STATE.armed.lock().await { *STATE.armed.lock().await = false; }
-            continue;
-        }
-
-        if !held {
-            // Deadman released -> immediate kill.
-            if *STATE.armed.lock().await {
-                *STATE.armed.lock().await = false;
-                state::set(FlightState::Idle);
-                defmt::warn!("STANDALONE: deadman released — DISARMED");
-            }
-            if launched { done = true; } // pulled after launch: end the run (power-cycle to reset)
-            continue;
-        }
-
-        if !launched {
-            // Hold out the settle window AND require a debounced continuous hold, so a
-            // momentary contact (or a bounce on insertion) can never trigger a launch.
-            if boot.elapsed() < Duration::from_secs(SETTLE_SECS) || held_ticks < 25 {
-                continue;
-            }
-            match pre_arm_check(FlightMode::DemoHover).await {
-                Ok(()) => {
-                    *STATE.armed.lock().await = true;
-                    state::set(FlightState::Armed);
-                    launched = true;
-                    defmt::warn!("STANDALONE: armed — DemoHover launching");
-                }
-                Err(reason) => {
-                    if !blocked_logged {
-                        defmt::warn!("STANDALONE: launch blocked — {=str}", reason);
-                        blocked_logged = true;
-                    }
-                }
-            }
-            continue;
-        }
-
-        // Launched and deadman still held.
-        if !*STATE.armed.lock().await {
-            // Navigation auto-disarmed at touchdown, or a crash cutoff fired.
-            done = true;
-            info!("STANDALONE: demo complete — disarmed (power-cycle to re-run)");
-            continue;
-        }
-        if state::get() == FlightState::Armed {
-            let nav = *STATE.nav_command.lock().await;
-            if nav.autonomous && nav.attitude_setpoint.throttle > 0.15 {
-                state::set(FlightState::Flying);
-            }
-        }
+        let outputs = mix_quad_x(setpoint.throttle, roll_out, pitch_out, yaw_out); // Set the motor outputs!
+        *STATE.motor_outputs.lock().await = outputs; // Publish motor outputs
     }
 }
 
 /// 50 Hz arm/disarm via RC switch. Disarm is honoured in EVERY state including
 /// Fault - the pilot's switch is an absolute kill. `safety_pin` (RBF jumper)
 /// gates only the disarmed->armed transition, never checked in flight.
-#[cfg(not(feature = "standalone-demo"))]
-async fn normal_arming(safety_pin: Input<'static>) {
+#[embassy_executor::task]
+async fn arming_task(safety_pin: Input<'static>) {
     use core::sync::atomic::Ordering;
     use embassy_time::Instant;
 
@@ -345,8 +216,7 @@ async fn normal_arming(safety_pin: Input<'static>) {
     // Deny warns rate-limited: the deny path holds every tick while the switch is up.
     let mut last_deny_log: Option<Instant> = None;
 
-    #[cfg(feature = "rc-optional")]
-    defmt::warn!("⚠ rc-optional build: until an SBUS link is seen, MAVLink arming \
+    defmt::warn!("⚠ No radio fitted: until an SBUS link is seen, MAVLink arming \
                   skips the RC gates and GCS disarm is the ONLY kill switch");
 
     loop {
@@ -425,8 +295,8 @@ async fn main(spawner: Spawner) {
         divr:   None,
     });
 
-    config.rcc.sys      = Sysclk::Pll1P;         // SYSCLK = 400 MHz
-    config.rcc.ahb_pre  = AHBPrescaler::Div2;    // HCLK = 200 MHz
+    config.rcc.sys      = Sysclk::Pll1P;         // SYSCLK = 400 MHz -- This is where we stop running CPU at 64MHz, start running at 400MHz
+    config.rcc.ahb_pre  = AHBPrescaler::Div2;    // HCLK = 200 MHz -- Remainder, different prescalers
     config.rcc.apb1_pre = APBPrescaler::Div2;    // APB1 = 100 MHz -> TIM3 timer = 200 MHz
     config.rcc.apb2_pre = APBPrescaler::Div2;    // APB2 = 100 MHz
     config.rcc.apb3_pre = APBPrescaler::Div2;    // APB3 = 100 MHz
@@ -453,44 +323,30 @@ async fn main(spawner: Spawner) {
         let mut spi_cfg = spi::Config::default();
         spi_cfg.frequency = Hertz(1_000_000);
         spi_cfg.mode      = spi::MODE_0;
-        // MOSI: PA7 on the custom FC; PD7 on the Nucleo, where PA7 is hard-wired
-        // to the on-board Ethernet PHY (RMII_CRS_DV) and unusable for SPI.
-        #[cfg(not(feature = "nucleo"))]
-        let spi = Spi::new(p.SPI1, p.PA5, p.PA7, p.PA6, p.DMA2_CH3, p.DMA2_CH0, Irqs, spi_cfg);
-        #[cfg(feature = "nucleo")]
+        // MOSI is PD7: on the Nucleo, PA7 is hard-wired to the on-board Ethernet
+        // PHY (RMII_CRS_DV), which loads the line and kills the IMU/baro bus.
         let spi = Spi::new(p.SPI1, p.PA5, p.PD7, p.PA6, p.DMA2_CH3, p.DMA2_CH0, Irqs, spi_cfg);
         *SPI1_BUS.lock().await = Some(spi);
     }
 
-    // Status LED: PG7 on the custom FC (active-LOW); LD2/PE1 on the Nucleo
-    // (active-HIGH). Both start OFF. led_task handles the polarity.
-    #[cfg(not(feature = "nucleo"))]
-    let led = Output::new(p.PG7, Level::High, Speed::Low);
-    #[cfg(feature = "nucleo")]
+    // Status LED: LD2/PE1 on the Nucleo, active-HIGH. Starts OFF.
     let led = Output::new(p.PE1, Level::Low, Speed::Low);
 
     // Remove-before-flight pin: PA0->GND jumper, internal pull-up.
     // Removed (open) = HIGH = clear to arm; installed (shorted) = LOW = denied.
     let safety_pin = Input::new(p.PA0, Pull::Up);
 
-    // Gripper-jaw microswitch (PC2 -> GND, closed = weed held = LOW). Read by
-    // navigation_task's grip check under `--features grip-sense`.
+    // Gripper-jaw microswitch pin (PC2 -> GND, closed = weed held = LOW).
+    // No switch is fitted: navigation_task grabs open-loop on a timer and only
+    // claims the pin so it is not left floating.
     let grip_pin = Input::new(p.PC2, Pull::Up);
 
     spawner.spawn(status::led::led_task(led).unwrap());
     spawner.spawn(sensors::imu::imu_task(p.PA4).unwrap());
-    #[cfg(not(feature = "pin-test"))]
     spawner.spawn(actuators::motor::motor_task(p.TIM3, p.PB4, p.PB5, p.PB0, p.PB1).unwrap());
-    // pin-test: motor pins as plain GPIO for DMM continuity checks - nothing spins.
-    #[cfg(feature = "pin-test")]
-    spawner.spawn(actuators::motor::pin_test_task(p.PB4, p.PB5, p.PB0, p.PB1).unwrap());
     spawner.spawn(sensors::rc::rc_task(p.USART2, p.PA2, p.PA3, p.DMA1_CH5, Irqs).unwrap());
-    // MAVLink on USART3. Default = Pi header pins (PB11/PB10); `nucleo-vcp`
-    // routes it to the ST-Link VCP (PD9/PD8) for prop-off bench testing over USB.
-    #[cfg(not(feature = "nucleo-vcp"))]
+    // MAVLink on USART3, Pi header pins (PB11/PB10).
     spawner.spawn(telemetry::telemetry_task(p.USART3, p.PB11, p.PB10, p.DMA1_CH3, p.DMA1_CH1, Irqs).unwrap());
-    #[cfg(feature = "nucleo-vcp")]
-    spawner.spawn(telemetry::telemetry_task(p.USART3, p.PD9, p.PD8, p.DMA1_CH3, p.DMA1_CH1, Irqs).unwrap());
     spawner.spawn(sensors::baro::baro_task(p.PA8).unwrap());
     spawner.spawn(sensors::gps::gps_task(p.USART1, p.PA10, p.PA9, p.DMA2_CH6, p.DMA2_CH5, Irqs).unwrap());
     // Battery monitor (ADC3: PC0 = pack divider, PF3 = ESC CUR pad).
@@ -522,9 +378,7 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
         actuators::motor::emergency_stop();
         // LED off via BSRR (atomic, can't clobber other pins). H7 GPIO bases are
         // 0x5802_xxxx (AHB4), never F4-era 0x4002_xxxx. Update if the LED pin moves.
-        #[cfg(not(feature = "nucleo"))] // custom FC: PG7 active-low -> set HIGH = off
-        let (gpio_base, bsrr) = (0x5802_1800u32, 1u32 << 7);
-        #[cfg(feature = "nucleo")]      // Nucleo: PE1 active-high -> reset LOW = off
+        // Nucleo: PE1 active-high -> reset LOW = off.
         let (gpio_base, bsrr) = (0x5802_1000u32, 1u32 << (1 + 16));
         (gpio_base as *mut u32).offset(6).write_volatile(bsrr);
     }

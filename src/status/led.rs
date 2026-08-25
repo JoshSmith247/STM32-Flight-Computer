@@ -1,5 +1,5 @@
 //! Status LED - blink patterns per FlightState.
-//! Custom FC: PG7, active-LOW. Nucleo (`--features nucleo`): LD2/PE1, active-HIGH.
+//! Nucleo: LD2/PE1, active-HIGH.
 
 use embassy_stm32::gpio::Output;
 use embassy_time::{Duration, Timer};
@@ -8,12 +8,12 @@ use crate::state::{self, FlightState};
 
 #[inline]
 fn led_on(led: &mut Output<'static>) {
-    if cfg!(feature = "nucleo") { led.set_high() } else { led.set_low() }
+    led.set_high();
 }
 
 #[inline]
 fn led_off(led: &mut Output<'static>) {
-    if cfg!(feature = "nucleo") { led.set_low() } else { led.set_high() }
+    led.set_low();
 }
 
 #[embassy_executor::task]

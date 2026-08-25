@@ -43,8 +43,6 @@ const MAGIC_MISSION_REQUEST_INT: u8 = 196;
 const MAGIC_MISSION_ACK:                    u8 = 153;
 const MAGIC_SET_POSITION_TARGET_LOCAL_NED: u8 = 143;
 const MAGIC_SCALED_IMU:                    u8 = 170;
-#[cfg(feature = "dshot-debug")]
-const MAGIC_STATUSTEXT:                    u8 = 83;
 
 const MAV_RESULT_ACCEPTED:             u8 = 0;
 const MAV_RESULT_TEMPORARILY_REJECTED: u8 = 1;
@@ -297,60 +295,6 @@ fn build_mission_ack(result: u8) -> [u8; 3] {
     [255, 0, result]
 }
 
-// STATUSTEXT #253 - surfaces the DSHOT TX-path counters to the GCS so the bench
-// is diagnosable with no probe-rs/RTT attached (dshot-debug only).
-#[cfg(feature = "dshot-debug")]
-struct FixedBuf { buf: [u8; 50], len: usize }
-
-#[cfg(feature = "dshot-debug")]
-impl core::fmt::Write for FixedBuf {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        for &b in s.as_bytes() {
-            if self.len >= self.buf.len() { break; }
-            self.buf[self.len] = b;
-            self.len += 1;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(feature = "dshot-debug")]
-fn build_statustext_dshot() -> [u8; 51] {
-    use core::fmt::Write;
-    use core::sync::atomic::Ordering;
-    use crate::actuators::motor::debug_stats as ds;
-
-    let mut p = [0u8; 51];
-    p[0] = 6; // MAV_SEVERITY_INFO
-    let mut fb = FixedBuf { buf: [0u8; 50], len: 0 };
-    let _ = write!(fb, "DSHOT f={} tc={} sk={} st={} e={} pin={:04b}",
-        ds::FRAMES.load(Ordering::Relaxed),   ds::TC.load(Ordering::Relaxed),
-        ds::SKIPPED.load(Ordering::Relaxed),  ds::STUCK_EN.load(Ordering::Relaxed),
-        ds::ERRORS.load(Ordering::Relaxed),   ds::PIN_MASK.load(Ordering::Relaxed));
-    p[1..1 + fb.len].copy_from_slice(&fb.buf[..fb.len]);
-    p
-}
-
-// Executor-cadence STATUSTEXT: observable over MAVLink with defmt compiled out
-// and no RTT host - the only way to measure cadence without the prime suspect
-// (blocking RTT) in the loop.
-#[cfg(feature = "dshot-debug")]
-fn build_statustext_cadence() -> [u8; 51] {
-    use core::fmt::Write;
-    use core::sync::atomic::Ordering;
-    use crate::actuators::motor::debug_stats as ds;
-
-    let long_gaps = ds::LONG_GAPS.load(Ordering::Relaxed);
-    let mut p = [0u8; 51];
-    p[0] = if long_gaps > 0 { 4 } else { 6 }; // MAV_SEVERITY_WARNING on clumping, else INFO
-    let mut fb = FixedBuf { buf: [0u8; 50], len: 0 };
-    let _ = write!(fb, "CAD gap={}us lg={} sg={} (steady: <2500,0,0)",
-        ds::MAX_GAP_US.load(Ordering::Relaxed), long_gaps,
-        ds::SHORT_GAPS.load(Ordering::Relaxed));
-    p[1..1 + fb.len].copy_from_slice(&fb.buf[..fb.len]);
-    p
-}
-
 // Command dispatcher
 
 async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
@@ -475,16 +419,9 @@ async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
 
 // Embassy task
 
-// MAVLink USART3 pins: Pi header (PB10/PB11) by default; `nucleo-vcp` swaps to
-// the ST-Link VCP pins (PD8/PD9) for bench testing over USB.
-#[cfg(not(feature = "nucleo-vcp"))]
+// MAVLink USART3 pins: Pi header.
 type MavRxPin = peripherals::PB11;
-#[cfg(not(feature = "nucleo-vcp"))]
 type MavTxPin = peripherals::PB10;
-#[cfg(feature = "nucleo-vcp")]
-type MavRxPin = peripherals::PD9;
-#[cfg(feature = "nucleo-vcp")]
-type MavTxPin = peripherals::PD8;
 
 #[embassy_executor::task]
 pub async fn telemetry_task(
@@ -630,8 +567,7 @@ pub async fn telemetry_task(
                     let n = write_frame(&mut buf, seq, 0, &p, MAGIC_HEARTBEAT);
                     tx.write(&buf[..n]).await.ok();
                     seq = seq.wrapping_add(1);
-                    // debug-level: 1 Hz RTT chatter pollutes the dshot-debug
-                    // cadence stats (defmt-RTT blocking is the prime suspect).
+                    // debug-level: 1 Hz RTT chatter is noisy at info.
                     defmt::debug!("HB tx — state={} mode={} payloads=0x{:04X}", flight_state, mode, pl_flags);
                 }
                 2 => {
@@ -682,19 +618,6 @@ pub async fn telemetry_task(
                     let p = build_battery_status(bat.voltage_v, bat.pct,
                                                  current_ca, mah, time_s);
                     let n = write_frame(&mut buf, seq, 147, &p, MAGIC_BATTERY_STATUS);
-                    tx.write(&buf[..n]).await.ok();
-                    seq = seq.wrapping_add(1);
-                }
-                // #4: DSHOT TX-path counters -> GCS as a 1 Hz STATUSTEXT (bench builds only).
-                #[cfg(feature = "dshot-debug")]
-                3 => {
-                    let p = build_statustext_dshot();
-                    let n = write_frame(&mut buf, seq, 253, &p, MAGIC_STATUSTEXT);
-                    tx.write(&buf[..n]).await.ok();
-                    seq = seq.wrapping_add(1);
-                    // Executor cadence rides in its own STATUSTEXT (50-char cap).
-                    let p = build_statustext_cadence();
-                    let n = write_frame(&mut buf, seq, 253, &p, MAGIC_STATUSTEXT);
                     tx.write(&buf[..n]).await.ok();
                     seq = seq.wrapping_add(1);
                 }

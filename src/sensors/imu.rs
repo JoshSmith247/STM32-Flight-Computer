@@ -3,7 +3,7 @@
 
 use core::f32::consts::PI;
 
-use defmt::{error, info, warn}; // warn used by gyro-cal (all builds) + nucleo-vcp IMU-missing path
+use defmt::{error, info, warn};
 use embassy_stm32::{
     gpio::{Level, Output, Speed},
     peripherals,
@@ -11,7 +11,6 @@ use embassy_stm32::{
 };
 use embassy_time::{Duration, Ticker, Timer};
 
-#[cfg(not(feature = "nucleo-vcp"))] // only the flight build Faults on a missing IMU
 use crate::state::FlightState;
 use crate::{
     types::{ImuData, Vec3},
@@ -143,7 +142,6 @@ pub async fn imu_task(cs_pin: Peri<'static, peripherals::PA4>) {
 
     // Confirm we're talking to the right chip. Retried: one flaky SPI read at
     // power-up must not permanently Fault the flight build.
-    #[cfg_attr(feature = "simulation", allow(unused_assignments, unused_mut))]
     let mut who = read_reg(&mut cs, WHO_AM_I).await;
     for attempt in 1..3u8 {
         if who == WHO_AM_I_EXPECTED { break; }
@@ -151,22 +149,11 @@ pub async fn imu_task(cs_pin: Peri<'static, peripherals::PA4>) {
         Timer::after(Duration::from_millis(10)).await;
         who = read_reg(&mut cs, WHO_AM_I).await;
     }
-    #[cfg(feature = "simulation")]
-    let who = WHO_AM_I_EXPECTED;
     if who != WHO_AM_I_EXPECTED {
-        // Flight build: a missing IMU is fatal - Fault and park.
-        #[cfg(not(feature = "nucleo-vcp"))]
-        {
-            error!("ICM-42688-P not found: WHO_AM_I = 0x{:02X} (expected 0x{:02X})", who, WHO_AM_I_EXPECTED);
-            crate::state::set(FlightState::Fault);
-            loop { Timer::after(Duration::from_secs(1)).await; }
-        }
-        // Bench build: tolerate a missing IMU so motor tests can run. WARNING: DO NOT FLY.
-        #[cfg(feature = "nucleo-vcp")]
-        {
-            warn!("ICM-42688-P not found (WHO_AM_I=0x{:02X}) — bench build, continuing WITHOUT IMU (no Fault, DO NOT FLY)", who);
-            loop { Timer::after(Duration::from_secs(1)).await; }
-        }
+        // A missing IMU is fatal - Fault and park.
+        error!("ICM-42688-P not found: WHO_AM_I = 0x{:02X} (expected 0x{:02X})", who, WHO_AM_I_EXPECTED);
+        crate::state::set(FlightState::Fault);
+        loop { Timer::after(Duration::from_secs(1)).await; }
     }
     info!("IMU: ICM-42688-P found (WHO_AM_I = 0x{:02X})", who);
 

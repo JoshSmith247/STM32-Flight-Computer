@@ -45,9 +45,6 @@ pub async fn flow_task(
     let mut hdr     = [0u8; 5];            // dev_id, sys_id, msg_id, seq, len
     let mut payload = [0u8; MAX_PAYLOAD];
     let mut cksum   = [0u8; 1];
-    // Bench readout: ~2 Hz at the 50 Hz frame rate (nucleo-vcp builds only).
-    #[cfg(feature = "nucleo-vcp")]
-    let mut log_ctr: u32 = 0;
 
     // Silence detector: counts 500 ms sync timeouts (reset by ANY received
     // byte) so a dead line is loudly distinguishable from wrong-protocol
@@ -115,17 +112,5 @@ pub async fn flow_task(
             valid,
             stamp_ms:     crate::types::stamp_now_ms(),
         };
-
-        // Bench bring-up readout — polarity check: at fixed height, slide the
-        // drone FORWARD → vx must go POSITIVE; slide RIGHT → vy POSITIVE.
-        // (Raw MICOLINK units: cm/s at 1 m height.)
-        #[cfg(feature = "nucleo-vcp")]
-        {
-            log_ctr += 1;
-            if log_ctr % 25 == 0 {
-                info!("FLOW  h={=i32}mm  q={=u8}  vx={=i32}  vy={=i32}  valid={=bool}",
-                      height_mm, quality, flow_x, flow_y, valid);
-            }
-        }
     }
 }

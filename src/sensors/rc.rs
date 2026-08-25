@@ -22,8 +22,8 @@ const SBUS_FLAG_FRAME_LOST: u8 = 1 << 2;
 const SBUS_MIN: u16 = 172;
 const SBUS_MAX: u16 = 1811;
 
-/// True once a valid SBUS frame has been received this boot. Under `rc-optional`
-/// the RC gates only apply after the link has existed - but then permanently.
+/// True once a valid SBUS frame has been received this boot. The RC gates only
+/// apply after the link has existed - but then permanently.
 pub static RC_EVER_SEEN: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 

@@ -49,17 +49,6 @@ pub async fn battery_task(
     mut vbat_pin: Peri<'static, peripherals::PC0>,
     mut cur_pin:  Peri<'static, peripherals::PF3>,
 ) {
-    // no-batt: publish "unknown but OK" once and park; the flight timer is the
-    // only pack protection. WARNING: The pilot owns pack health.
-    #[cfg(feature = "no-batt")]
-    {
-        let _ = (&adc_peri, &vbat_pin, &cur_pin);
-        *STATE.battery.lock().await =
-            BatteryData { voltage_v: 0.0, pct: 0, critical: false, current_a: -1.0 };
-        warn!("no-batt build: battery sensing DISABLED — flight timer is the only pack protection");
-        core::future::pending::<()>().await;
-    }
-
     let mut adc = Adc::new(adc_peri);
 
     let mut ticker       = Ticker::every(Duration::from_hz(2));
