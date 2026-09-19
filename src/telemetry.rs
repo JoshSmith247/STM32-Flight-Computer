@@ -316,7 +316,7 @@ async fn handle_command(cmd: u16, param1: f32, param2: f32) -> u8 {
                 } else if let Err(reason) = crate::pre_arm_check(STATE.effective_mode().await).await {
                     warn!("MAVLink: arm rejected — {=str}", reason);
                     MAV_RESULT_TEMPORARILY_REJECTED
-                } else {
+                } else { // NON-RC ARM. ARMING PATH 2.
                     *STATE.armed.lock().await = true;
                     state::set(FlightState::Armed);
                     info!("MAVLink: armed");
@@ -441,7 +441,7 @@ pub async fn telemetry_task(
     // Ring-buffered DMA RX: the DMA fills this buffer continuously so no inbound
     // bytes are lost while the executor is busy. 512 B ~ 89 ms of slack @ 57600.
     let mut rx_ring = [0u8; 512];
-    let mut rx = rx.into_ring_buffered(&mut rx_ring);
+    let mut rx = rx.into_ring_buffered(&mut rx_ring); // Note-- this is DMA!
 
     info!("Telemetry: MAVLink v2 @ 57600 baud, 7-msg TX, mission protocol RX");
 
@@ -459,7 +459,7 @@ pub async fn telemetry_task(
     let pending_mission_req: Cell<Option<u16>>        = Cell::new(None);
     let pending_mission_ack: Cell<Option<u8>>         = Cell::new(None);
 
-    // TX loop
+    // TX loop -- sending out
     let tx_fut = async {
         let mut seq:     u8  = 0;
         let mut tick:    u8  = 0;
@@ -657,7 +657,7 @@ pub async fn telemetry_task(
 
     // RX loop
     let rx_fut = async {
-        let mut sm:      u8        = 0; // 0=SYNC 1=HDR 2=PAY 3=CRC 4=SIGN
+        let mut sm:      u8        = 0; // 0=SYNC 1=HDR 2=PAY 3=CRC 4=SIGN state machine
         // CRC-fail warns rate-limited: corrupted-line byte soup (baud mismatch,
         // mini-UART clock drift, bad ground) floods hundreds/s and drowns RTT.
         let mut crc_fails: u32     = 0;
@@ -678,7 +678,7 @@ pub async fn telemetry_task(
             let b = byte[0];
 
             match sm {
-                0 => { if b == 0xFD { sm = 1; hdr_idx = 0; } }
+                0 => { if b == 0xFD { sm = 1; hdr_idx = 0; } } // Checks sync bit, if not accurate we don't start state
                 1 => {
                     hdr[hdr_idx] = b;
                     hdr_idx += 1;
@@ -885,5 +885,5 @@ pub async fn telemetry_task(
         }
     };
 
-    join(tx_fut, rx_fut).await;
+    join(tx_fut, rx_fut).await; // Polls both futures and lets the executer run whichever is ready
 }

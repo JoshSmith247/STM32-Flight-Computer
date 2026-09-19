@@ -105,10 +105,14 @@ bind_interrupts!(pub struct Irqs {
     USART3       => embassy_stm32::usart::InterruptHandler<embassy_stm32::peripherals::USART3>;
     UART4        => embassy_stm32::usart::InterruptHandler<embassy_stm32::peripherals::UART4>;
     //SPI1 => embassy_stm32::spi::InterruptHandler<embassy_stm32::peripherals::SPI1>;
+    I2C1_EV      => embassy_stm32::i2c::EventInterruptHandler<embassy_stm32::peripherals::I2C1>;
+    I2C1_ER      => embassy_stm32::i2c::ErrorInterruptHandler<embassy_stm32::peripherals::I2C1>;
     DMA1_STREAM1 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH1>;
     DMA1_STREAM2 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH2>;
     DMA1_STREAM3 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH3>;
     DMA1_STREAM5 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH5>;
+    DMA1_STREAM6 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH6>;
+    DMA1_STREAM7 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH7>;
     DMA2_STREAM0 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA2_CH0>;
     DMA2_STREAM3 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA2_CH3>;
     DMA2_STREAM5 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA2_CH5>;
@@ -157,7 +161,7 @@ async fn control_task() {
         };
 
         // usable() = calibrated AND fresh - never fuse a stale compass snapshot.
-        let quat = if mag.usable() {
+        let quat = if mag.usable() { // low beta = gyro weighted heavy against mag + accel, high beta other way around
             filter.update_with_mag(
                 imu.gyro, imu.accel,
                 types::Vec3 { x: mag.x, y: mag.y, z: mag.z },
@@ -219,7 +223,7 @@ async fn arming_task(safety_pin: Input<'static>) {
     defmt::warn!("⚠ No radio fitted: until an SBUS link is seen, MAVLink arming \
                   skips the RC gates and GCS disarm is the ONLY kill switch");
 
-    loop {
+    loop { // NOTE: WILL NOT ARM A DRONE SANS-RADIO. ARMING PATH 1. ARMING PATH 2 IN TELEMETRY.RS
         ticker.next().await;
 
         SAFETY_PIN_INSTALLED.store(safety_pin.is_low(), Ordering::Relaxed);
@@ -229,14 +233,14 @@ async fn arming_task(safety_pin: Input<'static>) {
         let rc_gates = rc_gates_active();
 
         if is_armed {
-            if rc_gates && (!rc.arm || rc.failsafe) {
+            if rc_gates && (!rc.arm || rc.failsafe) { // Fail before state switch can happen, don't fly
                 *STATE.armed.lock().await = false;
                 // A latched Fault stays latched; recovery is owned by the fault source.
                 if state::get() != FlightState::Fault {
                     state::set(FlightState::Idle);
                 }
                 info!("Disarmed");
-            } else if state::get() == FlightState::Armed {
+            } else if state::get() == FlightState::Armed { // State swich once armed
                 // Promote Armed -> Flying once real power is applied (pilot stick OR
                 // autonomous throttle, so an Auto takeoff gets the in-air disarm guard).
                 let nav = *STATE.nav_command.lock().await;
@@ -247,7 +251,7 @@ async fn arming_task(safety_pin: Input<'static>) {
                 }
             }
         } else if state::get() == FlightState::Fault {
-            // Never arm out of Fault.
+            // Never arm out of Fault. Mission aborted.
             continue;
         } else if rc.arm && rc.throttle < 0.05 && !rc.failsafe {
             let mode = STATE.effective_mode().await;
@@ -360,7 +364,7 @@ async fn main(spawner: Spawner) {
     // Flow (MTF-02P): safe unwired - flow.valid stays false, consumers fall back to GPS/baro.
     spawner.spawn(sensors::flow::flow_task(p.UART4, p.PC11, p.DMA1_CH2, Irqs).unwrap());
     spawner.spawn(actuators::payloads::servo::servo_task(p.TIM4, p.PD12, p.PD13, p.PD14, p.PD15).unwrap());
-    spawner.spawn(sensors::mag::mag_task(p.I2C1, p.PB8, p.PB9).unwrap());
+    spawner.spawn(sensors::mag::mag_task(p.I2C1, p.PB8, p.PB9, p.DMA1_CH6, p.DMA1_CH7).unwrap());
 
     state::set(FlightState::Idle);
 

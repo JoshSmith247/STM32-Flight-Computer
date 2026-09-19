@@ -1,18 +1,28 @@
-//! QMC5883L magnetometer driver - I2C1 blocking (PB8 SCL, PB9 SDA), 25 Hz.
+//! QMC5883L magnetometer driver - I2C1, DMA + timeout (PB8 SCL, PB9 SDA), 25 Hz.
 //! Polls DRDY, applies tilt compensation from the AHRS quaternion, writes STATE.mag_data.
+//! Was blocking with no bound; a stalled bus would freeze the whole cooperative executor
+//! (control loop included) until the IWDG reset it. Async + `with_timeout` bounds every
+//! transaction instead, matching the pattern already used for the UART sensor drivers.
 
 use core::f32::consts::TAU;
 
 use defmt::{error, info, warn};
 use embassy_stm32::{
     i2c::{Config, I2c},
+    mode::Async,
     peripherals,
     time::hz,
     Peri,
 };
-use embassy_time::{Duration, Ticker, Timer};
+use embassy_time::{with_timeout, Duration, Ticker, Timer};
 
 use crate::{types::MagData, STATE};
+
+/// Bound on every individual I2C transaction. A 400 kHz, few-byte transfer
+/// normally completes in well under 200 us; this only exists to cap how long
+/// a stalled bus can stop the whole executor, not to be tight against the
+/// happy path.
+const I2C_TIMEOUT: Duration = Duration::from_millis(5);
 
 const ADDR: u8 = 0x0D;
 
@@ -88,21 +98,25 @@ fn compute_cal(min: [f32; 3], max: [f32; 3]) -> (MagCal, bool) {
 }
 
 /// Poll DRDY and read one raw magnetometer vector (LSB, sensor frame).
-/// Returns `None` if data is not ready or an I2C read fails (caller skips tick).
-fn read_raw(
-    dev: &mut I2c<'static, embassy_stm32::mode::Blocking, embassy_stm32::i2c::Master>,
+/// Returns `None` if data is not ready, the I2C read fails, or it times out
+/// (caller skips tick either way — a stalled bus degrades to "no mag this tick,"
+/// not a frozen executor).
+async fn read_raw(
+    dev: &mut I2c<'static, Async, embassy_stm32::i2c::Master>,
 ) -> Option<[f32; 3]> {
     let mut status = [0u8; 1];
-    if dev.blocking_write_read(ADDR, &[REG_STATUS], &mut status).is_err() {
-        warn!("Mag: status read failed");
-        return None;
+    match with_timeout(I2C_TIMEOUT, dev.write_read(ADDR, &[REG_STATUS], &mut status)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => { warn!("Mag: status read failed"); return None; }
+        Err(_)     => { warn!("Mag: status read timed out — bus stalled?"); return None; }
     }
     if status[0] & 0x01 == 0 { return None; } // DRDY not set
 
     let mut raw = [0u8; 6];
-    if dev.blocking_write_read(ADDR, &[REG_DATA], &mut raw).is_err() {
-        warn!("Mag: data read failed");
-        return None;
+    match with_timeout(I2C_TIMEOUT, dev.write_read(ADDR, &[REG_DATA], &mut raw)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => { warn!("Mag: data read failed"); return None; }
+        Err(_)     => { warn!("Mag: data read timed out — bus stalled?"); return None; }
     }
 
     Some([
@@ -127,6 +141,8 @@ pub async fn mag_task(
     i2c: Peri<'static, peripherals::I2C1>,
     scl: Peri<'static, peripherals::PB8>,
     sda: Peri<'static, peripherals::PB9>,
+    tx_dma: Peri<'static, peripherals::DMA1_CH6>,
+    rx_dma: Peri<'static, peripherals::DMA1_CH7>,
 ) {
     Timer::after(Duration::from_millis(20)).await;
 
@@ -134,21 +150,24 @@ pub async fn mag_task(
     cfg.frequency = hz(400_000);
     cfg.scl_pullup = true;
     cfg.sda_pullup = true;
-    let mut dev = I2c::new_blocking(i2c, scl, sda, cfg);
+    let mut dev = I2c::new(i2c, scl, sda, tx_dma, rx_dma, crate::Irqs, cfg);
 
     // Soft reset
-    if dev.blocking_write(ADDR, &[REG_CR2, 0x80]).is_err() {
-        error!("Mag: I2C write failed on reset — check wiring (continuing without mag)");
-        loop { Timer::after(Duration::from_secs(10)).await; }
+    match with_timeout(I2C_TIMEOUT, dev.write(ADDR, &[REG_CR2, 0x80])).await {
+        Ok(Ok(())) => {}
+        _ => {
+            error!("Mag: I2C write failed or timed out on reset — check wiring (continuing without mag)");
+            loop { Timer::after(Duration::from_secs(10)).await; }
+        }
     }
     Timer::after(Duration::from_millis(10)).await;
 
-    dev.blocking_write(ADDR, &[REG_PERIOD, 0x01]).ok();
-    dev.blocking_write(ADDR, &[REG_CR2, 0x00]).ok();
-    dev.blocking_write(ADDR, &[REG_CR1, CR1_VALUE]).ok();
+    let _ = with_timeout(I2C_TIMEOUT, dev.write(ADDR, &[REG_PERIOD, 0x01])).await;
+    let _ = with_timeout(I2C_TIMEOUT, dev.write(ADDR, &[REG_CR2, 0x00])).await;
+    let _ = with_timeout(I2C_TIMEOUT, dev.write(ADDR, &[REG_CR1, CR1_VALUE])).await;
 
     let mut chip_id = [0u8; 1];
-    dev.blocking_write_read(ADDR, &[REG_CHIP_ID], &mut chip_id).ok();
+    let _ = with_timeout(I2C_TIMEOUT, dev.write_read(ADDR, &[REG_CHIP_ID], &mut chip_id)).await;
     if chip_id[0] != 0xFF {
         warn!("Mag: unexpected chip ID 0x{:02X} (expected 0xFF)", chip_id[0]);
     }
@@ -162,7 +181,7 @@ pub async fn mag_task(
     let (cal, cal_ok) = if CAL_ENABLED {
         warn!(
             "Mag: CALIBRATION STARTING — ROTATE THE DRONE through ALL orientations \
-             (slow figure-8) for the next {} s!",
+             (slow figure-8) for the next {} s!", // starts at 25
             CAL_WINDOW_SECS
         );
 
@@ -176,10 +195,10 @@ pub async fn mag_task(
         for tick in 0..total_ticks {
             ticker.next().await;
 
-            if let Some(v) = read_raw(&mut dev) {
+            if let Some(v) = read_raw(&mut dev).await {
                 for i in 0..3 {
-                    if v[i] < min[i] { min[i] = v[i]; }
-                    if v[i] > max[i] { max[i] = v[i]; }
+                    if v[i] < min[i] { min[i] = v[i]; } // Get window min and max values over the 25 samples * 25 sample/sec, 3 axis?
+                    if v[i] > max[i] { max[i] = v[i]; } // So, a single spike can mess up offset for entire flight, only 2 extremes of 625 matter
                 }
                 samples += 1;
             }
@@ -225,7 +244,7 @@ pub async fn mag_task(
     loop {
         ticker.next().await;
 
-        let raw = match read_raw(&mut dev) {
+        let raw = match read_raw(&mut dev).await {
             Some(v) => v,
             None => continue,
         };

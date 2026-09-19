@@ -82,7 +82,7 @@ impl PosEstimator {
         // (X=North, Y=West, Z=Up - see ahrs::ned_yaw).
         let (w, x, y, z) = (q.w, q.x, q.y, q.z);
 
-        let r00 = 1.0 - 2.0 * (y * y + z * z);
+        let r00 = 1.0 - 2.0 * (y * y + z * z); // Turning quaternion into a 3x3 rotation matrix
         let r01 = 2.0 * (x * y - w * z);
         let r02 = 2.0 * (x * z + w * y);
         let r10 = 2.0 * (x * y + w * z);
@@ -217,13 +217,13 @@ pub async fn estimator_task() {
 
         // Optional CORRECT from optical flow at low altitude, only fused when
         // there's no recent GPS update.
-        if est.origin_set && !had_recent_gps {
+        if est.origin_set && !had_recent_gps { // est.origin_set = have we ever recieved a valid GPS fix?
             let flow = *STATE.flow.lock().await;
             if flow.usable() && flow.height_mm > 0 && flow.height_mm <= FLOW_MAX_HEIGHT_MM {
                 let h_m = flow.height_mm as f32 / 1000.0;
                 // Body-frame velocities from flow (matches navigation.rs scaling).
-                let vel_fwd = flow.vel_x_mrad_s as f32 * h_m / 1_000_000.0;
-                let vel_right = flow.vel_y_mrad_s as f32 * h_m / 1_000_000.0;
+                let vel_fwd = flow.vel_x_mrad_s as f32 * h_m / 1_000_000.0; // Watching the angle of things go by fast
+                let vel_right = flow.vel_y_mrad_s as f32 * h_m / 1_000_000.0; // Angle sweeping across FOV, µrad/s
 
                 // Rotate body horizontal velocity into NED using the NED yaw.
                 let yaw = crate::ahrs::ned_yaw(&q);

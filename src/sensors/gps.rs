@@ -72,7 +72,7 @@ fn parse_pvt(payload: &[u8; 92]) -> GpsFix {
         vel_n_ms: vn  as f32 * 1e-3,
         vel_e_ms: ve  as f32 * 1e-3,
         vel_d_ms: vd  as f32 * 1e-3,
-        hacc_m:   hacc as f32 * 1e-3,
+        hacc_m:   hacc as f32 * 1e-3, // Estimate of how wrong it might be (m)
         fix_ok:   (flags & 0x01) != 0 && fix_type >= 3,
         fix_type,
         stamp_ms: crate::types::stamp_now_ms(),

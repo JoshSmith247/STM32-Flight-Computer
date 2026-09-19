@@ -270,7 +270,7 @@ pub async fn motor_task(
             // Arming voids any pending bench test so it can never carry into flight.
             *STATE.motor_test.lock().await = None;
             [
-                outputs.m1.max(MOTOR_IDLE),
+                outputs.m1.max(MOTOR_IDLE), // Return max of the value and idle, so floor idle
                 outputs.m2.max(MOTOR_IDLE),
                 outputs.m3.max(MOTOR_IDLE),
                 outputs.m4.max(MOTOR_IDLE),

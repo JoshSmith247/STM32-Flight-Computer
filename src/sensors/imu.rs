@@ -178,7 +178,7 @@ pub async fn imu_task(cs_pin: Peri<'static, peripherals::PA4>) {
     info!("IMU: running — ±2000 dps / ±16g @ 1 kHz ODR, sampling at 500 Hz");
 
     loop {
-        ticker.next().await;
+        ticker.next().await; // defers next frame, does not skip!
 
         // Burst-read 14 bytes: 2 temp + 6 accel + 6 gyro (regs 0x1D-0x2A).
         let mut buf = [0u8; 15];

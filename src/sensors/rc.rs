@@ -135,9 +135,9 @@ pub async fn rc_task(
         // read_until_idle fires when the line goes idle after the 25-byte burst,
         // which is the natural gap between SBUS frames (~14 ms period).
         match with_timeout(SBUS_TIMEOUT, rx.read_until_idle(&mut buf)).await {
-            Ok(Ok(SBUS_FRAME_LEN)) => {
+            Ok(Ok(SBUS_FRAME_LEN)) => { // Is the frame the correct length? does UART work? Did an error deliver a timeout?
                 bad_frames = 0;
-                if !link_up {
+                if !link_up { // The link is now seen!
                     info!("SBUS: link acquired");
                     link_up = true;
                     RC_EVER_SEEN.store(true, core::sync::atomic::Ordering::Relaxed);
@@ -189,8 +189,8 @@ pub async fn rc_task(
             // Partial frame or UART error - a degraded (not silent) link. Count
             // consecutive bad reads and assert failsafe before stale RC can linger.
             Ok(Ok(_)) | Ok(Err(_)) => {
-                bad_frames = bad_frames.saturating_add(1);
-                if bad_frames >= FAILSAFE_AFTER_BAD {
+                bad_frames = bad_frames.saturating_add(1); // Clamped at u8 INT_MAX
+                if bad_frames >= FAILSAFE_AFTER_BAD { // 3
                     if link_up {
                         warn!("SBUS: link degraded (partial/error) — failsafe active");
                         link_up = false;

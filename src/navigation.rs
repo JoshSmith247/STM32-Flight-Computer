@@ -194,7 +194,7 @@ fn guide_to(
     let err_n = raw_n.clamp(-NAV_ERR_CAP_M, NAV_ERR_CAP_M);
     let err_e = raw_e.clamp(-NAV_ERR_CAP_M, NAV_ERR_CAP_M);
 
-    let fwd_m   =  err_n * cosf(yaw) + err_e * sinf(yaw);
+    let fwd_m   =  err_n * cosf(yaw) + err_e * sinf(yaw); // We don't need elevation change during movement
     let right_m = -err_n * sinf(yaw) + err_e * cosf(yaw);
 
     let dist     = sqrtf(raw_n * raw_n + raw_e * raw_e);
@@ -317,7 +317,7 @@ pub async fn navigation_task(_grip_pin: embassy_stm32::gpio::Input<'static>) {
     let mut demo_start_alt:   f32                  = 0.0;
 
     info!("Navigation task started (100 Hz)");
-    let mut ticker = Ticker::every(Duration::from_hz(100));
+    let mut ticker: Ticker = Ticker::every(Duration::from_hz(100));
 
     loop {
         ticker.next().await;
@@ -437,7 +437,7 @@ pub async fn navigation_task(_grip_pin: embassy_stm32::gpio::Input<'static>) {
         {
             // Altitude source dead mid-flight: hand back manual throttle if a pilot
             // is on the sticks; with no RC link force Land (Stabilise = zero throttle).
-            if crate::rc_gates_active() {
+            if crate::rc_gates_active() { //  If the rc is EVER_SEEN, so cannot reengage mid-descent
                 if prev_mode != FlightMode::Stabilise {
                     warn!("Altitude source lost — forcing Stabilise (manual throttle)");
                 }
@@ -600,10 +600,10 @@ pub async fn navigation_task(_grip_pin: embassy_stm32::gpio::Input<'static>) {
                     }
                 }
 
-                if !gps_ok {
+                if !gps_ok { // Lost GPS, now we're in the window before the demotion to RC control
                     // Airborne with GPS gone but not yet demoted: hold the altitude where
                     // the fix died. On the ground keep manual passthrough (alt-hold would spool up).
-                    if state::get() == state::FlightState::Flying {
+                    if state::get() == state::FlightState::Flying { // This is a bridge for 5s after 2.5 seconds of GPS disappearance before it goes full demotion
                         if gps_loss_alt.is_none() {
                             warn!("Auto: GPS fix lost — holding altitude");
                         }
@@ -639,11 +639,11 @@ pub async fn navigation_task(_grip_pin: embassy_stm32::gpio::Input<'static>) {
                     climb
                 } else {
                     // Use rangefinder AGL when within reliable range; fall back to baro.
-                    let agl = if flow.usable() && flow.height_mm > 0
+                    let agl = if flow.usable() && flow.height_mm > 0 // above ground level
                                 && flow.height_mm <= FLOW_MAX_HEIGHT_MM {
                         flow.height_mm as f32 / 1000.0
                     } else {
-                        alt_now
+                        alt_now // direct baro reading
                     };
 
                     // New target -> LATCH into active_weed; a target arriving mid-sequence
@@ -831,7 +831,7 @@ pub async fn navigation_task(_grip_pin: embassy_stm32::gpio::Input<'static>) {
                         }
                     }
                     guide_to(hold_pos, pos, hold_alt, alt_now,
-                             yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
+                             yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid) // Guide to person, identified as weed by companion computer
                 }
             }
 

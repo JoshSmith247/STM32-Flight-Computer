@@ -206,10 +206,10 @@ impl PosPid {
 // M3 back-right CCW, M4 back-left CW.
 
 pub fn mix_quad_x(throttle: f32, roll: f32, pitch: f32, yaw: f32) -> MotorOutputs {
-    let r1 = throttle - roll + pitch - yaw;
-    let r2 = throttle + roll + pitch + yaw;
-    let r3 = throttle - roll - pitch + yaw;
-    let r4 = throttle + roll - pitch - yaw;
+    let r1 = throttle - roll + pitch - yaw; // FR, CW
+    let r2 = throttle + roll + pitch + yaw; // FL, CCW
+    let r3 = throttle - roll - pitch + yaw; // BR, CCW
+    let r4 = throttle + roll - pitch - yaw; // BL, CW
 
     // Shift all motors by the same offset before clamping so torque ratios are
     // preserved when any output would otherwise exceed [0, 1].

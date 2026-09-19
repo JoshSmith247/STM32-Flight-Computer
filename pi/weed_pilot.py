@@ -2,7 +2,10 @@
 """
 Weed pilot — Pi-side relay between ground station weed detection and STM32.
 
-Replaces mavlink_bridge.py when weed targeting is active. Runs on the Pi.
+This is the only relay actually deployed (see mavlink.service) — it runs
+unconditionally, not toggled based on whether weed targeting is active this
+flight. It's a superset of mavlink_bridge_deprecated.py's plain byte relay,
+plus its own STM32 heartbeat and the weed-target JSON->MAVLink gateway below.
 
 Responsibilities:
   1. Forward STM32 telemetry bytes (serial) → ground station laptop (UDP:GCS_PORT)

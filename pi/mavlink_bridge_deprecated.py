@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 """
+DEPRECATED — not wired to any systemd unit; weed_pilot.py is what actually runs
+(see pi/mavlink.service, ExecStart=weed_pilot.py). weed_pilot.py is a strict
+superset (same serial<->UDP relay, plus its own heartbeat to the STM32's Pi-loss
+watchdog and the weed-target JSON->MAVLink gateway), so there is no live
+"plain telemetry" mode this file is actually switched into. Kept only as a
+minimal manual/bench-test reference for the raw relay in isolation.
+
 MAVLink bridge: STM32 USART3 (serial) <-> GCS laptop (UDP).
 Forwards raw bytes in both directions — no parsing needed here.
 
