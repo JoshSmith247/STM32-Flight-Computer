@@ -15,6 +15,11 @@ from tracker import WeedTracker
 _FOLLOW_MODE_ID = 6   # FlightMode::FollowMe discriminant in STM32 heartbeat
 _WEED_MODE_ID   = 3   # FlightMode::Auto - only mode that runs ExG detection
 
+# How often to re-stream the selected weed's live tracked position while in
+# WeedPhase::HoverCorrect (navigation.rs) - keep comfortably under that phase's
+# WEED_TARGET_FRESH_MS (500 ms) so a couple of missed sends don't look stale.
+CORRECTION_INTERVAL_S = 0.2
+
 _LOGS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
 
 
@@ -165,6 +170,7 @@ class _Renderer:
         self.frame_count  = 0
         self.stream_alive = False
         self._prev_sel: int | None = None
+        self._last_correction_t = 0.0   # monotonic time of the last streamed weed correction
         # Letterbox state - written by renderer thread, read by main thread (GIL-safe)
         self._vid_scale = 1.0
         self._vid_x_off = 0
@@ -368,15 +374,24 @@ class _Renderer:
 
             if weed_mode:
                 sel = self._tracker._selected_wid
-                if sel != self._prev_sel:
-                    self._prev_sel = sel
-                    if sel is not None:
-                        wp = self._tracker._named.get(sel, {}).get('world_pos')
-                        if wp is not None:
-                            send_weed_target(sel, wp[0], wp[1])
-                        else:
-                            print(f"W{sel} selected — no GPS fix yet, target not sent",
-                                  flush=True)
+                newly_selected = sel != self._prev_sel
+                self._prev_sel = sel
+                if sel is not None:
+                    w  = self._tracker._named.get(sel, {})
+                    wp = w.get('world_pos')
+                    # Stream repeatedly (not just on selection) while actively tracked,
+                    # so the STM32's HoverCorrect phase can converge on the *live*
+                    # position instead of a single click-time estimate. lost_frames > 0
+                    # means the box is coasting on its last known spot, not a fresh
+                    # optical-flow/ExG fix - don't feed that in as if it were live.
+                    now = time.monotonic()
+                    due = newly_selected or (now - self._last_correction_t >= CORRECTION_INTERVAL_S)
+                    if wp is not None and w.get('lost_frames', 0) == 0 and due:
+                        send_weed_target(sel, wp[0], wp[1])
+                        self._last_correction_t = now
+                    elif newly_selected and wp is None:
+                        print(f"W{sel} selected — no GPS fix yet, target not sent",
+                              flush=True)
 
             with self._lock:
                 self._vid_arr = display

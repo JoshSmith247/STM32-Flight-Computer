@@ -10,6 +10,7 @@ pub const GPS_FRESH_MS: u64 = 2_500;  // nominal 5 Hz
 pub const FLOW_FRESH_MS: u64 = 300;   // continuous stream
 pub const MAG_FRESH_MS: u64 = 500;    // 25 Hz
 pub const IMU_FRESH_MS: u64 = 100;    // 500 Hz
+pub const WEED_TARGET_FRESH_MS: u64 = 500; // GCS streams corrections @ 5 Hz (200ms) during hover
 
 #[inline]
 pub fn stamp_now_ms() -> u64 {
@@ -281,6 +282,9 @@ pub struct ServoOutputs {
 
 /// Active weed pull target set by telemetry_task when a SET_POSITION_TARGET_LOCAL_NED
 /// message arrives from the Pi. Cleared by navigation_task after servo actuation.
+/// The GCS re-sends this repeatedly (not just once) while a weed is selected and
+/// tracked, so `stamp_ms` lets WeedPhase::HoverCorrect tell a live correction feed
+/// from a stale/frozen one.
 #[derive(Clone, Copy, defmt::Format)]
 pub struct WeedTarget {
     pub position:     LatLonAlt,
@@ -288,11 +292,16 @@ pub struct WeedTarget {
     /// Computed in telemetry_task as baro.altitude_m - ned_d at receive time.
     pub extract_alt_m: f32,
     pub valid:        bool,
+    pub stamp_ms:     u64,
+}
+
+impl WeedTarget {
+    pub fn is_fresh(&self) -> bool { is_fresh(self.stamp_ms, WEED_TARGET_FRESH_MS) }
 }
 
 impl Default for WeedTarget {
     fn default() -> Self {
-        Self { position: LatLonAlt::default(), extract_alt_m: 0.4, valid: false }
+        Self { position: LatLonAlt::default(), extract_alt_m: 0.4, valid: false, stamp_ms: 0 }
     }
 }
 
@@ -347,7 +356,7 @@ impl SharedState {
             pos_estimate:  Mutex::new(PosEstimate { pos_n:0.0, pos_e:0.0, pos_d:0.0, vel_n:0.0, vel_e:0.0, vel_d:0.0, valid:false }),
             sensor_health: Mutex::new(SensorHealth { imu_ok:false, baro_ok:false, mag_ok:false, gps_ok:false }),
             payload_flags:  Mutex::new(0u32),
-            weed_target:    Mutex::new(WeedTarget { position: LatLonAlt { lat_deg:0.0, lon_deg:0.0, alt_m:0.0 }, extract_alt_m: 0.4, valid: false }),
+            weed_target:    Mutex::new(WeedTarget { position: LatLonAlt { lat_deg:0.0, lon_deg:0.0, alt_m:0.0 }, extract_alt_m: 0.4, valid: false, stamp_ms: 0 }),
             home_override:  Mutex::new(None),
             motor_test:     Mutex::new(None),
             mode_override:  Mutex::new(None),

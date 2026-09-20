@@ -15,12 +15,20 @@ use crate::{
 
 // Weed extraction phases
 
-/// Seven-phase sequence executed each time a weed target is received in Auto mode.
+/// Eight-phase sequence executed each time a weed target is received in Auto mode.
 #[derive(Clone, Copy, PartialEq)]
 enum WeedPhase {
     /// Fly to the weed lat/lon at cruise altitude before descending.
     Approach,
-    /// Drone is overhead; descend to extract_alt_m using rangefinder when available.
+    /// Still at cruise altitude, claws nowhere near anything; wait to converge on
+    /// the GCS's *live*, repeatedly re-sent weed position before ever descending,
+    /// so the low-altitude approach is a clean straight-down descent onto an
+    /// already-confirmed spot. Aborts by abandoning this weed and resuming the
+    /// mission (nothing was ever gripped or descended to) on a convergence
+    /// timeout or a stale correction feed.
+    HoverCorrect,
+    /// Drone is overhead and converged; descend to extract_alt_m using rangefinder
+    /// when available.
     Descend,
     /// Hold at extraction altitude for WEED_STABILIZE_MS before actuating.
     Stabilize,
@@ -75,6 +83,18 @@ const WEED_STABILIZE_MS:  u64  = 1_000;       // hover at extraction alt before 
 const WEED_PULL_MS:       u64  = 500;         // servo hold duration
 const WEED_ASCEND_NEAR_M: f32  = 1.0;         // within this of approach alt -> ascent complete
 const BIN_DROP_ALT_M:     f32  = 0.5;         // AGL to descend to over bin before releasing
+
+// Hover correction (before ever descending, while still at cruise altitude): the
+// GCS re-sends STATE.weed_target repeatedly (~5 Hz) while a weed stays selected +
+// tracked, so this phase actually waits to converge on the *live* position instead
+// of trusting the single click-time estimate - descent onto the claws' working
+// range only starts once already confirmed centered. Aborts (abandon this weed,
+// resume the mission - nothing was ever gripped) if it can't converge in time, or
+// if fresh corrections stop arriving (ground/Pi link died mid-hover).
+const WEED_HOVER_TOLERANCE_M: f32 = 0.2;       // convergence radius
+const WEED_HOVER_SETTLE_MS:   u64 = 500;       // must stay within tolerance this long
+const WEED_HOVER_TIMEOUT_MS:  u64 = 9_000;     // give up converging after this long
+const WEED_TARGET_STALE_MS:   u64 = 2_000;     // abort if no fresh correction in this long
 
 // Demo hover (tethered, closed-loop) - self-contained takeoff/hold/descend/disarm.
 const DEMO_HOVER_ALT_M:        f32 = 0.6;      // ~2 ft target height above launch (AGL)
@@ -298,6 +318,10 @@ pub async fn navigation_task(_grip_pin: embassy_stm32::gpio::Input<'static>) {
     let mut active_weed:      crate::types::WeedTarget = Default::default();
     let mut weed_approach_alt: f32                 = 0.0;
     let mut weed_phase_timer: Option<Instant>      = None;
+    // HoverCorrect only: continuous within-tolerance dwell, and last time a fresh
+    // GCS correction was seen at all (drives the two abort conditions).
+    let mut weed_hover_settled_since: Option<Instant> = None;
+    let mut weed_last_fresh_correction: Option<Instant> = None;
     // Fixed hold point once the mission completes (target = current would drift).
     let mut mission_done_pos: Option<LatLonAlt>    = None;
     let mut prev_mode:        FlightMode           = FlightMode::Stabilise;
@@ -487,6 +511,8 @@ pub async fn navigation_task(_grip_pin: embassy_stm32::gpio::Input<'static>) {
             lander           = None;
             wp_arrived_at    = None;
             weed_phase_timer = None;
+            weed_hover_settled_since   = None;
+            weed_last_fresh_correction = None;
             mission_done_pos = None;
             demo_phase       = None;
             if weed_phase.take().is_some() {
@@ -685,13 +711,63 @@ pub async fn navigation_task(_grip_pin: embassy_stm32::gpio::Input<'static>) {
                             WeedPhase::Approach => {
                                 let dist = haversine_m(pos, weed.position);
                                 if dist < WEED_ARRIVE_M {
-                                    alt_pid.reset(); // altitude reference switches baro->AGL
-                                    weed_phase       = Some(WeedPhase::Descend);
-                                    weed_phase_timer = None;
-                                    info!("Weed overhead (dist={=f32}m) — descending to {=f32}m AGL",
-                                          dist, weed.extract_alt_m);
+                                    weed_phase       = Some(WeedPhase::HoverCorrect);
+                                    weed_phase_timer = Some(Instant::now());
+                                    weed_hover_settled_since   = None;
+                                    weed_last_fresh_correction = None;
+                                    info!("Weed overhead (dist={=f32}m) — converging on live position \
+                                           before descending", dist);
                                 }
                                 guide_to(weed.position, pos, weed_approach_alt, alt_now,
+                                         yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
+                            }
+
+                            // Phase 1.5: still at cruise altitude (claws nowhere near anything)
+                            // - wait to converge on the GCS's live, repeatedly re-sent position
+                            // (STATE.weed_target) before ever descending, so the low-altitude
+                            // approach with the gripper claws is a clean straight-down descent
+                            // onto an already-confirmed spot rather than a correction mid-grab.
+                            // Aborts by abandoning this weed and resuming the mission (nothing
+                            // was ever gripped or descended to, so there's nothing to carry
+                            // home) on a convergence timeout or a dead correction feed.
+                            WeedPhase::HoverCorrect => {
+                                let live = *STATE.weed_target.lock().await;
+                                if live.valid && live.is_fresh() {
+                                    active_weed.position = live.position;
+                                    weed_last_fresh_correction = Some(Instant::now());
+                                }
+
+                                let stale = weed_last_fresh_correction.map_or(true, |t| {
+                                    t.elapsed() > Duration::from_millis(WEED_TARGET_STALE_MS)
+                                });
+                                let timed_out = weed_phase_timer.map_or(false, |t| {
+                                    t.elapsed() > Duration::from_millis(WEED_HOVER_TIMEOUT_MS)
+                                });
+
+                                if stale || timed_out {
+                                    warn!("Hover correction {=str} — abandoning this weed, resuming mission",
+                                          if stale { "feed went stale" } else { "timed out" });
+                                    weed_phase = None;
+                                    STATE.weed_target.lock().await.valid = false;
+                                } else {
+                                    let dist = haversine_m(pos, active_weed.position);
+                                    if dist < WEED_HOVER_TOLERANCE_M {
+                                        let settled = *weed_hover_settled_since
+                                            .get_or_insert_with(Instant::now);
+                                        if settled.elapsed()
+                                            >= Duration::from_millis(WEED_HOVER_SETTLE_MS)
+                                        {
+                                            alt_pid.reset(); // altitude reference switches baro->AGL
+                                            weed_phase       = Some(WeedPhase::Descend);
+                                            weed_phase_timer = None;
+                                            info!("Converged on live weed position — descending to {=f32}m AGL",
+                                                  weed.extract_alt_m);
+                                        }
+                                    } else {
+                                        weed_hover_settled_since = None;
+                                    }
+                                }
+                                guide_to(active_weed.position, pos, weed_approach_alt, alt_now,
                                          yaw, &mut nav_pid_n, &mut nav_pid_e, &mut alt_pid)
                             }
 

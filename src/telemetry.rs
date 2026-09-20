@@ -865,6 +865,7 @@ pub async fn telemetry_task(
                                 };
                                 wt.extract_alt_m = extract_alt_m;
                                 wt.valid = true;
+                                wt.stamp_ms = crate::types::stamp_now_ms();
                                 info!("Weed target set: {=f32}m N, {=f32}m E, extract at {=f32}m AGL",
                                       ned_n, ned_e, extract_alt_m);
                             } else {
