@@ -146,6 +146,7 @@ async fn control_task() {
         }
 
         let imu      = *STATE.imu_data.lock().await;
+        let health  = *STATE.sensor_health.lock().await;
         let mag      = *STATE.mag_data.lock().await;
         let is_armed = *STATE.armed.lock().await;
         let nav_cmd  = *STATE.nav_command.lock().await;
@@ -172,15 +173,20 @@ async fn control_task() {
         *STATE.attitude.lock().await = quat;
         let euler = filter.euler();
 
+        // IMU registering unhealthy values OR
         // Crash/tumble cutoff: sustained extreme tilt while armed -> kill motors, latch Fault.
-        if is_armed && (euler.roll.abs() > CRASH_ANGLE_RAD || euler.pitch.abs() > CRASH_ANGLE_RAD) {
+        if is_armed && (euler.roll.abs() > CRASH_ANGLE_RAD || euler.pitch.abs() > CRASH_ANGLE_RAD || !health.imu_ok) {
             crash_ticks += 1;
             if crash_ticks > CRASH_TICKS {
                 *STATE.armed.lock().await = false;
                 state::set(FlightState::Fault);
                 *STATE.motor_outputs.lock().await = Default::default();
                 pids.reset_all();
-                defmt::warn!("Crash/tumble: extreme tilt — disarmed + Fault");
+                if !health.imu_ok {
+                    defmt::warn!("IMU: unhealthy — disarmed + Fault");
+                } else {
+                    defmt::warn!("Crash/tumble: extreme tilt — disarmed + Fault");
+                }
                 crash_ticks = 0;
                 continue;
             }

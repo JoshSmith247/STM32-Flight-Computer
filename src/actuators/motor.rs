@@ -44,7 +44,7 @@ fn encode_dshot(thr: u16) -> u16 {
 }
 
 // Physical motor-order remap: MOTOR_SLOT[i] = TIM3 slot driving mixer motor i+1
-// (bench --sequence, 2026-07-09). WARNING: Re-verify with `motor_test.py --sequence` before props go on.
+// (bench --sequence, 2026-07-09; re-verified on the new ESC+board 2026-09-20).
 const MOTOR_SLOT: [usize; MOTORS] = [1, 3, 0, 2];
 
 // Buffer is u16: the DMA does halfword transfers to TIM3's 16-bit DMAR/CCR registers.
