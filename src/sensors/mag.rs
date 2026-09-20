@@ -261,7 +261,7 @@ pub async fn mag_task(
         let heading_rad = tilt_compensated_heading(x, y, z, roll, pitch);
 
         *STATE.mag_data.lock().await = MagData {
-            x, y, z, heading_rad,
+            x, y, z, heading_rad, // Compass pointing of front of drone, in radians
             valid: cal_ok,
             stamp_ms: crate::types::stamp_now_ms(),
         };

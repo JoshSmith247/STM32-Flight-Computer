@@ -7,10 +7,21 @@ Codebase: 4,650 lines Rust, 16 concurrent tasks, STM32H723 / Embassy / `no_std`.
 
 ---
 
-## WHERE YOU ARE  (updated 2026-09-04)
+## WHERE YOU ARE  (updated 2026-09-19)
 
 **Done thoroughly:** `main.rs` · `motor.rs` · `imu.rs` · `rc.rs` · `gps.rs` · `baro.rs` ·
-**`navigation.rs` (complete)** · **`estimator.rs` (complete, line-level — see below)**
+**`navigation.rs` (complete)** · **`estimator.rs` (complete, line-level — see below)** ·
+**`mag.rs` (2026-09-19, deep — see below)**
+
+**In progress:** `navigation.rs` re-walked further 2026-09-19 (Q&A-driven, not systematic) —
+still not fully closed out; original ~60% tracking below may be stale but the gaps
+(PositionHold body, Auto body, FollowMe/RTH/DemoHover) haven't been confirmed closed.
+
+### Plan for 2026-09-20
+First-time/systematic reads: `flow.rs`, `baro.rs`.
+Consolidation/review passes (already ✅ or absorbed via Q&A, going back through
+end-to-end so it's one object instead of scattered facts): `rc.rs`, `battery.rs`,
+`pid.rs`, `state.rs`, `types.rs`, `motor.rs`, `estimator.rs`, `health.rs`, `ahrs.rs`.
 
 **Absorbed through questions, no systematic read needed:** `pid.rs` · `types.rs` ·
 `health.rs` · `ahrs.rs`.
@@ -45,10 +56,13 @@ fairness guarantee either. Also traced DMAMUX topology (DMAMUX1 shared by DMA1+D
 project has zero `scheduler-priority`/`scheduler-deadline` — genuinely flat, no task
 prioritization. Good general-purpose interview material beyond just this codebase.
 
-### Actually remaining — ~1.3 h
+### Actually remaining — ~0.8 h
 
-- ⬜ **`src/sensors/mag.rs`** (250) — 30 min. Hard/soft-iron cal, why it takes 25 s,
-  why failure blocks GPS-mode arming, tilt compensation. Operationally significant.
+- ✅ **`src/sensors/mag.rs`** (250) — done 2026-09-19: hard/soft-iron cal (per-axis
+  min/max → offset + diagonal scale), why the 25 s rotate-through-all-orientations
+  window, why cal failure blocks GPS-mode arming, tilt-compensated heading derivation
+  (`bx/by/bz` + roll/pitch → `atan2` → `[0, 2π)`), the two-phase I2C read (write-then-read
+  STATUS for DRDY, then write-then-read DATA), `with_timeout` guarding a stall-prone bus.
 - ✅ **`src/sensors/battery.rs`** (124) — self-reported done.
 - ⬜ **`src/pid.rs`** (226) — 30 min consolidation pass. You know every piece; read it
   end-to-end once so it's one object rather than six facts.
@@ -160,7 +174,7 @@ this firmware just parses it out of UBX-PVT rather than computing it
 - ✅ `src/sensors/gps.rs` (180) — UBX sync-char frame finder, checksum, `parse_pvt` scaling;
   what a "fix" is (3 sats = 2D, 4 = 3D — clock offset is the 4th unknown); `hacc_m`;
   GPS as a *smart* sensor vs the IMU as a dumb one; ⚠ the no-timeout blocking bug
-- ⬜ `src/sensors/mag.rs` (250) — 25 s boot calibration, why failure blocks GPS modes
+- ✅ `src/sensors/mag.rs` (250) — 25 s boot calibration, why failure blocks GPS modes
 - ✅ `src/sensors/battery.rs` (124) — two-stage thresholds, asymmetric hysteresis;
   also its flow-as-rangefinder AGL check for the ground Fault-lock (found via the
   estimator sessions, not a standalone read)

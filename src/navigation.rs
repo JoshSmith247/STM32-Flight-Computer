@@ -303,9 +303,11 @@ pub async fn navigation_task(_grip_pin: embassy_stm32::gpio::Input<'static>) {
     let mut prev_mode:        FlightMode           = FlightMode::Stabilise;
     let mut home_set:         bool                 = false;
     let mut last_gps_ok:      Instant              = Instant::now();
-    // Latched failsafe response (geofence / battery), held until disarm so a
-    // recovering breach or load-sagging battery pct can't toggle modes.
+    // Latched failsafe response (geofence / critical battery), held until disarm
+    // so a recovering breach or load-sagging battery pct can't toggle modes.
     let mut failsafe_forced:  Option<FlightMode>   = None;
+    // Edge-triggered so "low battery" only logs once per dip, not every tick.
+    let mut low_batt_warned:  bool                 = false;
     // Altitude latched at GPS loss so Auto/FollowMe hold height until the AltitudeHold demotion.
     let mut gps_loss_alt:     Option<f32>          = None;
     let mut prev_armed:       bool                 = false;
@@ -386,13 +388,19 @@ pub async fn navigation_task(_grip_pin: embassy_stm32::gpio::Input<'static>) {
             }
         }
 
+        // Low battery is advisory only - console warning, no forced mode change.
+        // Edge-triggered so it logs once per dip rather than every tick.
+        let low_batt_now = battery.voltage_v > 0.0 && battery.pct < BATT_LOW_PCT;
+        if low_batt_now && !low_batt_warned {
+            warn!("Low battery ({=u8}%) — no automatic action, pilot's call", battery.pct);
+        }
+        low_batt_warned = low_batt_now;
+
         // Failsafe triggers LATCH their response until disarm (per-tick re-evaluation
         // oscillates at the fence line). Skipped while already in Land/RTH.
         if failsafe_forced.is_none()
             && !matches!(mode, FlightMode::Land | FlightMode::ReturnToHome)
         {
-            // (reason, set Landing state?) - low battery is a routine RTH, not a
-            // landing-in-progress, so it leaves the flight state alone.
             let trigger = if home_set
                 && (alt_now > GEOFENCE_MAX_ALT_M
                     || (gps_ok && haversine_m(pos, mission.home) > GEOFENCE_MAX_RADIUS_M))
@@ -400,8 +408,6 @@ pub async fn navigation_task(_grip_pin: embassy_stm32::gpio::Input<'static>) {
                 Some(("Geofence breach", true))
             } else if battery.critical {
                 Some(("Critical battery", true))
-            } else if battery.voltage_v > 0.0 && battery.pct < BATT_LOW_PCT {
-                Some(("Low battery", false))
             } else {
                 None
             };
@@ -425,10 +431,23 @@ pub async fn navigation_task(_grip_pin: embassy_stm32::gpio::Input<'static>) {
             None => mode,
         };
 
-        // Resolve effective mode: Fault -> Land; sensor-loss demotions apply only
-        // to pilot modes (a latched RTH/Land handles its own GPS loss).
+        // Resolve effective mode: Fault -> RC Stabilise if a pilot is on the
+        // sticks, else Land (same rc_gates_active() pattern as altitude-source
+        // loss below). Crash/tumble already disarms directly in control_task,
+        // so this branch only matters in practice for a Pi-heartbeat-loss Fault -
+        // it can't soften the crash cutoff, which bypasses mode resolution entirely.
         let effective_mode = if state::get() == state::FlightState::Fault {
-            FlightMode::Land
+            if crate::rc_gates_active() {
+                if prev_mode != FlightMode::Stabilise {
+                    warn!("Fault — forcing Stabilise (manual control)");
+                }
+                FlightMode::Stabilise
+            } else {
+                if prev_mode != FlightMode::Land {
+                    warn!("Fault, no RC — forcing Land");
+                }
+                FlightMode::Land
+            }
         } else if failsafe_forced.is_some() {
             base_mode
         } else if !alt_source_ok
