@@ -8,7 +8,7 @@ import numpy as np
 import config
 import gfx
 from config import PROGRAMS, PAYLOAD_NAMES, OVERLAY_H
-from mavlink import _mav_lock, _mav_state, send_mavlink_command
+from mavlink import _mav_lock, _mav_state, send_mavlink_command, send_nudge_waypoint
 
 _FLIGHT_MODES = {
     0: 'STAB', 1: 'ALTH', 2: 'POSH', 3: 'AUTO', 4: 'RTH', 5: 'LAND', 6: 'FOLW',
@@ -42,6 +42,27 @@ _ui_state: dict = {
     'denied_prog':      None,
     'denied_until':     0.0,
 }
+
+# renderer.py only rebuilds the stats panel (draw_stats_panel, below) every
+# _STATS_INTERVAL (100 ms) to bound CPU cost for the continuously-changing
+# telemetry gauges. That means a click that changes stats-panel state (arm,
+# program select, payload toggle, movement pad) could sit for up to 100 ms
+# before it's even visible - this flag lets a click force an immediate
+# rebuild on the renderer thread's next loop iteration instead of waiting.
+_stats_dirty = False
+
+
+def mark_stats_dirty() -> None:
+    """Call after any click that changes what draw_stats_panel renders."""
+    global _stats_dirty
+    _stats_dirty = True
+
+
+def pop_stats_dirty() -> bool:
+    """Consume and clear the dirty flag. Renderer-thread-only."""
+    global _stats_dirty
+    dirty, _stats_dirty = _stats_dirty, False
+    return dirty
 
 # Bench motor test (MAV_CMD_DO_MOTOR_TEST, 209): M1..M4 buttons. Firmware spins
 # one motor for 2 s, only disarmed + Idle, throttle clamped to 0.20. PROPS OFF.
@@ -95,6 +116,7 @@ def handle_payload_double_click(px: int, py: int) -> None:
     bits = sorted(PAYLOAD_NAMES.keys())
     if idx < len(bits):
         toggle_payload_override(bits[idx])
+        mark_stats_dirty()
 
 
 _horizon_img_cache: dict = {}   # r -> {'sky': patch, 'gnd': patch}
@@ -210,6 +232,99 @@ def _draw_artificial_horizon(panel: np.ndarray, cx: int, cy: int, r: int,
     cv2.line(panel, (cx + hw // 3, cy), (cx + hw, cy), (0, 220, 255), max(1, 2 * s))
     cv2.circle(panel, (cx, cy), 3 * s, (0, 220, 255), -1)
     cv2.circle(panel, (cx, cy), r, (90, 90, 90), max(1, 2 * s))
+
+
+# Movement pad: click N/E/S/W to upload a single-waypoint MAVLink mission
+# _nudge_distance_m away in that direction (see mavlink.send_nudge_waypoint).
+# UP/DOWN arrows scale that distance exponentially (x2 / /2 per click), clamped
+# to [NUDGE_MIN_M, NUDGE_MAX_M] - a nudge pad shouldn't be able to fat-finger a
+# long cross-country leg; go through a real mission upload for that.
+# Rects are stored in stats-panel-local LOGICAL coords (same space station.py
+# uses for _payload_panel_rect / _arm_btn_rect) so station.py can hit-test them.
+NUDGE_MIN_M       = 0.1
+NUDGE_MAX_M       = 5.0
+NUDGE_FACTOR      = 2.0
+NUDGE_FLASH_S     = 0.25   # quick "registered" pulse, not a lingering error state
+_nudge_distance_m = 0.5
+_movement_pad_rects: dict = {}   # 'N'/'E'/'S'/'W'/'UP'/'DOWN' -> (x, y, w, h) logical
+_nudge_up_flash_until   = 0.0
+_nudge_down_flash_until = 0.0
+
+
+def _draw_tri_button(panel: np.ndarray, cx: int, cy: int, half_w: int, half_h: int,
+                     pointing: str, flashing: bool = False) -> None:
+    """Small filled triangle pointing 'up' or 'down', physical-pixel coords."""
+    if pointing == 'up':
+        pts = [(cx, cy - half_h), (cx - half_w, cy + half_h), (cx + half_w, cy + half_h)]
+    else:
+        pts = [(cx, cy + half_h), (cx - half_w, cy - half_h), (cx + half_w, cy - half_h)]
+    color = (100, 220, 255) if flashing else (70, 130, 210)
+    cv2.fillPoly(panel, [np.array(pts, np.int32)], color)
+
+
+def _draw_movement_pad(panel: np.ndarray, cx: int, cy: int, r: int) -> None:
+    """Plus-arranged N/E/S/W button cluster with a distance readout + exponential
+    inc/dec arrows in the centre gap, physical-pixel coords."""
+    s   = config.PR
+    btn = max(14 * s, r * 2 // 3)
+    gap = max(2 * s, r // 6)
+    _movement_pad_rects.clear()
+    offsets = {'N': (0, -(btn + gap)), 'S': (0, btn + gap),
+               'E': (btn + gap, 0),    'W': (-(btn + gap), 0)}
+    for lbl, (dx, dy) in offsets.items():
+        bx, by = cx + dx, cy + dy
+        x0, y0 = bx - btn // 2, by - btn // 2
+        x1, y1 = bx + btn // 2, by + btn // 2
+        cv2.rectangle(panel, (x0, y0), (x1, y1), (30, 55, 90), -1)
+        cv2.rectangle(panel, (x0, y0), (x1, y1), (60, 110, 190), max(1, s))
+        (lw, lh), _ = gfx.size(lbl, 0.36 * s)
+        gfx.put_text(panel, lbl, (bx - lw // 2, by + lh // 2), 0.36 * s, (150, 190, 230))
+        # Store in LOGICAL coords (physical / s) - station.py compares against
+        # logical mouse coords the same way _payload_panel_rect does.
+        _movement_pad_rects[lbl] = (x0 // s, y0 // s, (x1 - x0) // s, (y1 - y0) // s)
+
+    # Distance readout, centred in the gap between the four buttons. Brightens
+    # briefly (NUDGE_FLASH_S) whenever either arrow was just clicked.
+    now = time.monotonic()
+    text_flashing = now < _nudge_up_flash_until or now < _nudge_down_flash_until
+    dist_lbl = f"{_nudge_distance_m:g}m"
+    (dw, dh), _ = gfx.size(dist_lbl, 0.26 * s)
+    gfx.put_text(panel, dist_lbl, (cx - dw // 2, cy + dh // 2), 0.26 * s,
+                (220, 220, 220) if text_flashing else (130, 130, 130))
+
+    # Up/down arrows directly above/below the readout. This gap is tight by
+    # construction (bounded by the N/S buttons either side) - if these render
+    # too small to hit reliably, grow `r` in the caller rather than this ratio.
+    aw    = max(4 * s, gap // 2 + 2 * s)
+    ah    = max(3 * s, gap // 2)
+    click_pad = 2 * s
+    up_cy = cy - dh - ah - 2 * s
+    dn_cy = cy + dh + ah + 2 * s
+    _draw_tri_button(panel, cx, up_cy, aw, ah, 'up',   now < _nudge_up_flash_until)
+    _draw_tri_button(panel, cx, dn_cy, aw, ah, 'down', now < _nudge_down_flash_until)
+    _movement_pad_rects['UP']   = ((cx - aw - click_pad) // s, (up_cy - ah - click_pad) // s,
+                                    (2 * aw + 2 * click_pad) // s, (2 * ah + 2 * click_pad) // s)
+    _movement_pad_rects['DOWN'] = ((cx - aw - click_pad) // s, (dn_cy - ah - click_pad) // s,
+                                    (2 * aw + 2 * click_pad) // s, (2 * ah + 2 * click_pad) // s)
+
+
+def handle_movement_pad_click(px: int, py: int) -> None:
+    """Dispatch a click at stats-panel-local logical coords to the movement pad."""
+    global _nudge_distance_m, _nudge_up_flash_until, _nudge_down_flash_until
+    for direction, (rx, ry, rw, rh) in _movement_pad_rects.items():
+        if rx <= px <= rx + rw and ry <= py <= ry + rh:
+            mark_stats_dirty()
+            if direction == 'UP':
+                _nudge_distance_m = min(NUDGE_MAX_M, _nudge_distance_m * NUDGE_FACTOR)
+                _nudge_up_flash_until = time.monotonic() + NUDGE_FLASH_S
+                print(f"Nudge distance: {_nudge_distance_m:g} m", flush=True)
+            elif direction == 'DOWN':
+                _nudge_distance_m = max(NUDGE_MIN_M, _nudge_distance_m / NUDGE_FACTOR)
+                _nudge_down_flash_until = time.monotonic() + NUDGE_FLASH_S
+                print(f"Nudge distance: {_nudge_distance_m:g} m", flush=True)
+            else:
+                send_nudge_waypoint(direction, _nudge_distance_m)
+            return
 
 
 def _draw_compass(panel: np.ndarray, cx: int, cy: int, r: int,
@@ -672,6 +787,7 @@ def _handle_overlay_click(lx: int, ly: int) -> None:
     title_h = 28
     if ly < title_h:
         return
+    mark_stats_dirty()   # every branch below changes something this panel renders
     row_i = (ly - title_h) // 26
     if row_i < len(PROGRAMS):
         _ui_state['selected_prog'] = row_i
@@ -812,8 +928,10 @@ def draw_stats_panel(h: int, tracker=None) -> np.ndarray:
     gauge_area = max(180 * s, H - CY - BATT_NAV_H)
     row_h      = gauge_area // 3
 
-    ah_r  = max(20 * s, min(row_h // 2 - 18 * s, COL // 2 - 24 * s))
-    ah_cx = L + COL // 2
+    # Left-aligned + shrunk (was centred at COL//2) to free room on the right
+    # of this row for the movement pad.
+    ah_r  = max(18 * s, min(row_h // 2 - 16 * s, COL * 3 // 8 - 20 * s))
+    ah_cx = L + ah_r + 12 * s
     ah_cy = CY + row_h // 2
     _draw_artificial_horizon(panel, ah_cx, ah_cy,
                              ah_r, roll if linked else 0.0, pitch if linked else 0.0)
@@ -821,8 +939,12 @@ def draw_stats_panel(h: int, tracker=None) -> np.ndarray:
     gfx.put_text(panel, f"R{math.degrees(roll):+.1f}",
                  (L + 8 * s, rp_y), 0.34 * s, (140, 140, 140))
     ps = f"P{math.degrees(pitch):+.1f}"
-    (pw, _), _ = gfx.size(ps, 0.34 * s)
-    gfx.put_text(panel, ps, (L + COL - pw - 8 * s, rp_y), 0.34 * s, (140, 140, 140))
+    gfx.put_text(panel, ps, (ah_cx + ah_r + 6 * s, rp_y), 0.34 * s, (140, 140, 140))
+
+    pad_cx = ah_cx + ah_r + (COL - (ah_cx + ah_r)) // 2
+    pad_cy = ah_cy
+    pad_r  = max(10 * s, min(row_h // 2 - 16 * s, (COL - (ah_cx + ah_r)) // 2 - 8 * s))
+    _draw_movement_pad(panel, pad_cx, pad_cy, pad_r)
     sep1 = CY + row_h
     cv2.line(panel, (L, sep1), (L + COL, sep1), (48, 48, 48), max(1, s))
 

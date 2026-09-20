@@ -92,6 +92,102 @@ def send_set_home() -> None:
     print(f"Home set: {lat:.6f}, {lon:.6f}  ground_alt={alt:.1f} m", flush=True)
 
 
+# Movement-pad "nudge": uploads a single-waypoint MAVLink mission and relies on
+# the STM32's existing mission-upload handshake (telemetry.rs MISSION_COUNT /
+# MISSION_ITEM_INT / MISSION_ACK) + Auto-mode sequencer (navigation.rs) to fly
+# it. No firmware changes required. CRC_EXTRA values below are copied from
+# telemetry.rs's own MAGIC_MISSION_* constants so the two sides agree.
+
+MISSION_COUNT_ID       = 44
+MISSION_COUNT_CRC      = 221
+MISSION_ITEM_INT_ID    = 73
+MISSION_ITEM_INT_CRC   = 38
+MISSION_ACK_CRC        = 153   # MISSION_ACK id=47, received only - no sender needed
+MAV_CMD_NAV_WAYPOINT   = 16
+MAV_FRAME_GLOBAL_RELATIVE_ALT_INT = 3
+
+_NUDGE_DIRS = {   # (north_m, east_m) unit vectors, NED - matches navigation.rs/estimator.rs
+    'N': (1.0, 0.0), 'S': (-1.0, 0.0), 'E': (0.0, 1.0), 'W': (0.0, -1.0),
+}
+
+_pending_wp_lock = threading.Lock()
+_pending_wp: dict = {'lat_deg': None, 'lon_deg': None, 'alt_m': None}
+
+
+def _offset_latlon(lat_deg: float, lon_deg: float, north_m: float, east_m: float) -> tuple:
+    """Flat-earth offset - same approximation as estimator.rs::geo_to_ned / navigation.rs::guide_to."""
+    dlat = north_m / 111_320.0
+    dlon = east_m / (111_320.0 * math.cos(math.radians(lat_deg)))
+    return lat_deg + dlat, lon_deg + dlon
+
+
+def _build_frame(msgid: int, payload: bytes, crc_extra: int) -> bytes:
+    global _cmd_seq
+    n   = len(payload)
+    seq = _cmd_seq & 0xFF
+    _cmd_seq += 1
+    header = bytes([n, 0, 0, seq, 255, 0, msgid & 0xFF, (msgid >> 8) & 0xFF, (msgid >> 16) & 0xFF])
+    crc    = _cmd_crc(header + payload, crc_extra)
+    return bytes([0xFD]) + header + payload + struct.pack('<H', crc)
+
+
+def _send_frame(msgid: int, payload: bytes, crc_extra: int) -> None:
+    try:
+        _cmd_sock.sendto(_build_frame(msgid, payload, crc_extra), (config.PI_IP, config.GCS_PORT))
+    except OSError as exc:
+        print(f"_send_frame(id={msgid}): {exc}", flush=True)
+
+
+def _send_mission_item_int(lat_deg: float, lon_deg: float, alt_m: float) -> None:
+    """MISSION_ITEM_INT #73, seq=0, MAV_CMD_NAV_WAYPOINT - wire layout matches
+    telemetry.rs's parser exactly (params f32x4 @0, x/y i32 @16/20, z f32 @24,
+    seq/cmd u16 @28/30); trailing sys/comp/frame/current/autocontinue/type bytes
+    are spec-complete but ignored by this firmware."""
+    payload = struct.pack(
+        '<ffffiifHHBBBBBB',
+        0.0, 0.0, 0.0, 0.0,                 # param1..4 (param1 = hold time = fly-through)
+        int(round(lat_deg * 1e7)),
+        int(round(lon_deg * 1e7)),
+        alt_m,
+        0, MAV_CMD_NAV_WAYPOINT,             # seq, command
+        1, 1,                                # target_system, target_component
+        MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+        0, 1, 0,                             # current, autocontinue, mission_type
+    )
+    _send_frame(MISSION_ITEM_INT_ID, payload, MISSION_ITEM_INT_CRC)
+
+
+def send_nudge_waypoint(direction: str, distance_m: float = 0.5) -> None:
+    """Upload a single-waypoint mission `distance_m` away in `direction` (N/E/S/W).
+
+    Only uploads - does NOT switch flight mode. The mission sits in the
+    firmware's PENDING_MISSION until Auto mode is selected; warns if it isn't
+    already active so a click doesn't silently do nothing.
+    """
+    if direction not in _NUDGE_DIRS:
+        print(f"send_nudge_waypoint: unknown direction {direction!r}", flush=True)
+        return
+    with _mav_lock:
+        lat            = _mav_state['lat']
+        lon            = _mav_state['lon']
+        alt            = _mav_state['alt']
+        flight_mode_id = _mav_state['flight_mode_id']
+        armed          = _mav_state['armed']
+    if lat is None:
+        print("nudge: no GPS fix — ignoring", flush=True)
+        return
+    n, e = _NUDGE_DIRS[direction]
+    target_lat, target_lon = _offset_latlon(lat, lon, n * distance_m, e * distance_m)
+    with _pending_wp_lock:
+        _pending_wp.update(lat_deg=target_lat, lon_deg=target_lon, alt_m=alt)
+    _send_frame(MISSION_COUNT_ID, struct.pack('<HBB', 1, 1, 1), MISSION_COUNT_CRC)
+    print(f"Nudge: +{distance_m:.2f} m {direction} → "
+          f"{target_lat:.7f}, {target_lon:.7f} (mission upload sent)", flush=True)
+    if not (armed and flight_mode_id == 3):
+        print("  ⚠ not currently armed+Auto — mission uploaded but won't fly "
+              "until Auto mode is selected", flush=True)
+
+
 def send_follow_target(east_m: float, north_m: float) -> None:
     """Send tracked person's ground position to the Pi as a continuous position setpoint."""
     send_weed_target(0, east_m, north_m)
@@ -173,7 +269,8 @@ def _mav_listener() -> None:
         msg = conn.recv_match(
             type=['GLOBAL_POSITION_INT', 'ATTITUDE', 'SYS_STATUS',
                   'HEARTBEAT', 'BATTERY_STATUS', 'SERVO_OUTPUT_RAW', 'COMMAND_ACK',
-                  'GPS_RAW_INT', 'VFR_HUD', 'SCALED_IMU'],
+                  'GPS_RAW_INT', 'VFR_HUD', 'SCALED_IMU',
+                  'MISSION_REQUEST_INT', 'MISSION_ACK'],
             blocking=True, timeout=1.0)
         if msg is None:
             continue
@@ -231,6 +328,19 @@ def _mav_listener() -> None:
                 if msg.result != 0:
                     print(f"COMMAND_ACK cmd={msg.command} "
                           f"result={_RESULT.get(msg.result, msg.result)}", flush=True)
+            elif msg.get_type() == 'MISSION_REQUEST_INT':
+                # Firmware requesting item `seq` of the mission upload we started
+                # in send_nudge_waypoint(). Only ever a single item (seq=0) today.
+                if msg.seq == 0:
+                    with _pending_wp_lock:
+                        wp = dict(_pending_wp)
+                    if wp['lat_deg'] is not None:
+                        _send_mission_item_int(wp['lat_deg'], wp['lon_deg'], wp['alt_m'])
+            elif msg.get_type() == 'MISSION_ACK':
+                with _pending_wp_lock:
+                    _pending_wp.update(lat_deg=None, lon_deg=None, alt_m=None)
+                if msg.type != 0:   # MAV_MISSION_ACCEPTED = 0
+                    print(f"Mission upload rejected: type={msg.type}", flush=True)
             if config.VERBOSE_LOGGING:
                 mt = msg.get_type()
                 if mt == 'HEARTBEAT':

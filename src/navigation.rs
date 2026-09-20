@@ -69,7 +69,7 @@ const FLOW_MAX_HEIGHT_MM: i32 = 5_000;        // MTF-02P reliable range ceiling 
 const DT:                 f32 = 1.0 / 100.0;
 
 // Weed extraction sequence
-const WEED_ARRIVE_M:      f32  = 1.5;         // horizontal arrival radius (GPS-realistic)
+const WEED_ARRIVE_M:      f32  = 0.15;         // horizontal arrival radius (GPS-realistic)
 const WEED_ALT_BAND_M:    f32  = 0.15;        // "at extraction altitude" tolerance
 const WEED_STABILIZE_MS:  u64  = 1_000;       // hover at extraction alt before actuating
 const WEED_PULL_MS:       u64  = 500;         // servo hold duration

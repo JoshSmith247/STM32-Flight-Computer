@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 
 import config
-from dashboard import draw_stats_panel, _ui_state
+from dashboard import draw_stats_panel, pop_stats_dirty, _ui_state
 from exg import exg_candidates, exg_mask
 from follow import PersonTracker
 from mavlink import _mav_lock, _mav_state, send_follow_target, send_weed_target
@@ -242,7 +242,9 @@ class _Renderer:
                     self._sidebar_seq += 1
 
             now = time.monotonic()
-            if _stats is None or now >= _stats_next_t:
+            # pop_stats_dirty() forces an immediate rebuild after a click that
+            # changed stats-panel state, instead of waiting up to _STATS_INTERVAL.
+            if _stats is None or now >= _stats_next_t or pop_stats_dirty():
                 _stats       = draw_stats_panel(self._disp_h, self._tracker)
                 _stats_next_t = now + _STATS_INTERVAL
                 with self._lock:

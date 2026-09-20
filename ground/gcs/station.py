@@ -33,7 +33,8 @@ import numpy as np
 
 import config
 import overlay as _overlay
-from dashboard import _handle_overlay_click, _ui_state, handle_payload_double_click
+from dashboard import (_handle_overlay_click, _ui_state, handle_movement_pad_click,
+                       handle_payload_double_click)
 from follow import PersonTracker
 from mavlink import (_HAVE_MAVLINK, _mav_listener, _mav_lock, _mav_state,
                      _target_sock, send_emergency_stop, send_mavlink_command,
@@ -377,11 +378,15 @@ def main() -> None:
 
         # Program / motor-test panel (bottom-right of the stats column) drives
         # MAVLink, not the camera - so it must stay clickable with no video feed.
+        # Movement pad (top-left of the stats column) is video-independent too.
         if x >= disp_w + config.SIDEBAR_W:
             px  = x - (disp_w + config.SIDEBAR_W)
             COL = config.STATS_W // 2
             if px >= COL and y >= disp_h - config.OVERLAY_H:
                 _handle_overlay_click(px - COL, y - (disp_h - config.OVERLAY_H))
+                return
+            if px < COL:
+                handle_movement_pad_click(px, y)
                 return
 
         if not stream_ok[0]:
